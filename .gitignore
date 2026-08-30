@@ -1,0 +1,16 @@
+# Local reference copies and unpacked vendor projects
+.cinny-reference/
+.office-reference/
+.office-unpacked/
+sdk-inspect/
+office-reference.zip
+matrix-sdk.tgz
+
+# Build/check output
+.tmp-*/
+.tmp-*
+
+# Local/editor noise
+.DS_Store
+Thumbs.db
+*.log
