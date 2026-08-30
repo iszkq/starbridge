@@ -6,6 +6,17 @@
 
 在此目录执行 `./start.ps1`，然后打开 <http://localhost:4174>。脚本会优先使用 Bun，也支持 Python 或任意静态文件服务器。要使用内置 Matrix 代理，请使用这个启动脚本；如果直接用其他静态服务器，则要求 homeserver 自己配置 CORS。由于浏览器的 ES Module 安全策略，不建议直接双击 `index.html`（`file://`）。
 
+## 换电脑开发
+
+这是一个无需安装前端依赖的原生浏览器项目，克隆仓库后即可继续开发：
+
+1. 安装 [Bun](https://bun.sh/)（推荐）或 Python 3。
+2. 执行 `bun install`（当前没有第三方 npm 依赖，这一步可选）。
+3. Windows 执行 `./start.ps1`，其他系统执行 `bun server.js`。
+4. 打开 <http://localhost:4174>，直接编辑 `app.js`、`styles.css` 和 `index.html` 即可看到效果。
+
+运行时会从 esm.sh、Google Fonts 和表情资源服务器加载外部资源，因此首次运行需要网络连接；Matrix homeserver 地址和登录信息由页面运行时输入，不会写入仓库。
+
 ## 功能框架
 
 - 工作区与房间：从 `client.getRooms()` 加载已加入房间、房间搜索、未读数、最近消息、房间切换。
