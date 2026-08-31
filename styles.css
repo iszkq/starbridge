@@ -209,6 +209,9 @@ button { cursor: pointer; }
 .message-row.emoji-message-row .message-content-stack { display: block; max-width: none; }
 .message-row.emoji-message-row .attachment-wrap { width: auto; margin: 0; }
 .message-row.emoji-message-row .message-image { margin: 0; }
+.message-emoji-row-media { display: inline-flex; align-items: center; gap: 4px; max-width: min(100%, 560px); overflow-x: auto; padding: 0; }
+.message-emoji-tile { width: 40px; height: 40px; object-fit: contain; flex: 0 0 40px; cursor: pointer; border-radius: 6px; }
+.document-update-hint { margin-top: 3px; color: var(--muted-text, #7b8494); font-size: 11px; line-height: 1.35; }
 
 .emoji-browser { display: grid; grid-template-columns: 118px minmax(0, 1fr); gap: 10px; margin-top: 10px; min-height: 280px; }
 .emoji-category-nav { display: flex; flex-direction: column; gap: 3px; max-height: 310px; overflow: auto; padding-right: 3px; border-right: 1px solid #eef1f5; }
@@ -1152,6 +1155,9 @@ button { cursor: pointer; }
 .attachment-wrap .message-image { display: block; }
 .message-row.me .attachment-wrap { align-self: flex-end !important; margin-left: auto !important; width: fit-content !important; }
 .message-row:not(.me) .attachment-wrap { align-self: flex-start !important; margin-right: auto !important; width: fit-content !important; }
+.message-row.me .message-content-stack { width: 100%; align-items: flex-end; }
+.message-row.me .attachment-wrap .message-image { margin-left: auto; margin-right: 0; }
+.message-row:not(.me) .attachment-wrap .message-image { margin-left: 0; margin-right: auto; }
 .document-modal-text { flex: 1; overflow: auto; margin: 0; padding: 28px 34px; color: #1d2939; background: #fff; font: 13px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
 .document-modal-head-actions { display: flex; align-items: center; gap: 8px; }
 .document-icon { width: 42px; height: 46px; font-size: 21px; }

@@ -149,26 +149,16 @@ async function composeEmojiRowFile(items) {
 // understand Orbit's catalog or shortcode format.
 async function sendEmojiImageEvents(client, roomId, items, encryptedRoom, sendFn = client.sendMessage?.bind(client)) {
   if (!items?.length) return;
-  // Never rasterise animated GIF/WebP/APNG into the static row image.  Keep
-  // those files as individual Matrix m.image events so other clients can
-  // play them too; static selections can still be compacted into one row.
+  // Always send one event. Animated sources are retained in Orbit metadata;
+  // the standard PNG row remains readable by other Matrix clients.
   const animated = item => /(?:gif|webp|apng)(?:$|[?#])/i.test(`${item?.fileName || ""} ${item?.name || ""} ${item?.url || ""}`) || /image\/(?:gif|webp|apng)/i.test(String(item?.mimeType || ""));
-  const animatedItems = items.filter(animated);
-  const staticItems = items.filter(item => !animated(item));
-  const batches = [];
-  if (staticItems.length) batches.push(staticItems);
-  animatedItems.forEach(item => batches.push([item]));
+  const batches = [items];
   for (const batch of batches) {
-    let file;
-    if (batch.length === 1) {
-      const blob = await fetchEmojiBlob(batch[0]);
-      const type = blob.type || batch[0].mimeType || "application/octet-stream";
-      const extension = type.split("/")[1] || String(batch[0].fileName || "img").split(".").pop() || "bin";
-      file = new File([blob], batch[0].fileName || `${batch[0].name}.${extension}`, { type });
-    } else file = await composeEmojiRowFile(batch);
+    const file = await composeEmojiRowFile(batch);
     const { uploaded, fileInfo } = await uploadMatrixMedia(client, file, encryptedRoom);
     const width = batch.length === 1 ? 40 : batch.length * 44 - 4;
     const content = { msgtype: "m.image", body: "表情", info: { mimetype: file.type, w: width, h: 40, size: file.size } };
+    content["org.orbit.emoji_items"] = batch.map(item => ({ id: item.id || item.name, name: item.name, url: item.url, thumbUrl: item.thumbUrl || item.url, animated: animated(item) }));
     if (fileInfo) content.file = { ...fileInfo, url: uploaded.content_uri };
     else content.url = uploaded.content_uri;
     await sendFn(roomId, content);
@@ -498,7 +488,11 @@ function formatMentions(text, room) {
 }
 
 function stripReplyFallback(text) {
-  return String(text || "").replace(/^(?:>[^\n]*(?:\n|$))+\s*/, "").trim();
+  return String(text || "").replace(/^\s*(?:in reply to[^\n]*(?:\n|$))?/i, "").replace(/^(?:>[^\n]*(?:\n|$))+\s*/, "").trim();
+}
+
+function stripReplyHtml(html) {
+  return String(html || "").replace(/<mx-reply[\s\S]*?<\/mx-reply>/gi, "").replace(/^\s*(?:in reply to[^<]*(?:<br\s*\/?>|$))/i, "").trim();
 }
 
 function sanitizeFormattedBody(html) {
@@ -564,11 +558,13 @@ function eventToMessage(event, room, userId) {
   const emojiNames = [...String(cleanBody || "").matchAll(/:([^:\s]+):/g)].map(match => match[1]);
   const emojiFiles = content["org.orbit.emoji_files"] || (content.file && emojiNames.length ? Object.fromEntries(emojiNames.map(name => [name, content.file])) : null);
   if (emojiFiles && typeof emojiFiles === "object") window.orbitEncryptedEmojiFiles = { ...(window.orbitEncryptedEmojiFiles || {}), ...emojiFiles };
-  const formatted = content.format === "org.matrix.custom.html" && content.formatted_body ? sanitizeFormattedBody(content.formatted_body) : null;
+  const formatted = content.format === "org.matrix.custom.html" && content.formatted_body ? sanitizeFormattedBody(reply ? stripReplyHtml(content.formatted_body) : content.formatted_body) : null;
   // A few clients send a formatted body without any block markers while the
   // plain Matrix body still contains the authoritative line breaks.  Prefer
   // that plain body in this case so copied multi-line messages stay readable.
   const formattedHasBreaks = /<br\b/i.test(String(content.formatted_body || "")) || /<\/(?:p|div|li|h[1-6]|blockquote|pre)>/i.test(String(content.formatted_body || ""));
+  const updatedMeta = content["org.orbit.updated"] || null;
+  const updatedMember = updatedMeta?.user_id ? room.getMember?.(updatedMeta.user_id) : null;
   return {
     id: event.getId?.() || `${sender}-${event.getTs?.()}`, roomId: room.roomId,
     event,
@@ -581,17 +577,20 @@ function eventToMessage(event, room, userId) {
     text: formatMentions(cleanBody, room),
     formattedBody: formatted && (!String(cleanBody || "").includes("\n") || formattedHasBreaks) ? formatted : null,
     emojiFiles: content["org.orbit.emoji_files"] || null,
+    emojiItems: Array.isArray(content["org.orbit.emoji_items"]) ? content["org.orbit.emoji_items"] : null,
+    updatedBy: updatedMember?.name || updatedMeta?.user_id || null,
+    updatedAt: Number(updatedMeta?.ts) || 0,
     isMe: sender === userId,
     replyTo: reply,
     threadRoot,
     edited: replacement,
-    attachment: ["m.image", "m.file", "m.video", "m.audio", "m.sticker"].includes(msgtype) ? { name: content.body, url: content.url || content.file?.url, file: content.file, info: content.info || null, emoji: msgtype === "m.image" && content.body === "表情" && Number(content.info?.w || 0) <= 96 && Number(content.info?.h || 0) <= 96, sticker: msgtype === "m.sticker" || content["org.orbit.sticker"] === true, type: msgtype === "m.sticker" ? "m.image" : msgtype } : null,
+    attachment: ["m.image", "m.file", "m.video", "m.audio", "m.sticker"].includes(msgtype) ? { name: content.body, url: content.url || content.file?.url, file: content.file, info: content.info || null, emoji: msgtype === "m.image" && (Array.isArray(content["org.orbit.emoji_items"]) || (content.body === "表情" && Number(content.info?.w || 0) <= 96 && Number(content.info?.h || 0) <= 96)), sticker: msgtype === "m.sticker" || content["org.orbit.sticker"] === true, type: msgtype === "m.sticker" ? "m.image" : msgtype } : null,
   };
 }
 
 async function roomMessages(room, userId, client) {
   const events = room?.getLiveTimeline?.().getEvents?.() || [];
-  const redacted = new Set(); const reactions = new Map(); const edits = new Map(); const byId = new Map();
+  const redacted = new Set(); const reactions = new Map(); const edits = new Map(); const updates = new Map(); const byId = new Map();
   events.forEach(event => {
     if (event.getType?.() === "m.room.redaction") { const id = event.getRedacts?.() || event.getContent?.()?.redacts; if (id) redacted.add(id); return; }
     if (event.getType?.() === "m.reaction") { const relation = event.getContent?.()?.["m.relates_to"]; if (relation?.event_id) { const list = reactions.get(relation.event_id) || []; list.push({ id: event.getId?.(), key: relation.key || "👍", sender: event.getSender?.() }); reactions.set(relation.event_id, list); } return; }
@@ -599,11 +598,12 @@ async function roomMessages(room, userId, client) {
     if (clearType !== "m.room.message" && clearType !== "m.sticker" && event.getType?.() !== "m.room.encrypted") return;
     const eventContent = event.getClearContent?.() || event.getContent?.() || {};
     const relation = eventContent["m.relates_to"];
-    if (relation?.rel_type === "m.replace" && relation.event_id) { edits.set(relation.event_id, eventContent?.["m.new_content"]?.body || eventContent?.body || ""); return; }
+    if (relation?.rel_type === "m.replace" && relation.event_id) { edits.set(relation.event_id, eventContent?.["m.new_content"]?.body || eventContent?.body || ""); const updated = eventContent?.["org.orbit.updated"] || eventContent?.["m.new_content"]?.["org.orbit.updated"]; if (updated) updates.set(relation.event_id, updated); return; }
     const message = eventToMessage(event, room, userId); if (message) byId.set(message.id, message);
   });
   const members = room?.getJoinedMembers?.() || [];
   byId.forEach((message, id) => { if (redacted.has(id)) { byId.delete(id); return; } if (edits.has(id)) { message.text = edits.get(id); message.edited = true; } const reactionCounts = {}; (reactions.get(id) || []).forEach(reaction => { if (!reaction.id || redacted.has(reaction.id)) return; reactionCounts[reaction.key] = (reactionCounts[reaction.key] || 0) + 1; }); message.reactions = reactionCounts; const reply = message.replyTo ? byId.get(message.replyTo) : null; if (reply) { message.replyPreview = reply.text; message.replyAuthor = reply.author; message.replyAvatarMxc = reply.avatarMxc; } const thread = message.threadRoot ? byId.get(message.threadRoot) : null; if (thread) { message.threadPreview = thread.text || thread.attachment?.name || "消息"; message.threadAuthor = thread.author; message.threadAvatarMxc = thread.avatarMxc; } });
+  updates.forEach((updated, id) => { const message = byId.get(id); if (!message) return; message.updatedAt = Number(updated.ts) || 0; const member = room.getMember?.(updated.user_id); message.updatedBy = member?.name || updated.user_id || null; });
   // A receipt is a moving marker, not a badge that belongs on every message.
   // Find the latest event read by each member, then render that member only
   // beneath the corresponding message (as mature Matrix clients do).
@@ -903,15 +903,28 @@ async function saveEditedAttachment(client, item, buffer, fileName, mimeType) {
   const { uploaded, fileInfo } = await uploadMatrixMedia(client, file, encrypted);
   const msgtype = item.attachment?.type || "m.file";
   const info = { ...(item.attachment?.info || {}), mimetype: type, size: file.size };
-  const content = { msgtype, body: name, info, "m.relates_to": { rel_type: "m.replace", event_id: item.id }, "m.new_content": { msgtype, body: name, info } };
+  const updated = { user_id: client.getUserId?.() || "", ts: Date.now(), from_event_id: item.id, mode: item.isMe ? "replace" : "copy" };
+  const content = { msgtype, body: name, info, "org.orbit.updated": updated };
+  if (item.isMe) {
+    content["m.relates_to"] = { rel_type: "m.replace", event_id: item.id };
+    content["m.new_content"] = { msgtype, body: name, info, "org.orbit.updated": updated };
+  }
   if (fileInfo) {
     content.file = { ...fileInfo, url: uploaded.content_uri };
-    content["m.new_content"].file = content.file;
+    if (content["m.new_content"]) content["m.new_content"].file = content.file;
   } else {
     content.url = uploaded.content_uri;
-    content["m.new_content"].url = uploaded.content_uri;
+    if (content["m.new_content"]) content["m.new_content"].url = uploaded.content_uri;
   }
   await client.sendMessage(item.roomId, content);
+}
+
+function EmojiRowMedia({ items = [], client, onOpen }) {
+  return h("div", { className: "message-emoji-row-media", role: "img", "aria-label": "表情" }, items.map((emoji, index) => {
+    const source = emoji?.thumbUrl || emoji?.url;
+    const src = assetRequestUrl(source);
+    return h("img", { key: emoji?.id || `${emoji?.name || "emoji"}-${index}`, className: "message-emoji-tile", src, alt: emoji?.name || "表情", loading: "lazy", onClick: () => src && onOpen?.(src, emoji?.name || "表情") });
+  }));
 }
 
 function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onMention, onTogglePinMessage, pinnedEventIds = [], selecting, selected, onSelect, grouped = item?.grouped || false }) {
@@ -1024,6 +1037,7 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
   const asset = useMatrixAsset(client, rawUrl, undefined, undefined, undefined, item.attachment?.file || null);
   if (item.type === "empty") return h("div", { className: "empty-messages" }, "☁", h("div", null, item.label));
   const fileUrl = asset.src;
+  const emojiRow = item.emojiItems?.length && fileUrl ? h(EmojiRowMedia, { items: item.emojiItems, client, onOpen: (src, alt) => setViewer({ src, alt }) }) : null;
   const reactions = Object.entries(item.reactions || {});
   const media = item.attachment && fileUrl && (item.attachment.type === "m.image" ? h("img", { className: `message-image ${item.attachment.emoji ? "message-emoji-image" : ""} ${item.attachment.sticker ? "message-sticker" : ""}`, src: fileUrl, alt: item.attachment.name || "图片", loading: "lazy", onClick: () => setViewer({ src: fileUrl, alt: item.attachment.name || "图片" }) }) : item.attachment.type === "m.video" ? h("video", { className: "message-video", src: fileUrl, controls: true, preload: "metadata" }) : item.attachment.type === "m.audio" ? h("audio", { className: "message-audio", src: fileUrl, controls: true, preload: "metadata" }) : null);
   const fetchAttachmentBlob = async () => { if (!asset.url) throw new Error("附件地址不可用"); const token = client?.getAccessToken?.(); const candidates = mediaRequestCandidates(client, rawUrl, asset.url); let lastError = null; for (const candidate of candidates) { try { const response = await fetch(candidate, { cache: "no-store", headers: token ? { Authorization: `Bearer ${token}` } : undefined }); if (response.ok) { const encryptedBuffer = await response.arrayBuffer(); const plainBuffer = await decryptMatrixBuffer(encryptedBuffer, item.attachment?.file); const blob = new Blob([plainBuffer], { type: item.attachment?.file?.mimetype || item.attachment?.info?.mimetype || response.headers.get("content-type") || "application/octet-stream" }); if (blob.size > 0) return blob; } lastError = new Error(`媒体请求失败（${response.status}）`); } catch (error) { lastError = error; } } throw lastError || new Error("媒体请求失败"); };
@@ -1033,7 +1047,7 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
   const documentAttachment = item.attachment?.type === "m.file" && item.attachment?.name;
   const docKind = documentAttachment ? attachmentKind(item.attachment.name) : null;
   const isTextAttachment = Boolean(documentAttachment && ["txt", "log", "md", "json", "xml", "csv"].includes(docKind?.ext));
-  const isOfficeAttachment = Boolean(documentAttachment && ["doc", "docx", "xls", "xlsx", "ppt", "pptx"].includes(docKind?.ext));
+  const isOfficeAttachment = Boolean(documentAttachment && ["doc", "docx", "xls", "xlsx", "ppt", "pptx", "ods", "csv"].includes(docKind?.ext));
   useEffect(() => {
     if (!documentModal || !documentAttachment || isOfficeAttachment || !asset.url) return;
     let active = true; let objectUrl = "";
@@ -1107,11 +1121,12 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
         placeholder.replaceWith(frame);
         let sent = false;
         let password = "";
+        let passwordAttempts = 0;
         const send = (nextPassword = password, force = false) => { if (sent && !force) return; sent = true; password = nextPassword || ""; const transferBuffer = buffer.slice(0); frame.contentWindow?.postMessage({ type: "xinghuo-office-open", requestId, buffer: transferBuffer, password, fileName: item.attachment?.name || "document", fileType: docKind?.ext || "", mimeType: item.attachment?.info?.mimetype || blob.type || "application/octet-stream" }, officeOrigin, [transferBuffer]); };
         const onReady = event => {
           if (event.source !== frame.contentWindow || event.origin !== officeOrigin || event.data?.requestId && event.data.requestId !== requestId) return;
           if (event.data?.type === "xinghuo-office-ready") send();
-          if (event.data?.type === "xinghuo-office-password-required") { const next = window.prompt("此 Office 文件需要密码，请输入文件密码：", ""); if (next) send(next, true); }
+          if (event.data?.type === "xinghuo-office-password-required") { if (passwordAttempts >= 2) return; passwordAttempts += 1; const next = window.prompt("此 Office 文件需要密码，请输入文件密码：", ""); if (next) send(next, true); }
           if (event.data?.type === "xinghuo-office-dirty") { setOfficeDirty(Boolean(event.data.dirty)); setOfficeSaving(false); }
           if (event.data?.type === "xinghuo-office-saving") setOfficeSaving(true);
           if (event.data?.type === "xinghuo-office-saved") {
@@ -1119,10 +1134,10 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
             if (!savedBuffer) { setOfficeSaving(false); Toast.error("Office 编辑器没有返回可保存的数据"); return; }
             setOfficeSaving(true);
             saveEditedAttachment(client, item, savedBuffer, event.data.fileName || item.attachment?.name, event.data.mimeType || item.attachment?.info?.mimetype)
-              .then(() => { if (active) { setOfficeDirty(false); setOfficeSaving(false); Toast.success("文件已保存回 Matrix"); } })
+              .then(() => { if (active) { setOfficeDirty(false); setOfficeSaving(false); Toast.success(item.isMe ? "文件已更新" : "已作为新文件发送"); } })
               .catch(error => { if (active) { setOfficeSaving(false); Toast.error(`文件保存失败：${error?.message || "未知错误"}`); } });
           }
-          if (event.data?.type === "xinghuo-office-error") { setOfficeSaving(false); Toast.error(event.data.message || "Office 编辑器操作失败"); }
+          if (event.data?.type === "xinghuo-office-error") { const errorText = String(event.data.message || ""); if (/(password|encrypted|decrypt|加密|密码|密碼|打开文件时发生错误)/i.test(errorText) && passwordAttempts < 2) { passwordAttempts += 1; const next = window.prompt("此 Office 文件需要密码，请输入文件密码：", ""); if (next) { sent = false; send(next, true); return; } } setOfficeSaving(false); Toast.error(errorText || "Office 操作失败"); }
         };
         window.addEventListener("message", onReady);
         removeOfficeListener = () => window.removeEventListener("message", onReady);
@@ -1140,6 +1155,17 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
     const timer = setTimeout(() => requestOfficeSave(), 2500);
     return () => clearTimeout(timer);
   }, [officeDirty, officeSaving, isOfficeAttachment, docKind?.ext]);
+  useEffect(() => {
+    if (!documentModal || !isOfficeAttachment) return;
+    const onShortcut = event => {
+      if ((event.ctrlKey || event.metaKey) && String(event.key).toLowerCase() === "s") {
+        event.preventDefault();
+        requestOfficeSave();
+      }
+    };
+    window.addEventListener("keydown", onShortcut);
+    return () => window.removeEventListener("keydown", onShortcut);
+  }, [documentModal, isOfficeAttachment, officeDirty, officeSaving]);
   useEffect(() => {
     if (!documentModal || !isTextAttachment || documentPreview.status !== "ready") return;
     const modal = document.querySelector(".document-modal");
@@ -1180,10 +1206,11 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
     return () => { closeButton?.removeEventListener("click", stopAndClose, true); backdrop.removeEventListener("mousedown", onBackdrop, true); saveButton?.removeEventListener("click", requestOfficeSave); saveButton?.remove(); };
   }, [documentModal, isOfficeAttachment, officeDirty, officeSaving, documentPreview.status]);
   const displayName = shortenAttachmentName(item.attachment?.name || "附件");
-  const documentCard = documentAttachment ? h("div", { className: "document-card" }, h("div", { className: `document-icon document-icon-${docKind.className}` }, docKind.icon), h("div", { className: "document-main" }, h("div", { className: "document-name", title: item.attachment.name }, displayName), h("div", { className: "document-meta" }, formatAttachmentSize(item.attachment.info?.size || item.attachment.file?.size) || "文档", " · ", docKind.label)), h("div", { className: "document-actions" }, isTextAttachment ? h("button", { type: "button", disabled: !asset.url, onClick: openOriginal }, "打开") : h("button", { type: "button", disabled: !asset.url, onClick: openOriginal }, "在线预览"), !isTextAttachment && h("button", { type: "button", disabled: !asset.url, onClick: openOfficeEditor }, "在线编辑"), h("button", { type: "button", disabled: !asset.url, onClick: downloadAttachment }, "下载"))) : null;
+  const updatedHint = item.updatedAt ? h("div", { className: "document-update-hint" }, `由 ${item.updatedBy || "用户"} 更新于 ${new Date(item.updatedAt).toLocaleString("zh-CN")}`) : null;
+  const documentCard = documentAttachment ? h("div", { className: "document-card" }, h("div", { className: `document-icon document-icon-${docKind.className}` }, docKind.icon), h("div", { className: "document-main" }, h("div", { className: "document-name", title: item.attachment.name }, displayName), h("div", { className: "document-meta" }, formatAttachmentSize(item.attachment.info?.size || item.attachment.file?.size) || "文档", " · ", docKind.label), updatedHint), h("div", { className: "document-actions" }, isTextAttachment ? h("button", { type: "button", disabled: !asset.url, onClick: openOriginal }, "打开") : h("button", { type: "button", disabled: !asset.url, onClick: openOriginal }, "在线预览"), !isTextAttachment && h("button", { type: "button", disabled: !asset.url, onClick: openOfficeEditor }, "在线编辑"), h("button", { type: "button", disabled: !asset.url, onClick: downloadAttachment }, "下载"))) : null;
   const attachmentFallback = item.attachment && !media && !documentCard ? h("div", { className: "attachment-unavailable" }, asset.failed ? "媒体加载失败" : "正在加载媒体…", asset.url && h("a", { href: asset.url, onClick: openOriginal }, "打开原文件")) : null;
   const relation = (item.replyTo || item.threadRoot) && h(RelationContext, { item, client, onJumpTo, onThread });
-  const payload = item.attachment ? h("div", { className: "attachment-wrap" }, documentCard || media || attachmentFallback || h("div", { className: "attachment-unavailable" }, "附件地址不可用"), media && !item.attachment.emoji && !item.attachment.sticker && h("div", { className: "attachment-caption", title: item.attachment.name }, displayName)) : item.formattedBody ? h("div", { className: "message-bubble formatted-message" }, h(FormattedMessage, { html: item.formattedBody, client, emojiFiles: item.emojiFiles, onImage: (src, alt) => setViewer({ src, alt }) })) : h("div", { className: "message-bubble" }, item.decryptFailed ? `🔒 ${item.text}` : h(MessageText, { text: item.text }));
+  const payload = item.attachment ? h("div", { className: "attachment-wrap" }, documentCard || emojiRow || media || attachmentFallback || h("div", { className: "attachment-unavailable" }, "附件地址不可用"), media && !item.attachment.emoji && !item.attachment.sticker && h("div", { className: "attachment-caption", title: item.attachment.name }, displayName)) : item.formattedBody ? h("div", { className: "message-bubble formatted-message" }, h(FormattedMessage, { html: item.formattedBody, client, emojiFiles: item.emojiFiles, onImage: (src, alt) => setViewer({ src, alt }) })) : h("div", { className: "message-bubble" }, item.decryptFailed ? `🔒 ${item.text}` : h(MessageText, { text: item.text }));
   const documentContent = documentPreview.status === "loading" ? h("div", { className: "document-modal-loading" }, "正在解析文档…") : documentPreview.status === "error" ? h("div", { className: "document-modal-loading" }, documentPreview.error) : isTextAttachment && documentPreview.status === "ready" ? h("pre", { className: "document-modal-text" }, documentPreview.text) : docKind?.ext === "pdf" && documentPreview.url ? h("iframe", { className: "document-modal-frame", src: documentPreview.url, title: item.attachment?.name || "PDF 预览" }) : documentPreview.status === "ready" && documentPreview.html ? h("div", { className: `document-modal-html ${documentModal === "edit" ? "is-editable" : ""}`, contentEditable: documentModal === "edit", suppressContentEditableWarning: true, dangerouslySetInnerHTML: { __html: documentPreview.html } }) : h("div", { className: "document-modal-loading" }, documentPreview.error || "此格式暂不支持浏览器内排版，请使用下载后的 Office 应用打开");
   return h(React.Fragment, null, h("div", { className: `message-row ${item.isMe ? "me" : ""} ${item.attachment?.emoji ? "emoji-message-row" : ""} ${grouped ? "message-grouped" : ""} ${item.decryptFailed ? "encrypted-message" : ""} ${selecting ? "message-selecting" : ""} ${selected ? "message-selected" : ""}`, id: item.id ? `event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}` : undefined, onClick: selecting ? () => onSelect?.(item) : undefined, onContextMenu: event => { event.preventDefault(); setContextMenu({ x: event.clientX, y: event.clientY }); } }, h(MatrixAvatar, { client, mxcUrl: item.avatarMxc, size: 34, className: "message-avatar", style: { background: item.color }, fallback: item.avatar, alt: item.author }), h("div", { className: "message-body" }, !grouped && h("div", { className: "message-author" }, h("button", { type: "button", className: "message-author-name", onClick: event => { event.stopPropagation(); onMention?.({ userId: item.handle, name: item.author }); } }, item.author), h("span", { className: "message-time" }, item.time), item.edited && h("span", { className: "message-time" }, "已编辑")), h("div", { className: `message-content-stack ${relation ? "has-relation" : ""}` }, relation, payload, item.decryptFailed && h("div", { className: "decrypt-hint" }, "请在“我的设置 → 设备与安全”中恢复密钥"), reactions.length > 0 && h("div", { className: "reaction-row" }, reactions.map(([key, count]) => h("button", { className: "reaction", key, onClick: event => { event.stopPropagation(); onReact(item, key); } }, reactionLabel(key), h("span", { className: "reaction-count" }, count)))), item.readBy?.length > 0 && h(ReadReceipt, { readBy: item.readBy || [], client })), h("div", { className: "message-actions" }, h("button", { onClick: event => { event.stopPropagation(); onReply(item); } }, "回复"), h(ReactionPicker, { client, onSelect: key => onReact(item, key) }), h("button", { onClick: event => { event.stopPropagation(); onThread(item); } }, "线程"), item.isMe && h("button", { onClick: event => { event.stopPropagation(); onEdit(item); } }, "编辑"), item.isMe && h("button", { onClick: event => { event.stopPropagation(); onRedact(item); } }, "撤回")), contextMenu && h("div", { className: "message-context-menu", style: { left: contextMenu.x, top: contextMenu.y }, onClick: event => event.stopPropagation() }, h("button", { onClick: () => { setContextMenu(null); onReply(item); } }, "回复"), h("button", { onClick: () => { setContextMenu(null); onThread(item); } }, "在线程中回复"), h("button", { onClick: () => { navigator.clipboard?.writeText(item.text || ""); setContextMenu(null); } }, "复制消息"), h("button", { onClick: () => { setContextMenu(null); onForward?.(item, false); } }, "转发"), h("button", { onClick: () => { setContextMenu(null); onTogglePinMessage?.(item); } }, pinnedEventIds.includes(item.id) ? "取消置顶消息" : "置顶消息"), reactions.length > 0 && h("button", { onClick: () => { setContextMenu(null); Toast.info(`该消息有 ${reactions.reduce((sum, entry) => sum + entry[1], 0)} 个回应`); } }, "查看回应详情"), item.isMe && h("button", { onClick: () => { setContextMenu(null); onEdit(item); } }, "编辑"), item.isMe && h("button", { className: "danger", onClick: () => { setContextMenu(null); onRedact(item); } }, "撤回")))), documentModal && h("div", { className: "document-modal-backdrop", onMouseDown: event => event.target === event.currentTarget && setDocumentModal(null) }, h("div", { className: "document-modal" }, h("div", { className: "document-modal-head" }, h("div", null, h("strong", null, documentModal === "edit" ? "在线编辑文档" : "在线预览文档"), h("span", null, item.attachment?.name)), h("div", { className: "document-modal-head-actions" }, isTextAttachment && documentPreview.status === "ready" && h(UiButton, { size: "small", onClick: () => navigator.clipboard?.writeText(documentPreview.text).then(() => Toast.success("文本已复制")) }, "一键复制"), h("button", { type: "button", onClick: () => setDocumentModal(null), "aria-label": "关闭" }, "×"))), documentContent, documentModal === "edit" && h("div", { className: "document-modal-hint" }, docKind?.ext === "docx" || docKind?.ext === "doc" ? "当前为可编辑文本预览，修改内容后请复制保存；如需保留原始 DOCX 排版，请下载后使用 Office。" : "此格式暂不支持浏览器内编辑，建议下载后使用 Office。"), h("div", { className: "document-modal-actions" }, h(UiButton, { className: "ghost-btn", onClick: downloadAttachment }, "下载文件"), h(UiButton, { variant: "primary", onClick: () => setDocumentModal(null) }, "完成")))), h(MediaLightbox, { viewer, onClose: () => setViewer(null) }));
 }
@@ -1202,7 +1229,7 @@ function ThreadPanel({ root, replies = [], client, onClose, onJumpTo }) {
 }
 
 function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, onSend, onTyping, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onEmojiSelect, replyTo, threadRoot, editing, onCancelReply, onCancelThread, onCancelEdit, onUpload, detailsCollapsed, onToggleDetails, selecting, forwardItems, onSelectForward, onStartSelecting, pinnedEventIds, onTogglePinMessage, onOpenDetails, onStartCall }) {
-  const [draft, setDraft] = useState(""); const [remoteTyping, setRemoteTyping] = useState([]); const inputRef = useRef(null); const fileRef = useRef(null); const scrollRef = useRef(null); const forceScrollRef = useRef(false); const pendingRoomScrollRef = useRef(null); const loadingEarlierRef = useRef(false); const [showJump, setShowJump] = useState(false); const [loadingEarlier, setLoadingEarlier] = useState(false); const [historyExhausted, setHistoryExhausted] = useState(false);
+  const [draft, setDraft] = useState(""); const [draftHtml, setDraftHtml] = useState(""); const [remoteTyping, setRemoteTyping] = useState([]); const inputRef = useRef(null); const fileRef = useRef(null); const scrollRef = useRef(null); const forceScrollRef = useRef(false); const pendingRoomScrollRef = useRef(null); const loadingEarlierRef = useRef(false); const [showJump, setShowJump] = useState(false); const [loadingEarlier, setLoadingEarlier] = useState(false); const [historyExhausted, setHistoryExhausted] = useState(false);
   React.useEffect(() => {
     if (!client || !room?.id) { setRemoteTyping([]); return; }
     const update = (_event, member) => {
@@ -1219,15 +1246,16 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
   }, [client, room?.id]);
   typingUsers = remoteTyping;
   const [mentionTargets, setMentionTargets] = useState([]);
-  React.useEffect(() => { setDraft(editing?.text || ""); setHistoryExhausted(false); if (room?.id) pendingRoomScrollRef.current = room.id; }, [room?.id, editing?.id]);
+  React.useEffect(() => { setDraft(editing?.text || ""); setDraftHtml(""); setMentionTargets([]); setHistoryExhausted(false); if (room?.id) pendingRoomScrollRef.current = room.id; }, [room?.id, editing?.id]);
   React.useEffect(() => { const el = scrollRef.current; if (!el || !room?.id || pendingRoomScrollRef.current !== room.id) return; requestAnimationFrame(() => { if (!scrollRef.current || pendingRoomScrollRef.current !== room.id) return; scrollRef.current.scrollTop = scrollRef.current.scrollHeight; pendingRoomScrollRef.current = null; setShowJump(false); }); }, [room?.id, messages.length]);
   React.useEffect(() => { const el = scrollRef.current; if (!el || !forceScrollRef.current) return; requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; forceScrollRef.current = false; }); }, [messages.length]);
-  const send = async () => { const text = draft.trim(); if (!text) return; setDraft(""); forceScrollRef.current = true; await onSend(text); setTimeout(() => { const el = scrollRef.current; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); setShowJump(false); }, 350); };
+  const send = async () => { const text = draft.trim(); if (!text) return; const pending = (window.orbitPendingMentions || {})[room?.id] || []; const mentions = [...mentionTargets, ...pending].filter((entry, index, list) => entry?.userId && text.includes(`@${String(entry.name || "").replace(/^@/, "")}`) && list.findIndex(other => other.userId === entry.userId) === index); setDraft(""); setDraftHtml(""); setMentionTargets([]); forceScrollRef.current = true; await onSend(text, draftHtml, mentions); setTimeout(() => { const el = scrollRef.current; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); setShowJump(false); }, 350); };
   const keyDown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
   const loadEarlier = async () => { if (loadingEarlierRef.current || historyExhausted) return; const el = scrollRef.current; loadingEarlierRef.current = true; setLoadingEarlier(true); const beforeHeight = el?.scrollHeight || 0; try { const loaded = await onLoadMore?.(); if (loaded === false) setHistoryExhausted(true); requestAnimationFrame(() => { if (el) el.scrollTop += el.scrollHeight - beforeHeight; }); } finally { loadingEarlierRef.current = false; setLoadingEarlier(false); } };
   const jumpBottom = () => { const el = scrollRef.current; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); };
   if (!room) return h("main", { className: "main-panel" }, h("div", { className: "empty-messages" }, "登录后选择一个房间开始聊天"));
   const insertEmoji = item => { const token = `:${item.name}:`; setDraft(value => `${value}${value && !value.endsWith(" ") ? " " : ""}${token} `); requestAnimationFrame(() => inputRef.current?.focus?.()); };
+  const insertMention = mention => { const userId = mention?.userId; const name = String(mention?.name || userId || "").replace(/^@/, "").trim(); if (!userId || !name) return; setMentionTargets(current => current.some(entry => entry.userId === userId) ? current : [...current, { userId, name }]); const current = String(draft || ""); const prefix = current && !/[\s\n]$/.test(current) ? " " : ""; inputRef.current?.insertText?.(`${prefix}@${name} `); };
   const handleFiles = files => { const list = [...(files || [])].filter(file => file && file.size >= 0); if (!list.length || !onUpload) return; list.reduce((chain, file) => chain.then(() => onUpload(file)), Promise.resolve()).catch(() => {}); };
   const threadReplies = threadRoot ? messages.filter(item => item.type !== "empty" && item.threadRoot === threadRoot.id) : [];
   messages.forEach((item, index) => { const previous = messages[index - 1]; const sameSender = previous && item.type !== "empty" && previous.type !== "empty" && item.handle && item.handle === previous.handle; const sameMinute = sameSender && item.time && item.time === previous.time; item.grouped = Boolean(sameMinute); });
