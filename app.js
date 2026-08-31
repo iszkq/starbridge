@@ -149,20 +149,28 @@ async function composeEmojiRowFile(items) {
 // understand Orbit's catalog or shortcode format.
 async function sendEmojiImageEvents(client, roomId, items, encryptedRoom, sendFn = client.sendMessage?.bind(client)) {
   if (!items?.length) return;
-  // Always send one event. Animated sources are retained in Orbit metadata;
-  // the standard PNG row remains readable by other Matrix clients.
-  const animated = item => /(?:gif|webp|apng)(?:$|[?#])/i.test(`${item?.fileName || ""} ${item?.name || ""} ${item?.url || ""}`) || /image\/(?:gif|webp|apng)/i.test(String(item?.mimeType || ""));
-  const batches = [items];
-  for (const batch of batches) {
-    const file = await composeEmojiRowFile(batch);
-    const { uploaded, fileInfo } = await uploadMatrixMedia(client, file, encryptedRoom);
-    const width = batch.length === 1 ? 40 : batch.length * 44 - 4;
-    const content = { msgtype: "m.image", body: "表情", info: { mimetype: file.type, w: width, h: 40, size: file.size } };
-    content["org.orbit.emoji_items"] = batch.map(item => ({ id: item.id || item.name, name: item.name, url: item.url, thumbUrl: item.thumbUrl || item.url, animated: animated(item) }));
-    if (fileInfo) content.file = { ...fileInfo, url: uploaded.content_uri };
-    else content.url = uploaded.content_uri;
-    await sendFn(roomId, content);
+  // Cinny's interoperable pattern: upload each remote emoji to Matrix, then
+  // put all original (including animated GIF/WebP) MXC URLs in one formatted
+  // HTML text event. This is one event, while every client can load the
+  // standard <img src="mxc://…"> elements and preserve animation.
+  const uploaded = [];
+  for (const item of items) {
+    const blob = await fetchEmojiBlob(item);
+    const type = blob.type || item.mimeType || "image/gif";
+    const ext = type.split("/")[1] || "gif";
+    const file = new File([blob], item.fileName || `${item.name || "emoji"}.${ext}`, { type });
+    // The media itself stays unencrypted here on purpose. The room event is
+    // encrypted by Matrix, while a plain MXC image in formatted_body is the
+    // only representation that Element/Cinny and other clients can render as
+    // an animated inline image. The source assets are public emoji artwork,
+    // not room content.
+    const result = await uploadMatrixMedia(client, file, false);
+    if (!result?.uploaded?.content_uri) throw new Error("Matrix 未返回表情媒体地址");
+    uploaded.push({ item, mxc: result.uploaded.content_uri });
   }
+  const body = uploaded.map(({ item }) => `:${item.name || "表情"}:`).join(" ");
+  const formattedBody = uploaded.map(({ item, mxc }) => `<img src="${mxc}" alt="${escapeEditorText(item.name || "表情")}" title="${escapeEditorText(item.name || "表情")}" data-mx-emoticon="1">`).join(" ");
+  await sendFn(roomId, { msgtype: "m.text", body, format: "org.matrix.custom.html", formatted_body: formattedBody });
 }
 
 function mediaRequestUrl(client, url) {
@@ -924,26 +932,24 @@ async function saveEditedAttachment(client, item, buffer, fileName, mimeType) {
 let orbitOfficeCryptoPromise;
 async function decryptOfficeForEditor(buffer, fileName) {
   if (!buffer) return buffer;
-  try {
-    orbitOfficeCryptoPromise ||= import("https://esm.sh/officecrypto-tool@0.0.19?bundle");
-    const crypto = await orbitOfficeCryptoPromise;
-    if (!crypto?.isEncrypted?.(buffer)) return buffer;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const password = window.prompt(`文件“${fileName || "Office 文件"}”已加密，请输入密码：`, "");
-      if (password == null) throw new Error("已取消密码输入");
-      try {
-        const plain = await crypto.decrypt(buffer, { password });
-        const bytes = plain instanceof Uint8Array ? plain : new Uint8Array(plain);
-        return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-      } catch (error) {
-        if (attempt === 2) throw new Error("Office 文件密码错误或解密失败");
-      }
+  orbitOfficeCryptoPromise ||= import("https://esm.sh/officecrypto-tool@0.0.19?bundle");
+  let crypto;
+  try { crypto = await orbitOfficeCryptoPromise; } catch (error) { console.warn("Office 解密模块加载失败", error); return buffer; }
+  let encrypted = false;
+  try { encrypted = Boolean(crypto?.isEncrypted?.(buffer)); } catch (error) { console.warn("Office 加密检测失败", error); return buffer; }
+  if (!encrypted) return buffer;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const password = window.prompt(`文件“${fileName || "Office 文件"}”已加密，请输入密码：`, "");
+    if (password == null) throw new Error("已取消密码输入");
+    try {
+      const plain = await crypto.decrypt(buffer, { password });
+      const bytes = plain instanceof Uint8Array ? plain : new Uint8Array(plain);
+      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    } catch (error) {
+      if (attempt === 2) throw new Error("Office 文件密码错误或解密失败");
     }
-  } catch (error) {
-    if (/已取消密码输入|密码错误|解密失败/.test(String(error?.message || ""))) throw error;
-    console.warn("Office 加密检测失败，将交给编辑器处理", error);
   }
-  return buffer;
+  throw new Error("Office 文件解密失败");
 }
 
 function EmojiRowMedia({ items = [], client, onOpen, fallback }) {
@@ -954,6 +960,18 @@ function EmojiRowMedia({ items = [], client, onOpen, fallback }) {
     const src = assetRequestUrl(source);
     return h("img", { key: emoji?.id || `${emoji?.name || "emoji"}-${index}`, className: "message-emoji-tile", src, alt: emoji?.name || "表情", loading: "lazy", onError: () => setFailed(value => value + 1), onClick: () => src && onOpen?.(src, emoji?.name || "表情") });
   }));
+}
+
+function MediaPlayer({ src, type = "video", className = "" }) {
+  const ref = useRef(null);
+  const [rate, setRate] = useState(1);
+  const rates = [0.75, 1, 1.25, 1.5, 2];
+  const changeRate = event => { const next = Number(event.target.value) || 1; setRate(next); if (ref.current) ref.current.playbackRate = next; };
+  return h("div", { className: `media-player ${type === "audio" ? "media-player-audio" : "media-player-video"}` },
+    type === "audio" ? h("div", { className: "audio-art", "aria-hidden": "true" }, "♪") : null,
+    type === "video" ? h("video", { ref, className, src, controls: true, preload: "metadata", playsInline: true }) : h("audio", { ref, className, src, controls: true, preload: "metadata" }),
+    h("label", { className: "media-rate" }, "倍速", h("select", { value: rate, onChange: changeRate, "aria-label": "播放倍速" }, rates.map(value => h("option", { key: value, value }, `${value}x`))))
+  );
 }
 
 function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onMention, onTogglePinMessage, pinnedEventIds = [], selecting, selected, onSelect, grouped = item?.grouped || false }) {
@@ -1069,7 +1087,7 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
   const fileUrl = asset.src;
   const emojiRow = item.emojiItems?.length && fileUrl ? h(EmojiRowMedia, { items: item.emojiItems, client, fallback: fileUrl, onOpen: (src, alt) => setViewer({ src, alt }) }) : null;
   const reactions = Object.entries(item.reactions || {});
-  const media = item.attachment && fileUrl && (item.attachment.type === "m.image" ? h("img", { className: `message-image ${item.attachment.emoji ? "message-emoji-image" : ""} ${item.attachment.sticker ? "message-sticker" : ""}`, src: fileUrl, alt: item.attachment.name || "图片", loading: "lazy", onClick: () => setViewer({ src: fileUrl, alt: item.attachment.name || "图片" }) }) : item.attachment.type === "m.video" ? h("video", { className: "message-video", src: fileUrl, controls: true, preload: "metadata" }) : item.attachment.type === "m.audio" ? h("audio", { className: "message-audio", src: fileUrl, controls: true, preload: "metadata" }) : null);
+  const media = item.attachment && fileUrl && (item.attachment.type === "m.image" ? h("img", { className: `message-image ${item.attachment.emoji ? "message-emoji-image" : ""} ${item.attachment.sticker ? "message-sticker" : ""}`, src: fileUrl, alt: item.attachment.name || "图片", loading: "lazy", onClick: () => setViewer({ src: fileUrl, alt: item.attachment.name || "图片" }) }) : item.attachment.type === "m.video" ? h(MediaPlayer, { type: "video", className: "message-video", src: fileUrl }) : item.attachment.type === "m.audio" ? h(MediaPlayer, { type: "audio", className: "message-audio", src: fileUrl }) : null);
   const fetchAttachmentBlob = async () => { if (!asset.url) throw new Error("附件地址不可用"); const token = client?.getAccessToken?.(); const candidates = mediaRequestCandidates(client, rawUrl, asset.url); let lastError = null; for (const candidate of candidates) { try { const response = await fetch(candidate, { cache: "no-store", headers: token ? { Authorization: `Bearer ${token}` } : undefined }); if (response.ok) { const encryptedBuffer = await response.arrayBuffer(); const plainBuffer = await decryptMatrixBuffer(encryptedBuffer, item.attachment?.file); const blob = new Blob([plainBuffer], { type: item.attachment?.file?.mimetype || item.attachment?.info?.mimetype || response.headers.get("content-type") || "application/octet-stream" }); if (blob.size > 0) return blob; } lastError = new Error(`媒体请求失败（${response.status}）`); } catch (error) { lastError = error; } } throw lastError || new Error("媒体请求失败"); };
   const openOriginal = async e => { e?.preventDefault?.(); if (documentAttachment) return setDocumentModal("preview"); try { const blob = await fetchAttachmentBlob(); const opened = URL.createObjectURL(blob); window.open(opened, "_blank", "noopener,noreferrer"); setTimeout(() => URL.revokeObjectURL(opened), 60000); } catch { Toast.error("原文件打开失败，请稍后重试"); } };
   const downloadAttachment = async e => { e?.preventDefault?.(); try { const blob = await fetchAttachmentBlob(); const href = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = href; link.download = item.attachment?.name || "附件"; document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(href), 60000); } catch { Toast.error("文件下载失败，请稍后重试"); } };
@@ -1154,7 +1172,32 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
         let sent = false;
         let password = "";
         let passwordAttempts = 0;
-         const send = (nextPassword = password, force = false) => { if (sent && !force) return; sent = true; password = nextPassword || ""; const payload = { type: "xinghuo-office-open", requestId, buffer: buffer.slice(0), password, fileName: item.attachment?.name || "document", fileType: docKind?.ext || "", mimeType: item.attachment?.info?.mimetype || blob.type || "application/octet-stream" }; try { frame.contentWindow?.postMessage(payload, officeOrigin, [payload.buffer]); } catch (error) { try { payload.buffer = buffer.slice(0); frame.contentWindow?.postMessage(payload, "*", [payload.buffer]); } catch (fallbackError) { sent = false; setOfficeSaving(false); Toast.error(`Office 编辑器连接失败：${fallbackError?.message || error?.message || "目标窗口来源不匹配"}`); } } };
+        const postOfficeMessage = (payload, transfer) => {
+          if (!frame.contentWindow) return false;
+          try { frame.contentWindow?.postMessage(payload, officeOrigin, transfer || []); return true; }
+          catch (error) { try { frame.contentWindow?.postMessage(payload, "*", transfer || []); return true; } catch (fallbackError) { Toast.error(`Office 编辑器连接失败：${fallbackError?.message || error?.message || "目标窗口来源不匹配"}`); return false; } }
+        };
+        const toBase64 = bytes => { let binary = ""; const step = 0x8000; for (let offset = 0; offset < bytes.length; offset += step) binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + step, bytes.length))); return btoa(binary); };
+        const send = (nextPassword = password, force = false) => {
+          if (sent && !force) return;
+          sent = true; password = nextPassword || "";
+          const fileName = item.attachment?.name || "document";
+          const fileType = docKind?.ext || "";
+          const mimeType = item.attachment?.info?.mimetype || blob.type || "application/octet-stream";
+          // The Office bridge supports chunked transfer. Use it for larger
+          // files so browser structured-clone conversion cannot fail or hit
+          // the iframe's memory limit (the direct path remains fastest for
+          // normal documents).
+          if (buffer.byteLength > 8 * 1024 * 1024) {
+            const bytes = new Uint8Array(buffer); const chunkSize = 192 * 1024; const chunkCount = Math.ceil(bytes.byteLength / chunkSize);
+            if (!postOfficeMessage({ type: "xinghuo-office-source-begin", requestId, byteLength: bytes.byteLength, chunkCount, chunkSize, password, fileName, fileType, mimeType })) { sent = false; return; }
+            for (let index = 0; index < chunkCount; index += 1) { const start = index * chunkSize; const chunk = bytes.subarray(start, Math.min(start + chunkSize, bytes.byteLength)); if (!postOfficeMessage({ type: "xinghuo-office-source-chunk", requestId, chunkIndex: index, chunkData: toBase64(chunk) })) { sent = false; return; } }
+            postOfficeMessage({ type: "xinghuo-office-source-end", requestId });
+            return;
+          }
+          const payload = { type: "xinghuo-office-open", requestId, buffer: buffer.slice(0), password, fileName, fileType, mimeType };
+          if (!postOfficeMessage(payload, [payload.buffer])) sent = false;
+        };
         const onReady = event => {
           if (event.source !== frame.contentWindow || event.origin !== officeOrigin || event.data?.requestId && event.data.requestId !== requestId) return;
           if (event.data?.type === "xinghuo-office-ready") send();
@@ -1475,7 +1518,7 @@ function App() {
     }
     if (type === "secret") { if (typeof crypto.loadSessionBackupPrivateKeyFromSecretStorage === "function") { try { await crypto.loadSessionBackupPrivateKeyFromSecretStorage(); } catch (error) { const stored = await crypto.isKeyBackupKeyStored?.(version); if (!stored) throw error; } } }
     const result = type === "passphrase" ? await crypto.restoreKeyBackupWithPassphrase(passphrase, { progressCallback: p => setCryptoState(s => ({ ...s, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })) }) : await crypto.restoreKeyBackup({ progressCallback: p => setCryptoState(s => ({ ...s, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })) }); try { await crypto.bootstrapCrossSigning?.({ authUploadDeviceSigningKeys: async () => ({}) }); } catch {} await connected.client.retryImmediatelyDecryption?.(); await refresh(connected.client); setCryptoState(s => ({ ...s, restoring: false, restoreProgress: 100, keyRestored: true })); Toast.success(`密钥恢复完成，导入 ${result?.imported ?? 0} 个会话。若其他客户端仍显示未验证，请完成一次设备验证。`); } catch (error) { const raw = error?.message || "密钥恢复失败"; const mismatch = /does not match|mismatch|match.*decryption key/i.test(raw); const message = mismatch ? `恢复密钥与服务器备份版本 ${version} 不匹配。请确认这是该账号当前 Secret Storage 的恢复密钥；如果备份曾重置，请从 Element“设置 → 安全与隐私”获取最新密钥。` : raw; setCryptoState(s => ({ ...s, restoring: false, error: message })); Toast.error(message); } };
-  const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); setSyncing(true); setTimeout(() => setSyncing(false), 15000); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const authExpired = /unknown token|M_UNKNOWN_TOKEN|401/i.test(text); const message = authExpired ? "Matrix 登录状态已失效，请重新登录" : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired) { client.stopClient?.(); window.orbitMatrixClient = null; localStorage.removeItem("orbit.matrix.session"); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); } }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const selectedRoom = room?.roomId === selectedIdRef.current; if (selectedRoom && !document.hidden) { Promise.resolve(client.sendReadReceipt?.(event)).then(() => queueRefresh(client)).catch(() => {}); } if (prepared && eventId && room?.roomId !== selectedIdRef.current && !orbitNotifiedEvents.has(eventId)) { orbitNotifiedEvents.add(eventId); if (orbitNotifiedEvents.size > 500) orbitNotifiedEvents.delete(orbitNotifiedEvents.values().next().value); const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); if (typeof Notification !== "undefined" && Notification.permission === "granted") { try { new Notification(title, { body, tag: `orbit-${room?.roomId || "room"}` }); } catch {} } else if (!document.hidden) { Toast.info(`${title}：${body}`); } } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", () => queueRefresh(client)); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user.presence || "online"); queueRefresh(client); }); client.on("Event.decrypted", () => queueRefresh(client)); queueRefresh(client); setShowLogin(false); };
+  const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); setSyncing(true); setTimeout(() => setSyncing(false), 15000); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const authExpired = /unknown token|M_UNKNOWN_TOKEN|401/i.test(text); const message = authExpired ? "Matrix 登录状态已失效，请重新登录" : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired) { client.stopClient?.(); window.orbitMatrixClient = null; localStorage.removeItem("orbit.matrix.session"); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); } }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const selectedRoom = room?.roomId === selectedIdRef.current; if (selectedRoom && !document.hidden) { Promise.resolve(client.sendReadReceipt?.(event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && eventId && (room?.roomId !== selectedIdRef.current || document.hidden || !document.hasFocus?.()); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { orbitNotifiedEvents.add(eventId); if (orbitNotifiedEvents.size > 500) orbitNotifiedEvents.delete(orbitNotifiedEvents.values().next().value); const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); let desktopShown = false; if (typeof Notification !== "undefined" && Notification.permission === "granted") { try { new Notification(title, { body, tag: `orbit-${room?.roomId || "room"}` }); desktopShown = true; } catch {} } if (!desktopShown || !document.hidden) Toast.info(`${title}：${body}`); } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", () => queueRefresh(client)); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user.presence || "online"); queueRefresh(client); }); client.on("Event.decrypted", () => queueRefresh(client)); queueRefresh(client); setShowLogin(false); };
   React.useEffect(() => { const saved = localStorage.getItem("orbit.matrix.session"); if (!saved) return; (async () => { try { const session = JSON.parse(saved); const resolved = await resolveHomeserver(session.homeserver); const client = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, userId: session.userId, accessToken: session.accessToken, deviceId: session.deviceId, cryptoCallbacks: orbitCryptoCallbacks }); await initCryptoSafely(client); window.orbitMatrixClient = client; connectedHandler({ client, userId: session.userId, homeserver: resolved.homeserver }); client.startClient({ initialSyncLimit: 30 }); } catch { localStorage.removeItem("orbit.matrix.session"); } })(); }, []);
   React.useEffect(() => { installEmojiSendInterceptor(connected?.client); }, [connected?.client]);
   React.useEffect(() => {
@@ -1496,7 +1539,13 @@ function App() {
     if (!client?.sendMessage) return;
     const original = client.sendMessage.bind(client);
     client.sendMessage = (roomId, content, ...rest) => {
-      const pending = window.orbitPendingMentions?.[roomId] || [];
+      const room = client.getRoom?.(roomId);
+      const inferred = [...String(content?.body || "").matchAll(/@([^\s@<>,，。！？!?]+)/g)].map(match => {
+        const label = match[1];
+        const member = (room?.getJoinedMembers?.() || []).find(entry => String(entry?.name || entry?.rawDisplayName || "").replace(/^@/, "") === label);
+        return member ? { userId: member.userId, name: label } : null;
+      }).filter(Boolean);
+      const pending = [...(window.orbitPendingMentions?.[roomId] || []), ...inferred];
       if (content?.msgtype === "m.text" && pending.length) {
         const valid = pending.filter(entry => entry?.userId && String(content.body || "").includes(`@${String(entry.name || "").replace(/^@/, "")}`));
         if (valid.length) {
@@ -1512,7 +1561,7 @@ function App() {
   const visibleRooms = useMemo(() => { if (viewMode === "spaces") { const space = spaces.find(item => item.id === activeSpaceId); const childIds = spaceChildIds(space?.matrixRoom); return childIds.map(id => rooms.find(item => item.id === id)).filter(Boolean); } if (viewMode === "groups") return rooms.filter(item => item.isGroup); return rooms.filter(item => !item.isSpace && item.isDirect); }, [rooms, spaces, viewMode, activeSpaceId]);
   const room = useMemo(() => visibleRooms.find(item => item.id === selectedId) || null, [visibleRooms, selectedId]);
   const loadMore = async () => { if (!connected || !room) return false; try { const before = (messages[room.id] || []).filter(item => item.type !== "empty").length; await connected.client.scrollback(room.matrixRoom, 40); const loaded = await roomMessages(room.matrixRoom, connected.userId, connected.client); setMessages(current => ({ ...current, [room.id]: loaded })); return loaded.filter(item => item.type !== "empty").length > before; } catch (error) { Toast.error(`历史消息加载失败：${error?.message || "未知错误"}`); return false; } };
-  const send = async text => { if (!connected || !room) return; try { if (!editing && !replyTo && !threadRoot) { const catalog = window.orbitEmojiItems?.length ? window.orbitEmojiItems : await ensureEmojiCatalog(); const tokens = [...String(text).matchAll(/:([^:\s]+):/g)]; const emojiOnly = tokens.length > 0 && tokens.map(match => match[0]).join(" ").trim() === String(text).trim(); const emojiItems = emojiOnly ? tokens.map(match => catalog.find(item => item.name === match[1])).filter(Boolean) : []; if (emojiOnly && emojiItems.length === tokens.length) { await sendEmojiImageEvents(connected.client, room.id, emojiItems, Boolean(room.matrixRoom.hasEncryptionStateEvent?.())); refresh(connected.client); return; } } if (editing) { await connected.client.sendMessage(room.id, { msgtype: "m.text", body: `* ${text}`, "m.new_content": { msgtype: "m.text", body: text }, "m.relates_to": { rel_type: "m.replace", event_id: editing.id } }); setEditing(null); } else { const content = { msgtype: "m.text", body: text }; if (threadRoot) content["m.relates_to"] = { rel_type: "m.thread", event_id: threadRoot.id, "m.in_reply_to": { event_id: threadRoot.id } }; else if (replyTo) content["m.relates_to"] = { "m.in_reply_to": { event_id: replyTo.id } }; await connected.client.sendMessage(room.id, content); setReplyTo(null); setThreadRoot(null); } refresh(connected.client); } catch (error) { Toast.error(`消息发送失败：${error?.message || "未知错误"}`); throw error; } };
+  const send = async (text, _html, mentions = []) => { if (!connected || !room) return; try { if (!editing && !replyTo && !threadRoot) { const catalog = window.orbitEmojiItems?.length ? window.orbitEmojiItems : await ensureEmojiCatalog(); const tokens = [...String(text).matchAll(/:([^:\s]+):/g)]; const emojiOnly = tokens.length > 0 && tokens.map(match => match[0]).join(" ").trim() === String(text).trim(); const emojiItems = emojiOnly ? tokens.map(match => catalog.find(item => item.name === match[1])).filter(Boolean) : []; if (emojiOnly && emojiItems.length === tokens.length) { await sendEmojiImageEvents(connected.client, room.id, emojiItems, Boolean(room.matrixRoom.hasEncryptionStateEvent?.())); refresh(connected.client); return; } } if (editing) { await connected.client.sendMessage(room.id, { msgtype: "m.text", body: `* ${text}`, "m.new_content": { msgtype: "m.text", body: text }, "m.relates_to": { rel_type: "m.replace", event_id: editing.id } }); setEditing(null); } else { const content = { msgtype: "m.text", body: text }; const validMentions = (mentions || []).filter(entry => entry?.userId && String(text).includes(`@${String(entry.name || "").replace(/^@/, "")}`)); if (validMentions.length) { content["m.mentions"] = { user_ids: [...new Set(validMentions.map(entry => entry.userId))] }; content.format = "org.matrix.custom.html"; content.formatted_body = mentionHtml(text, validMentions); } if (threadRoot) content["m.relates_to"] = { rel_type: "m.thread", event_id: threadRoot.id, "m.in_reply_to": { event_id: threadRoot.id } }; else if (replyTo) content["m.relates_to"] = { "m.in_reply_to": { event_id: replyTo.id } }; await connected.client.sendMessage(room.id, content); setReplyTo(null); setThreadRoot(null); } refresh(connected.client); } catch (error) { Toast.error(`消息发送失败：${error?.message || "未知错误"}`); throw error; } };
   const react = async (item, key = "👍") => { try { const matrixRoom = room?.matrixRoom; const timelineEvents = matrixRoom?.getLiveTimeline?.().getEvents?.() || []; let candidates = timelineEvents; try { const relations = matrixRoom?.getRelationsForEvent?.(item.id, "m.annotation", "m.reaction"); const relatedEvents = relations?.getRelations?.() || relations?.events || []; if (relatedEvents.length) candidates = [...candidates, ...relatedEvents]; } catch {} const mine = candidates.find(event => event.getType?.() === "m.reaction" && event.getSender?.() === connected.userId && event.getContent?.()?.["m.relates_to"]?.event_id === item.id && event.getContent?.()?.["m.relates_to"]?.key === key); if (mine) await connected.client.redactEvent(room.id, mine.getId?.()); else await connected.client.sendEvent(room.id, "m.reaction", { "m.relates_to": { rel_type: "m.annotation", event_id: item.id, key } }); refresh(connected.client); } catch (error) { Toast.error(`回应操作失败：${error?.message || "未知错误"}`); } };
   const redact = async item => { if (!confirm("确定撤回这条消息吗？")) return; try { await connected.client.redactEvent(room.id, item.id); refresh(connected.client); } catch (error) { Toast.error(`撤回失败：${error?.message || "未知错误"}`); } };
   const upload = async file => { try { const encryptedRoom = Boolean(room.matrixRoom.hasEncryptionStateEvent?.()); const { uploaded, fileInfo } = await uploadMatrixMedia(connected.client, file, encryptedRoom); const type = file.type.startsWith("image/") ? "m.image" : file.type.startsWith("video/") ? "m.video" : file.type.startsWith("audio/") ? "m.audio" : "m.file"; const content = { msgtype: type, body: file.name, url: uploaded.content_uri, info: { mimetype: file.type, size: file.size } }; if (fileInfo) content.file = fileInfo; await connected.client.sendMessage(room.id, content); Toast.success(encryptedRoom ? "加密文件已发送" : "文件已发送"); refresh(connected.client); } catch (error) { Toast.error(`文件发送失败：${error?.message || "未知错误"}`); } };

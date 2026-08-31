@@ -1244,20 +1244,24 @@ button { cursor: pointer; }
 /* Keep the quote preview and the reply in one shared bubble, matching the
    compact conversation treatment in the reference screenshot. */
 .message-content-stack.has-relation {
-  width: fit-content;
-  max-width: min(100%, 640px);
+  display: inline-flex;
+  align-self: flex-start;
+  width: auto;
+  max-width: min(100%, 560px);
   padding: 8px 11px 9px !important;
   border: 1px solid #dfe3ea !important;
   border-radius: 5px 13px 13px 13px !important;
   background: #eef0f3 !important;
 }
 .message-row.me .message-content-stack.has-relation {
+  align-self: flex-end;
   border-color: #c9defb !important;
   border-radius: 13px 5px 13px 13px !important;
   background: #e7f2ff !important;
 }
 .message-content-stack.has-relation .relation-context {
-  width: min(100%, 440px) !important;
+  width: auto !important;
+  max-width: min(100%, 520px) !important;
   margin-bottom: 4px !important;
   padding: 2px 4px 3px 6px !important;
   border-left-width: 2px !important;
@@ -1385,6 +1389,33 @@ button { cursor: pointer; }
 .message-row.emoji-message-row .message-body { width: auto; max-width: min(760px, calc(100% - 2px)); flex: 1 1 auto; }
 .message-row.emoji-message-row .message-content-stack { display: flex; max-width: 100%; }
 .message-row.emoji-message-row .attachment-wrap { width: fit-content; max-width: 100%; margin-top: 7px; }
+.message-row.emoji-message-row .message-avatar,
+.message-row.emoji-message-row .message-author,
+.message-row.emoji-message-row .message-actions { display: flex !important; }
+.message-row.emoji-message-row .message-author { align-items: center; }
+.message-row.emoji-message-row .message-content-stack { align-items: inherit; }
+.message-row.me.emoji-message-row .message-content-stack { align-items: flex-end; }
+.media-player { position: relative; overflow: hidden; border: 1px solid #dfe5ef; border-radius: 14px; background: #f8fafc; box-shadow: 0 8px 22px rgba(16,24,40,.08); }
+.media-player-video { width: min(560px, 68vw); }
+.media-player-video video { display: block; width: 100%; max-height: 420px; background: #111827; object-fit: contain; }
+.media-player-audio { display: flex; align-items: center; gap: 10px; width: min(460px, 68vw); padding: 10px 12px; background: linear-gradient(135deg, #f7f9ff, #eef3ff); }
+.media-player-audio audio { flex: 1 1 auto; min-width: 0; }
+.audio-art { display: grid; width: 38px; height: 38px; flex: 0 0 38px; place-items: center; border-radius: 10px; color: #356df3; background: #dfe9ff; font-size: 22px; }
+.media-rate { display: inline-flex; align-items: center; gap: 4px; position: absolute; right: 10px; bottom: 10px; padding: 3px 6px; border-radius: 6px; color: #fff; background: rgba(15,23,42,.72); font-size: 11px; }
+.media-player-video .media-rate { top: 10px; bottom: auto; }
+.media-player-audio .media-rate { position: static; color: #475467; background: #fff; border: 1px solid #d0d5dd; }
+.media-rate select { border: 0; outline: 0; color: inherit; background: transparent; font-size: 11px; cursor: pointer; }
+.media-rate select:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; border-radius: 3px; }
+.media-player-audio .media-rate select { color: #344054; }
+
+@media (max-width: 640px) {
+  .media-player-video { width: min(100%, 92vw); }
+  .media-player-video video { max-height: 54vh; }
+  .media-player-audio { width: min(100%, 92vw); gap: 7px; padding: 8px; }
+  .audio-art { width: 32px; height: 32px; flex-basis: 32px; font-size: 18px; }
+  .message-content-stack.has-relation { max-width: 100%; }
+  .message-content-stack.has-relation .relation-context { max-width: 100% !important; }
+}
 .message-image.message-sticker {
   width: auto;
   max-width: min(280px, 72vw);
