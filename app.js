@@ -989,7 +989,7 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
     const author = row?.querySelector(".message-author-name");
     if (!author) return;
     const rememberMention = () => {
-      const roomId = item.roomId;
+      const roomId = item.roomId || window.orbitActiveRoomId;
       const key = roomId || "*";
       const pending = window.orbitPendingMentions || {};
       const list = pending[key] || [];
