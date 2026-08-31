@@ -90,6 +90,12 @@ function encodeBase64Url(bytes) {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
+async function decryptMatrixBuffer(buffer, encryptedInfo) {
+  if (!encryptedInfo?.key?.k || !encryptedInfo?.iv) return buffer;
+  const key = await window.crypto.subtle.importKey("raw", decodeBase64(encryptedInfo.key.k), { name: "AES-CTR" }, false, ["decrypt"]);
+  return window.crypto.subtle.decrypt({ name: "AES-CTR", counter: decodeBase64(encryptedInfo.iv), length: 64 }, key, buffer);
+}
+
 async function uploadMatrixMedia(client, file, encrypted = false) {
   if (!encrypted || !window.crypto?.subtle) {
     const uploaded = await client.uploadContent(file, { name: file.name, type: file.type });
@@ -230,8 +236,7 @@ function useMatrixAsset(client, rawUrl, width = null, height = null, resizeMetho
     const fetchMedia = async () => { let lastError = null; for (const candidate of mediaRequestCandidates(client, rawUrl, requestUrl)) { try { const response = await fetch(candidate, { headers: { Authorization: `Bearer ${token}` } }); if (response.ok) { if (candidate !== requestUrl && active) setResolvedUrl(candidate); return response.arrayBuffer(); } lastError = new Error(`媒体请求失败（${response.status}）`); } catch (error) { lastError = error; } } throw lastError || new Error("媒体请求失败"); };
     fetchMedia().then(async buffer => {
       if (!encrypted) return new Blob([buffer]);
-      const key = await crypto.subtle.importKey("raw", decodeBase64(encryptedInfo.key.k), { name: "AES-CTR" }, false, ["decrypt"]);
-      const plain = await crypto.subtle.decrypt({ name: "AES-CTR", counter: decodeBase64(encryptedInfo.iv), length: 64 }, key, buffer);
+      const plain = await decryptMatrixBuffer(buffer, encryptedInfo);
       return new Blob([plain], { type: encryptedInfo.mimetype || "application/octet-stream" });
     }).then(blob => { if (active) { objectUrl = URL.createObjectURL(blob); setSrc(objectUrl); } }).catch(error => { console.warn("媒体解密失败", error); if (active) setFailed(true); });
     return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
@@ -624,7 +629,7 @@ async function roomMessages(room, userId, client) {
       const receipt = room.getLastUnthreadedReceiptFor?.(memberId);
       const wrappedReceipt = room.getReadReceiptForUserId?.(memberId, true);
       const entry = { userId: memberId, name: member.name || memberId, ts: receipt?.ts || wrappedReceipt?.data?.ts || null };
-      message.readBy = [...(message.readBy || []), entry];
+      message.readBy = [...(message.readBy || []), entry].sort((a, b) => (Number(b.ts) || 0) - (Number(a.ts) || 0));
     });
   }
   // Keep a generous window so “加载更早的消息” can prepend a page while
@@ -879,11 +884,61 @@ async function decodeTextAttachment(blob) {
   return new TextDecoder().decode(bytes);
 }
 
+function shortenAttachmentName(name, maxLength = 30) {
+  const original = String(name || "附件");
+  if (original.length <= maxLength) return original;
+  const dot = original.lastIndexOf(".");
+  const ext = dot > 0 && dot < original.length - 1 ? original.slice(dot).toLowerCase() : "";
+  if (/^\.(?:png|jpe?g|gif|webp|svg|bmp|avif)$/i.test(ext)) return `image${ext}`;
+  const keep = Math.max(8, maxLength - ext.length - 1);
+  return `${original.slice(0, keep)}…${ext}`;
+}
+
+async function saveEditedAttachment(client, item, buffer, fileName, mimeType) {
+  if (!client || !item?.roomId || !item?.id || !buffer) throw new Error("无法保存文件：缺少房间或文件信息");
+  const name = fileName || item.attachment?.name || "document";
+  const type = mimeType || item.attachment?.info?.mimetype || "application/octet-stream";
+  const file = new File([buffer], name, { type });
+  const encrypted = Boolean(item.attachment?.file?.key?.k && item.attachment?.file?.iv);
+  const { uploaded, fileInfo } = await uploadMatrixMedia(client, file, encrypted);
+  const msgtype = item.attachment?.type || "m.file";
+  const info = { ...(item.attachment?.info || {}), mimetype: type, size: file.size };
+  const content = { msgtype, body: name, info, "m.relates_to": { rel_type: "m.replace", event_id: item.id }, "m.new_content": { msgtype, body: name, info } };
+  if (fileInfo) {
+    content.file = { ...fileInfo, url: uploaded.content_uri };
+    content["m.new_content"].file = content.file;
+  } else {
+    content.url = uploaded.content_uri;
+    content["m.new_content"].url = uploaded.content_uri;
+  }
+  await client.sendMessage(item.roomId, content);
+}
+
 function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onMention, onTogglePinMessage, pinnedEventIds = [], selecting, selected, onSelect, grouped = item?.grouped || false }) {
   const [contextMenu, setContextMenu] = useState(null);
   const [viewer, setViewer] = useState(null);
   const [documentModal, setDocumentModal] = useState(null);
   const [documentPreview, setDocumentPreview] = useState({ status: "idle", html: "", text: "", url: "", error: "" });
+  const [officeDirty, setOfficeDirty] = useState(false);
+  const [officeSaving, setOfficeSaving] = useState(false);
+  const officeFrameRef = useRef(null);
+  const officeRequestIdRef = useRef("");
+  const officeSaveIdRef = useRef("");
+  const requestOfficeSave = () => {
+    const frame = officeFrameRef.current;
+    if (!frame?.contentWindow || !officeRequestIdRef.current || officeSaving) return false;
+    const saveId = `save-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    officeSaveIdRef.current = saveId;
+    setOfficeSaving(true);
+    frame.contentWindow.postMessage({ type: "xinghuo-office-save", requestId: officeRequestIdRef.current, saveId }, new URL(orbitOfficeEditorUrl, location.href).origin);
+    return true;
+  };
+  const closeDocument = () => {
+    if (officeDirty) {
+      if (window.confirm("文件有未保存的修改。点击“确定”先保存，点击“取消”放弃修改并关闭。")) { requestOfficeSave(); return; }
+    }
+    setDocumentModal(null);
+  };
   useEffect(() => { if (!contextMenu) return; const close = () => setContextMenu(null); document.addEventListener("click", close); return () => document.removeEventListener("click", close); }, [contextMenu]);
   useEffect(() => { if (!item.threadRoot || !item.id) return; const row = document.getElementById(`event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`); const reference = row?.querySelector(".thread-reference"); if (!reference) return; const open = event => { event.stopPropagation(); onThread?.(item); }; reference.setAttribute("role", "button"); reference.setAttribute("tabindex", "0"); reference.addEventListener("click", open); return () => reference.removeEventListener("click", open); }, [item.id, item.threadRoot, onThread]);
   useEffect(() => {
@@ -971,7 +1026,7 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
   const fileUrl = asset.src;
   const reactions = Object.entries(item.reactions || {});
   const media = item.attachment && fileUrl && (item.attachment.type === "m.image" ? h("img", { className: `message-image ${item.attachment.emoji ? "message-emoji-image" : ""} ${item.attachment.sticker ? "message-sticker" : ""}`, src: fileUrl, alt: item.attachment.name || "图片", loading: "lazy", onClick: () => setViewer({ src: fileUrl, alt: item.attachment.name || "图片" }) }) : item.attachment.type === "m.video" ? h("video", { className: "message-video", src: fileUrl, controls: true, preload: "metadata" }) : item.attachment.type === "m.audio" ? h("audio", { className: "message-audio", src: fileUrl, controls: true, preload: "metadata" }) : null);
-  const fetchAttachmentBlob = async () => { if (!asset.url) throw new Error("附件地址不可用"); const token = client?.getAccessToken?.(); const candidates = mediaRequestCandidates(client, rawUrl, asset.url); let lastError = null; for (const candidate of candidates) { try { const response = await fetch(candidate, { cache: "no-store", headers: token ? { Authorization: `Bearer ${token}` } : undefined }); if (response.ok) { const blob = await response.blob(); if (blob.size > 0) return blob; } lastError = new Error(`媒体请求失败（${response.status}）`); } catch (error) { lastError = error; } } throw lastError || new Error("媒体请求失败"); };
+  const fetchAttachmentBlob = async () => { if (!asset.url) throw new Error("附件地址不可用"); const token = client?.getAccessToken?.(); const candidates = mediaRequestCandidates(client, rawUrl, asset.url); let lastError = null; for (const candidate of candidates) { try { const response = await fetch(candidate, { cache: "no-store", headers: token ? { Authorization: `Bearer ${token}` } : undefined }); if (response.ok) { const encryptedBuffer = await response.arrayBuffer(); const plainBuffer = await decryptMatrixBuffer(encryptedBuffer, item.attachment?.file); const blob = new Blob([plainBuffer], { type: item.attachment?.file?.mimetype || item.attachment?.info?.mimetype || response.headers.get("content-type") || "application/octet-stream" }); if (blob.size > 0) return blob; } lastError = new Error(`媒体请求失败（${response.status}）`); } catch (error) { lastError = error; } } throw lastError || new Error("媒体请求失败"); };
   const openOriginal = async e => { e?.preventDefault?.(); if (documentAttachment) return setDocumentModal("preview"); try { const blob = await fetchAttachmentBlob(); const opened = URL.createObjectURL(blob); window.open(opened, "_blank", "noopener,noreferrer"); setTimeout(() => URL.revokeObjectURL(opened), 60000); } catch { Toast.error("原文件打开失败，请稍后重试"); } };
   const downloadAttachment = async e => { e?.preventDefault?.(); try { const blob = await fetchAttachmentBlob(); const href = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = href; link.download = item.attachment?.name || "附件"; document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(href), 60000); } catch { Toast.error("文件下载失败，请稍后重试"); } };
   const openOfficeEditor = async e => { e?.preventDefault?.(); setDocumentModal("edit"); };
@@ -1029,6 +1084,7 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
   useEffect(() => {
     if (!documentModal || !isOfficeAttachment || !asset.url) return;
     let active = true;
+    let removeOfficeListener = () => {};
     const requestId = `orbit-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const officeOrigin = new URL(orbitOfficeEditorUrl, location.href).origin;
     const params = new URLSearchParams({ embed: "1", editing: documentModal === "edit" ? "1" : "0", requestId, parentOrigin: location.origin });
@@ -1045,22 +1101,45 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
         frame.className = "document-modal-frame office-editor-frame";
         frame.title = item.attachment?.name || "Office 在线编辑器";
         frame.src = iframeUrl;
+        officeFrameRef.current = frame;
+        officeRequestIdRef.current = requestId;
+        officeSaveIdRef.current = "";
         placeholder.replaceWith(frame);
         let sent = false;
         let password = "";
         const send = (nextPassword = password, force = false) => { if (sent && !force) return; sent = true; password = nextPassword || ""; const transferBuffer = buffer.slice(0); frame.contentWindow?.postMessage({ type: "xinghuo-office-open", requestId, buffer: transferBuffer, password, fileName: item.attachment?.name || "document", fileType: docKind?.ext || "", mimeType: item.attachment?.info?.mimetype || blob.type || "application/octet-stream" }, officeOrigin, [transferBuffer]); };
-        const onReady = event => { if (event.source === frame.contentWindow && event.origin === officeOrigin && event.data?.type === "xinghuo-office-ready" && event.data?.requestId === requestId) send(); if (event.source === frame.contentWindow && event.origin === officeOrigin && event.data?.type === "xinghuo-office-password-required") { const next = window.prompt("此 Office 文件需要密码，请输入文件密码：", ""); if (next) send(next, true); } };
+        const onReady = event => {
+          if (event.source !== frame.contentWindow || event.origin !== officeOrigin || event.data?.requestId && event.data.requestId !== requestId) return;
+          if (event.data?.type === "xinghuo-office-ready") send();
+          if (event.data?.type === "xinghuo-office-password-required") { const next = window.prompt("此 Office 文件需要密码，请输入文件密码：", ""); if (next) send(next, true); }
+          if (event.data?.type === "xinghuo-office-dirty") { setOfficeDirty(Boolean(event.data.dirty)); setOfficeSaving(false); }
+          if (event.data?.type === "xinghuo-office-saving") setOfficeSaving(true);
+          if (event.data?.type === "xinghuo-office-saved") {
+            const savedBuffer = event.data.buffer instanceof ArrayBuffer ? event.data.buffer : event.data.buffer?.buffer instanceof ArrayBuffer ? event.data.buffer.buffer : null;
+            if (!savedBuffer) { setOfficeSaving(false); Toast.error("Office 编辑器没有返回可保存的数据"); return; }
+            setOfficeSaving(true);
+            saveEditedAttachment(client, item, savedBuffer, event.data.fileName || item.attachment?.name, event.data.mimeType || item.attachment?.info?.mimetype)
+              .then(() => { if (active) { setOfficeDirty(false); setOfficeSaving(false); Toast.success("文件已保存回 Matrix"); } })
+              .catch(error => { if (active) { setOfficeSaving(false); Toast.error(`文件保存失败：${error?.message || "未知错误"}`); } });
+          }
+          if (event.data?.type === "xinghuo-office-error") { setOfficeSaving(false); Toast.error(event.data.message || "Office 编辑器操作失败"); }
+        };
         window.addEventListener("message", onReady);
+        removeOfficeListener = () => window.removeEventListener("message", onReady);
         frame.addEventListener("load", send, { once: true });
         setTimeout(send, 900);
-        setTimeout(() => window.removeEventListener("message", onReady), 10000);
       } catch (error) {
         if (active) setDocumentPreview(current => ({ ...current, status: "error", error: `Office 编辑器加载失败：${error?.message || "无法读取文件"}` }));
       }
     };
     open();
-    return () => { active = false; };
+    return () => { active = false; removeOfficeListener(); officeFrameRef.current = null; officeRequestIdRef.current = ""; setOfficeSaving(false); };
   }, [documentModal, isOfficeAttachment, asset.url]);
+  useEffect(() => {
+    if (!officeDirty || !isOfficeAttachment || !["xls", "xlsx", "ods", "csv"].includes(docKind?.ext) || officeSaving) return;
+    const timer = setTimeout(() => requestOfficeSave(), 2500);
+    return () => clearTimeout(timer);
+  }, [officeDirty, officeSaving, isOfficeAttachment, docKind?.ext]);
   useEffect(() => {
     if (!documentModal || !isTextAttachment || documentPreview.status !== "ready") return;
     const modal = document.querySelector(".document-modal");
@@ -1076,10 +1155,35 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
     actions.insertBefore(button, actions.firstChild);
     return () => { button.remove(); if (headButton) headButton.style.display = ""; };
   }, [documentModal, isTextAttachment, documentPreview.status, documentPreview.text]);
-  const documentCard = documentAttachment ? h("div", { className: "document-card" }, h("div", { className: `document-icon document-icon-${docKind.className}` }, docKind.icon), h("div", { className: "document-main" }, h("div", { className: "document-name", title: item.attachment.name }, item.attachment.name), h("div", { className: "document-meta" }, formatAttachmentSize(item.attachment.info?.size || item.attachment.file?.size) || "文档", " · ", docKind.label)), h("div", { className: "document-actions" }, isTextAttachment ? h("button", { type: "button", disabled: !asset.url, onClick: openOriginal }, "打开") : h("button", { type: "button", disabled: !asset.url, onClick: openOriginal }, "在线预览"), !isTextAttachment && h("button", { type: "button", disabled: !asset.url, onClick: openOfficeEditor }, "在线编辑"), h("button", { type: "button", disabled: !asset.url, onClick: downloadAttachment }, "下载"))) : null;
+  useEffect(() => {
+    const modal = document.querySelector(".document-modal");
+    const backdrop = document.querySelector(".document-modal-backdrop");
+    if (!documentModal || !modal || !backdrop) return;
+    const closeButton = modal.querySelector(".document-modal-head button[aria-label='关闭']");
+    const stopAndClose = event => { event.preventDefault(); event.stopPropagation(); closeDocument(); };
+    closeButton?.addEventListener("click", stopAndClose, true);
+    const onBackdrop = event => { if (event.target === backdrop) stopAndClose(event); };
+    backdrop.addEventListener("mousedown", onBackdrop, true);
+    const actions = modal.querySelector(".document-modal-actions");
+    let saveButton = null;
+    if (isOfficeAttachment && actions && !actions.querySelector(".office-save-button")) {
+      saveButton = document.createElement("button");
+      saveButton.type = "button";
+      saveButton.className = "office-save-button";
+      actions.insertBefore(saveButton, actions.lastElementChild);
+    }
+    if (saveButton) {
+      saveButton.textContent = officeSaving ? "保存中…" : "保存";
+      saveButton.disabled = !officeDirty || officeSaving;
+      saveButton.addEventListener("click", requestOfficeSave);
+    }
+    return () => { closeButton?.removeEventListener("click", stopAndClose, true); backdrop.removeEventListener("mousedown", onBackdrop, true); saveButton?.removeEventListener("click", requestOfficeSave); saveButton?.remove(); };
+  }, [documentModal, isOfficeAttachment, officeDirty, officeSaving, documentPreview.status]);
+  const displayName = shortenAttachmentName(item.attachment?.name || "附件");
+  const documentCard = documentAttachment ? h("div", { className: "document-card" }, h("div", { className: `document-icon document-icon-${docKind.className}` }, docKind.icon), h("div", { className: "document-main" }, h("div", { className: "document-name", title: item.attachment.name }, displayName), h("div", { className: "document-meta" }, formatAttachmentSize(item.attachment.info?.size || item.attachment.file?.size) || "文档", " · ", docKind.label)), h("div", { className: "document-actions" }, isTextAttachment ? h("button", { type: "button", disabled: !asset.url, onClick: openOriginal }, "打开") : h("button", { type: "button", disabled: !asset.url, onClick: openOriginal }, "在线预览"), !isTextAttachment && h("button", { type: "button", disabled: !asset.url, onClick: openOfficeEditor }, "在线编辑"), h("button", { type: "button", disabled: !asset.url, onClick: downloadAttachment }, "下载"))) : null;
   const attachmentFallback = item.attachment && !media && !documentCard ? h("div", { className: "attachment-unavailable" }, asset.failed ? "媒体加载失败" : "正在加载媒体…", asset.url && h("a", { href: asset.url, onClick: openOriginal }, "打开原文件")) : null;
   const relation = (item.replyTo || item.threadRoot) && h(RelationContext, { item, client, onJumpTo, onThread });
-  const payload = item.attachment ? h("div", { className: "attachment-wrap" }, documentCard || media || attachmentFallback || h("div", { className: "attachment-unavailable" }, "附件地址不可用"), media && !item.attachment.emoji && !item.attachment.sticker && h("div", { className: "attachment-caption" }, item.attachment.name)) : item.formattedBody ? h("div", { className: "message-bubble formatted-message" }, h(FormattedMessage, { html: item.formattedBody, client, emojiFiles: item.emojiFiles, onImage: (src, alt) => setViewer({ src, alt }) })) : h("div", { className: "message-bubble" }, item.decryptFailed ? `🔒 ${item.text}` : h(MessageText, { text: item.text }));
+  const payload = item.attachment ? h("div", { className: "attachment-wrap" }, documentCard || media || attachmentFallback || h("div", { className: "attachment-unavailable" }, "附件地址不可用"), media && !item.attachment.emoji && !item.attachment.sticker && h("div", { className: "attachment-caption", title: item.attachment.name }, displayName)) : item.formattedBody ? h("div", { className: "message-bubble formatted-message" }, h(FormattedMessage, { html: item.formattedBody, client, emojiFiles: item.emojiFiles, onImage: (src, alt) => setViewer({ src, alt }) })) : h("div", { className: "message-bubble" }, item.decryptFailed ? `🔒 ${item.text}` : h(MessageText, { text: item.text }));
   const documentContent = documentPreview.status === "loading" ? h("div", { className: "document-modal-loading" }, "正在解析文档…") : documentPreview.status === "error" ? h("div", { className: "document-modal-loading" }, documentPreview.error) : isTextAttachment && documentPreview.status === "ready" ? h("pre", { className: "document-modal-text" }, documentPreview.text) : docKind?.ext === "pdf" && documentPreview.url ? h("iframe", { className: "document-modal-frame", src: documentPreview.url, title: item.attachment?.name || "PDF 预览" }) : documentPreview.status === "ready" && documentPreview.html ? h("div", { className: `document-modal-html ${documentModal === "edit" ? "is-editable" : ""}`, contentEditable: documentModal === "edit", suppressContentEditableWarning: true, dangerouslySetInnerHTML: { __html: documentPreview.html } }) : h("div", { className: "document-modal-loading" }, documentPreview.error || "此格式暂不支持浏览器内排版，请使用下载后的 Office 应用打开");
   return h(React.Fragment, null, h("div", { className: `message-row ${item.isMe ? "me" : ""} ${item.attachment?.emoji ? "emoji-message-row" : ""} ${grouped ? "message-grouped" : ""} ${item.decryptFailed ? "encrypted-message" : ""} ${selecting ? "message-selecting" : ""} ${selected ? "message-selected" : ""}`, id: item.id ? `event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}` : undefined, onClick: selecting ? () => onSelect?.(item) : undefined, onContextMenu: event => { event.preventDefault(); setContextMenu({ x: event.clientX, y: event.clientY }); } }, h(MatrixAvatar, { client, mxcUrl: item.avatarMxc, size: 34, className: "message-avatar", style: { background: item.color }, fallback: item.avatar, alt: item.author }), h("div", { className: "message-body" }, !grouped && h("div", { className: "message-author" }, h("button", { type: "button", className: "message-author-name", onClick: event => { event.stopPropagation(); onMention?.({ userId: item.handle, name: item.author }); } }, item.author), h("span", { className: "message-time" }, item.time), item.edited && h("span", { className: "message-time" }, "已编辑")), h("div", { className: `message-content-stack ${relation ? "has-relation" : ""}` }, relation, payload, item.decryptFailed && h("div", { className: "decrypt-hint" }, "请在“我的设置 → 设备与安全”中恢复密钥"), reactions.length > 0 && h("div", { className: "reaction-row" }, reactions.map(([key, count]) => h("button", { className: "reaction", key, onClick: event => { event.stopPropagation(); onReact(item, key); } }, reactionLabel(key), h("span", { className: "reaction-count" }, count)))), item.readBy?.length > 0 && h(ReadReceipt, { readBy: item.readBy || [], client })), h("div", { className: "message-actions" }, h("button", { onClick: event => { event.stopPropagation(); onReply(item); } }, "回复"), h(ReactionPicker, { client, onSelect: key => onReact(item, key) }), h("button", { onClick: event => { event.stopPropagation(); onThread(item); } }, "线程"), item.isMe && h("button", { onClick: event => { event.stopPropagation(); onEdit(item); } }, "编辑"), item.isMe && h("button", { onClick: event => { event.stopPropagation(); onRedact(item); } }, "撤回")), contextMenu && h("div", { className: "message-context-menu", style: { left: contextMenu.x, top: contextMenu.y }, onClick: event => event.stopPropagation() }, h("button", { onClick: () => { setContextMenu(null); onReply(item); } }, "回复"), h("button", { onClick: () => { setContextMenu(null); onThread(item); } }, "在线程中回复"), h("button", { onClick: () => { navigator.clipboard?.writeText(item.text || ""); setContextMenu(null); } }, "复制消息"), h("button", { onClick: () => { setContextMenu(null); onForward?.(item, false); } }, "转发"), h("button", { onClick: () => { setContextMenu(null); onTogglePinMessage?.(item); } }, pinnedEventIds.includes(item.id) ? "取消置顶消息" : "置顶消息"), reactions.length > 0 && h("button", { onClick: () => { setContextMenu(null); Toast.info(`该消息有 ${reactions.reduce((sum, entry) => sum + entry[1], 0)} 个回应`); } }, "查看回应详情"), item.isMe && h("button", { onClick: () => { setContextMenu(null); onEdit(item); } }, "编辑"), item.isMe && h("button", { className: "danger", onClick: () => { setContextMenu(null); onRedact(item); } }, "撤回")))), documentModal && h("div", { className: "document-modal-backdrop", onMouseDown: event => event.target === event.currentTarget && setDocumentModal(null) }, h("div", { className: "document-modal" }, h("div", { className: "document-modal-head" }, h("div", null, h("strong", null, documentModal === "edit" ? "在线编辑文档" : "在线预览文档"), h("span", null, item.attachment?.name)), h("div", { className: "document-modal-head-actions" }, isTextAttachment && documentPreview.status === "ready" && h(UiButton, { size: "small", onClick: () => navigator.clipboard?.writeText(documentPreview.text).then(() => Toast.success("文本已复制")) }, "一键复制"), h("button", { type: "button", onClick: () => setDocumentModal(null), "aria-label": "关闭" }, "×"))), documentContent, documentModal === "edit" && h("div", { className: "document-modal-hint" }, docKind?.ext === "docx" || docKind?.ext === "doc" ? "当前为可编辑文本预览，修改内容后请复制保存；如需保留原始 DOCX 排版，请下载后使用 Office。" : "此格式暂不支持浏览器内编辑，建议下载后使用 Office。"), h("div", { className: "document-modal-actions" }, h(UiButton, { className: "ghost-btn", onClick: downloadAttachment }, "下载文件"), h(UiButton, { variant: "primary", onClick: () => setDocumentModal(null) }, "完成")))), h(MediaLightbox, { viewer, onClose: () => setViewer(null) }));
 }
@@ -1177,9 +1281,11 @@ function Details({ room, client, onInvite, onLeave, collapsed, onToggle, onRoomU
     const displayName = member.name || user?.displayName || member.userId;
     return { member, user, presence, displayName };
   });
+  const presenceRank = { online: 0, busy: 1, unavailable: 2, unknown: 3, offline: 4 };
+  const sortedMemberData = [...memberData].sort((a, b) => (presenceRank[a.presence] ?? 3) - (presenceRank[b.presence] ?? 3) || a.displayName.localeCompare(b.displayName, "zh-CN"));
   const onlineCount = memberData.filter(item => item.presence === "online").length;
   const offlineCount = memberData.filter(item => item.presence === "offline").length;
-  const memberRows = memberData.map(({ member, presence, displayName }) => {
+  const memberRows = sortedMemberData.map(({ member, presence, displayName }) => {
     const profile = h("div", { className: "member-popover" },
       h("div", { className: "member-popover-name" }, displayName),
       h("div", { className: "member-popover-id" }, member.userId),
@@ -1201,7 +1307,7 @@ function Details({ room, client, onInvite, onLeave, collapsed, onToggle, onRoomU
     h("div", { className: "details-section" },
       h("div", { className: "details-section-head" }, h("span", null, "成员", h("span", { className: "member-count" }, room.members)), h("button", { className: "detail-link", onClick: onInvite }, "邀请成员")),
       h("div", { className: "member-summary" }, h("span", { className: "member-summary-total" }, `${room.members} 位成员`), h("span", { className: "member-summary-online" }, `● ${onlineCount} 在线`), h("span", { className: "member-summary-offline" }, `○ ${offlineCount} 离线`)),
-      h("div", { className: "member-stack" }, memberData.slice(0, 5).map(({ member, displayName }) => h("div", { className: "member-avatar-wrap", key: member.userId, title: `${displayName} · ${member.userId}` }, h(MatrixAvatar, { client, mxcUrl: memberAvatarMxc(member), size: 32, className: "member-avatar", style: { background: colorFor(member.userId) }, fallback: initials(displayName), alt: displayName }))), members.length > 5 && h("span", { className: "member-count" }, `+${members.length - 5}`)),
+      h("div", { className: "member-stack" }, sortedMemberData.slice(0, 5).map(({ member, displayName }) => h("div", { className: "member-avatar-wrap", key: member.userId, title: `${displayName} · ${member.userId}` }, h(MatrixAvatar, { client, mxcUrl: memberAvatarMxc(member), size: 32, className: "member-avatar", style: { background: colorFor(member.userId) }, fallback: initials(displayName), alt: displayName }))), members.length > 5 && h("span", { className: "member-count" }, `+${members.length - 5}`)),
       h("div", { className: "member-list" }, memberRows)),
     h("div", { className: "privacy-note" }, "🔒 房间事件和消息通过 Matrix Client-Server API 同步。加密状态由该房间的 Matrix 状态事件决定."));
 }

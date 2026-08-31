@@ -1097,6 +1097,9 @@ button { cursor: pointer; }
 .document-modal-html td, .document-modal-html th { padding: 6px 9px; border: 1px solid #d0d5dd; }
 .document-modal-hint { padding: 9px 18px; border-top: 1px solid #eef1f5; color: #667085; background: #f8fafc; font-size: 11px; line-height: 1.5; }
 .document-modal-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 11px 18px; border-top: 1px solid #e4e7ec; }
+.office-save-button { min-width: 72px; height: 34px; padding: 0 14px; border: 1px solid #d0d5dd; border-radius: 7px; color: #344054; background: #fff; font-size: 12px; cursor: pointer; }
+.office-save-button:hover:not(:disabled) { border-color: #98b7f5; color: #2454c6; background: #f5f8ff; }
+.office-save-button:disabled { color: #98a2b3; background: #f8fafc; cursor: not-allowed; }
 .sort-switch { display: inline-flex; margin-left: auto; gap: 2px; padding: 2px; border: 1px solid #e4e7ec; border-radius: 6px; background: #f8fafc; }
 .sort-switch button { border: 0; border-radius: 4px; padding: 2px 5px; color: #98a2b3; background: transparent; font-size: 9px; cursor: pointer; }
 .sort-switch button.active { color: #1d4ed8; background: #eaf1ff; font-weight: 600; }
