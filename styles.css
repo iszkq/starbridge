@@ -1377,6 +1377,14 @@ button { cursor: pointer; }
 .document-card:has(.document-icon-file) .document-actions {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
+.message-row.emoji-message-row { display: flex; width: 100%; max-width: 850px; margin: 0 0 14px; gap: 11px; }
+.message-row.me.emoji-message-row { flex-direction: row-reverse; margin-left: auto; margin-right: 0; }
+.message-row.emoji-message-row .message-avatar { display: grid; }
+.message-row.emoji-message-row .message-author,
+.message-row.emoji-message-row .message-actions { display: flex; }
+.message-row.emoji-message-row .message-body { width: auto; max-width: min(760px, calc(100% - 2px)); flex: 1 1 auto; }
+.message-row.emoji-message-row .message-content-stack { display: flex; max-width: 100%; }
+.message-row.emoji-message-row .attachment-wrap { width: fit-content; max-width: 100%; margin-top: 7px; }
 .message-image.message-sticker {
   width: auto;
   max-width: min(280px, 72vw);

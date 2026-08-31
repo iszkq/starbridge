@@ -518,7 +518,8 @@ function mentionHtml(text, mentions = []) {
     const userId = String(mention?.userId || "").trim();
     if (!name || !userId) continue;
     const safeName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    html = html.replace(new RegExp(`@${safeName}(?=\\s|$)`, "g"), `<a href="https://matrix.to/#/${encodeURIComponent(userId)}">@${name}</a>`);
+    const matrixTarget = encodeURIComponent(userId).replace(/%40/gi, "@").replace(/%3A/gi, ":");
+    html = html.replace(new RegExp(`@${safeName}(?=\\s|$)`, "g"), `<a href="https://matrix.to/#/${matrixTarget}">@${name}</a>`);
   }
   return html;
 }
@@ -1085,7 +1086,9 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
     (async () => {
       try {
         if (kind.ext === "pdf") {
-          if (active) setDocumentPreview({ status: "ready", html: "", text: "", url: asset.url, error: "" });
+          const pdfBlob = await fetchAttachmentBlob();
+          objectUrl = URL.createObjectURL(new Blob([pdfBlob], { type: "application/pdf" }));
+          if (active) setDocumentPreview({ status: "ready", html: "", text: "", url: objectUrl, error: "" });
           return;
         }
         const blob = await fetchAttachmentBlob();
