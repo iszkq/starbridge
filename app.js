@@ -590,7 +590,7 @@ function eventToMessage(event, room, userId) {
 
 async function roomMessages(room, userId, client) {
   const events = room?.getLiveTimeline?.().getEvents?.() || [];
-  const redacted = new Set(); const reactions = new Map(); const edits = new Map(); const updates = new Map(); const byId = new Map();
+  const redacted = new Set(); const reactions = new Map(); const edits = new Map(); const replacements = new Map(); const updates = new Map(); const byId = new Map();
   events.forEach(event => {
     if (event.getType?.() === "m.room.redaction") { const id = event.getRedacts?.() || event.getContent?.()?.redacts; if (id) redacted.add(id); return; }
     if (event.getType?.() === "m.reaction") { const relation = event.getContent?.()?.["m.relates_to"]; if (relation?.event_id) { const list = reactions.get(relation.event_id) || []; list.push({ id: event.getId?.(), key: relation.key || "👍", sender: event.getSender?.() }); reactions.set(relation.event_id, list); } return; }
@@ -598,11 +598,12 @@ async function roomMessages(room, userId, client) {
     if (clearType !== "m.room.message" && clearType !== "m.sticker" && event.getType?.() !== "m.room.encrypted") return;
     const eventContent = event.getClearContent?.() || event.getContent?.() || {};
     const relation = eventContent["m.relates_to"];
-    if (relation?.rel_type === "m.replace" && relation.event_id) { edits.set(relation.event_id, eventContent?.["m.new_content"]?.body || eventContent?.body || ""); const updated = eventContent?.["org.orbit.updated"] || eventContent?.["m.new_content"]?.["org.orbit.updated"]; if (updated) updates.set(relation.event_id, updated); return; }
+    if (relation?.rel_type === "m.replace" && relation.event_id) { const nextContent = eventContent?.["m.new_content"] || eventContent; edits.set(relation.event_id, nextContent?.body || eventContent?.body || ""); replacements.set(relation.event_id, nextContent); const updated = eventContent?.["org.orbit.updated"] || nextContent?.["org.orbit.updated"]; if (updated) updates.set(relation.event_id, updated); return; }
     const message = eventToMessage(event, room, userId); if (message) byId.set(message.id, message);
   });
   const members = room?.getJoinedMembers?.() || [];
   byId.forEach((message, id) => { if (redacted.has(id)) { byId.delete(id); return; } if (edits.has(id)) { message.text = edits.get(id); message.edited = true; } const reactionCounts = {}; (reactions.get(id) || []).forEach(reaction => { if (!reaction.id || redacted.has(reaction.id)) return; reactionCounts[reaction.key] = (reactionCounts[reaction.key] || 0) + 1; }); message.reactions = reactionCounts; const reply = message.replyTo ? byId.get(message.replyTo) : null; if (reply) { message.replyPreview = reply.text; message.replyAuthor = reply.author; message.replyAvatarMxc = reply.avatarMxc; } const thread = message.threadRoot ? byId.get(message.threadRoot) : null; if (thread) { message.threadPreview = thread.text || thread.attachment?.name || "消息"; message.threadAuthor = thread.author; message.threadAvatarMxc = thread.avatarMxc; } });
+  replacements.forEach((replacement, id) => { const message = byId.get(id); if (!message || !replacement) return; if (message.attachment && ["m.image", "m.file", "m.video", "m.audio"].includes(replacement.msgtype)) { message.attachment = { ...message.attachment, name: replacement.body || message.attachment.name, url: replacement.url || replacement.file?.url || message.attachment.url, file: replacement.file || message.attachment.file, info: replacement.info || message.attachment.info, type: replacement.msgtype }; } });
   updates.forEach((updated, id) => { const message = byId.get(id); if (!message) return; message.updatedAt = Number(updated.ts) || 0; const member = room.getMember?.(updated.user_id); message.updatedBy = member?.name || updated.user_id || null; });
   // A receipt is a moving marker, not a badge that belongs on every message.
   // Find the latest event read by each member, then render that member only
@@ -919,11 +920,38 @@ async function saveEditedAttachment(client, item, buffer, fileName, mimeType) {
   await client.sendMessage(item.roomId, content);
 }
 
-function EmojiRowMedia({ items = [], client, onOpen }) {
+let orbitOfficeCryptoPromise;
+async function decryptOfficeForEditor(buffer, fileName) {
+  if (!buffer) return buffer;
+  try {
+    orbitOfficeCryptoPromise ||= import("https://esm.sh/officecrypto-tool@0.0.19?bundle");
+    const crypto = await orbitOfficeCryptoPromise;
+    if (!crypto?.isEncrypted?.(buffer)) return buffer;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const password = window.prompt(`文件“${fileName || "Office 文件"}”已加密，请输入密码：`, "");
+      if (password == null) throw new Error("已取消密码输入");
+      try {
+        const plain = await crypto.decrypt(buffer, { password });
+        const bytes = plain instanceof Uint8Array ? plain : new Uint8Array(plain);
+        return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      } catch (error) {
+        if (attempt === 2) throw new Error("Office 文件密码错误或解密失败");
+      }
+    }
+  } catch (error) {
+    if (/已取消密码输入|密码错误|解密失败/.test(String(error?.message || ""))) throw error;
+    console.warn("Office 加密检测失败，将交给编辑器处理", error);
+  }
+  return buffer;
+}
+
+function EmojiRowMedia({ items = [], client, onOpen, fallback }) {
+  const [failed, setFailed] = useState(0);
+  if (failed >= items.length && fallback) return h("img", { className: "message-image message-emoji-image", src: fallback, alt: "表情", onClick: () => onOpen?.(fallback, "表情") });
   return h("div", { className: "message-emoji-row-media", role: "img", "aria-label": "表情" }, items.map((emoji, index) => {
     const source = emoji?.thumbUrl || emoji?.url;
     const src = assetRequestUrl(source);
-    return h("img", { key: emoji?.id || `${emoji?.name || "emoji"}-${index}`, className: "message-emoji-tile", src, alt: emoji?.name || "表情", loading: "lazy", onClick: () => src && onOpen?.(src, emoji?.name || "表情") });
+    return h("img", { key: emoji?.id || `${emoji?.name || "emoji"}-${index}`, className: "message-emoji-tile", src, alt: emoji?.name || "表情", loading: "lazy", onError: () => setFailed(value => value + 1), onClick: () => src && onOpen?.(src, emoji?.name || "表情") });
   }));
 }
 
@@ -943,7 +971,8 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
     const saveId = `save-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     officeSaveIdRef.current = saveId;
     setOfficeSaving(true);
-    frame.contentWindow.postMessage({ type: "xinghuo-office-save", requestId: officeRequestIdRef.current, saveId }, new URL(orbitOfficeEditorUrl, location.href).origin);
+    const message = { type: "xinghuo-office-save", requestId: officeRequestIdRef.current, saveId };
+    try { frame.contentWindow.postMessage(message, new URL(orbitOfficeEditorUrl, location.href).origin); } catch { try { frame.contentWindow.postMessage(message, "*"); } catch { setOfficeSaving(false); Toast.error("Office 编辑器连接失败"); } }
     return true;
   };
   const closeDocument = () => {
@@ -1037,7 +1066,7 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
   const asset = useMatrixAsset(client, rawUrl, undefined, undefined, undefined, item.attachment?.file || null);
   if (item.type === "empty") return h("div", { className: "empty-messages" }, "☁", h("div", null, item.label));
   const fileUrl = asset.src;
-  const emojiRow = item.emojiItems?.length && fileUrl ? h(EmojiRowMedia, { items: item.emojiItems, client, onOpen: (src, alt) => setViewer({ src, alt }) }) : null;
+  const emojiRow = item.emojiItems?.length && fileUrl ? h(EmojiRowMedia, { items: item.emojiItems, client, fallback: fileUrl, onOpen: (src, alt) => setViewer({ src, alt }) }) : null;
   const reactions = Object.entries(item.reactions || {});
   const media = item.attachment && fileUrl && (item.attachment.type === "m.image" ? h("img", { className: `message-image ${item.attachment.emoji ? "message-emoji-image" : ""} ${item.attachment.sticker ? "message-sticker" : ""}`, src: fileUrl, alt: item.attachment.name || "图片", loading: "lazy", onClick: () => setViewer({ src: fileUrl, alt: item.attachment.name || "图片" }) }) : item.attachment.type === "m.video" ? h("video", { className: "message-video", src: fileUrl, controls: true, preload: "metadata" }) : item.attachment.type === "m.audio" ? h("audio", { className: "message-audio", src: fileUrl, controls: true, preload: "metadata" }) : null);
   const fetchAttachmentBlob = async () => { if (!asset.url) throw new Error("附件地址不可用"); const token = client?.getAccessToken?.(); const candidates = mediaRequestCandidates(client, rawUrl, asset.url); let lastError = null; for (const candidate of candidates) { try { const response = await fetch(candidate, { cache: "no-store", headers: token ? { Authorization: `Bearer ${token}` } : undefined }); if (response.ok) { const encryptedBuffer = await response.arrayBuffer(); const plainBuffer = await decryptMatrixBuffer(encryptedBuffer, item.attachment?.file); const blob = new Blob([plainBuffer], { type: item.attachment?.file?.mimetype || item.attachment?.info?.mimetype || response.headers.get("content-type") || "application/octet-stream" }); if (blob.size > 0) return blob; } lastError = new Error(`媒体请求失败（${response.status}）`); } catch (error) { lastError = error; } } throw lastError || new Error("媒体请求失败"); };
@@ -1106,7 +1135,7 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
     const open = async () => {
       try {
         const blob = await fetchAttachmentBlob();
-        const buffer = await blob.arrayBuffer();
+        const buffer = await decryptOfficeForEditor(await blob.arrayBuffer(), item.attachment?.name);
         if (!active) return;
         const host = document.querySelector(".document-modal");
         const placeholder = host?.querySelector(".document-modal-loading");
@@ -1122,7 +1151,7 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
         let sent = false;
         let password = "";
         let passwordAttempts = 0;
-        const send = (nextPassword = password, force = false) => { if (sent && !force) return; sent = true; password = nextPassword || ""; const transferBuffer = buffer.slice(0); frame.contentWindow?.postMessage({ type: "xinghuo-office-open", requestId, buffer: transferBuffer, password, fileName: item.attachment?.name || "document", fileType: docKind?.ext || "", mimeType: item.attachment?.info?.mimetype || blob.type || "application/octet-stream" }, officeOrigin, [transferBuffer]); };
+         const send = (nextPassword = password, force = false) => { if (sent && !force) return; sent = true; password = nextPassword || ""; const payload = { type: "xinghuo-office-open", requestId, buffer: buffer.slice(0), password, fileName: item.attachment?.name || "document", fileType: docKind?.ext || "", mimeType: item.attachment?.info?.mimetype || blob.type || "application/octet-stream" }; try { frame.contentWindow?.postMessage(payload, officeOrigin, [payload.buffer]); } catch (error) { try { payload.buffer = buffer.slice(0); frame.contentWindow?.postMessage(payload, "*", [payload.buffer]); } catch (fallbackError) { sent = false; setOfficeSaving(false); Toast.error(`Office 编辑器连接失败：${fallbackError?.message || error?.message || "目标窗口来源不匹配"}`); } } };
         const onReady = event => {
           if (event.source !== frame.contentWindow || event.origin !== officeOrigin || event.data?.requestId && event.data.requestId !== requestId) return;
           if (event.data?.type === "xinghuo-office-ready") send();
@@ -1250,6 +1279,7 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
   React.useEffect(() => { const el = scrollRef.current; if (!el || !room?.id || pendingRoomScrollRef.current !== room.id) return; requestAnimationFrame(() => { if (!scrollRef.current || pendingRoomScrollRef.current !== room.id) return; scrollRef.current.scrollTop = scrollRef.current.scrollHeight; pendingRoomScrollRef.current = null; setShowJump(false); }); }, [room?.id, messages.length]);
   React.useEffect(() => { const el = scrollRef.current; if (!el || !forceScrollRef.current) return; requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; forceScrollRef.current = false; }); }, [messages.length]);
   const send = async () => { const text = draft.trim(); if (!text) return; const pending = (window.orbitPendingMentions || {})[room?.id] || []; const mentions = [...mentionTargets, ...pending].filter((entry, index, list) => entry?.userId && text.includes(`@${String(entry.name || "").replace(/^@/, "")}`) && list.findIndex(other => other.userId === entry.userId) === index); setDraft(""); setDraftHtml(""); setMentionTargets([]); forceScrollRef.current = true; await onSend(text, draftHtml, mentions); setTimeout(() => { const el = scrollRef.current; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); setShowJump(false); }, 350); };
+  React.useEffect(() => { window.orbitActiveRoomId = room?.id || null; }, [room?.id]);
   const keyDown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
   const loadEarlier = async () => { if (loadingEarlierRef.current || historyExhausted) return; const el = scrollRef.current; loadingEarlierRef.current = true; setLoadingEarlier(true); const beforeHeight = el?.scrollHeight || 0; try { const loaded = await onLoadMore?.(); if (loaded === false) setHistoryExhausted(true); requestAnimationFrame(() => { if (el) el.scrollTop += el.scrollHeight - beforeHeight; }); } finally { loadingEarlierRef.current = false; setLoadingEarlier(false); } };
   const jumpBottom = () => { const el = scrollRef.current; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); };
