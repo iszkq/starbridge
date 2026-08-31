@@ -196,6 +196,20 @@ button { cursor: pointer; }
 .message-emoji-image { width: auto !important; max-width: none !important; max-height: 40px !important; height: 40px !important; padding: 0; border: 0; background: transparent; object-fit: contain; }
 .message-emoji-image + .attachment-caption { display: none; }
 
+/* Emoji-only sends may be several Matrix image events when they contain
+   animated files. Keep those events interoperable, but lay them out as one
+   compact row in Orbit instead of stacking each image vertically. */
+.message-row.emoji-message-row { display: inline-flex; width: auto; max-width: min(100%, 560px); margin: 0 4px 8px 0; gap: 0; vertical-align: bottom; }
+.message-row.me.emoji-message-row { margin-left: 4px; margin-right: 0; flex-direction: row; }
+.message-row.emoji-message-row .message-avatar,
+.message-row.emoji-message-row .message-author,
+.message-row.emoji-message-row .message-actions,
+.message-row.emoji-message-row .attachment-caption { display: none; }
+.message-row.emoji-message-row .message-body { width: auto; max-width: none; flex: 0 0 auto; }
+.message-row.emoji-message-row .message-content-stack { display: block; max-width: none; }
+.message-row.emoji-message-row .attachment-wrap { width: auto; margin: 0; }
+.message-row.emoji-message-row .message-image { margin: 0; }
+
 .emoji-browser { display: grid; grid-template-columns: 118px minmax(0, 1fr); gap: 10px; margin-top: 10px; min-height: 280px; }
 .emoji-category-nav { display: flex; flex-direction: column; gap: 3px; max-height: 310px; overflow: auto; padding-right: 3px; border-right: 1px solid #eef1f5; }
 .emoji-category { display: flex; align-items: center; justify-content: space-between; gap: 5px; border: 0; border-radius: 6px; padding: 7px 8px; color: #667085; background: transparent; font-size: 11px; text-align: left; }
