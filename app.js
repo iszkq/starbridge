@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "https://esm.sh/react@18.3.1";
 import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
 import * as Antd from "https://esm.sh/antd@5.27.4?bundle&deps=react@18.3.1,react-dom@18.3.1";
+import "https://esm.sh/media-chrome@4.13.0?bundle";
 import * as MatrixSDK from "https://esm.sh/matrix-js-sdk@37.2.0?bundle&external=@matrix-org/matrix-sdk-crypto-wasm";
 import { decodeRecoveryKey } from "https://esm.sh/matrix-js-sdk@37.2.0/lib/crypto-api/recovery-key?bundle";
 
@@ -966,111 +967,50 @@ function MediaPlayer({ src, type = "video", className = "", label = "媒体文�
   const ref = useRef(null);
   const shellRef = useRef(null);
   const [playing, setPlaying] = useState(false);
-  const [current, setCurrent] = useState(0);
-  const [duration, setDuration] = useState(0);
-  const [rate, setRate] = useState(1);
-  const [volume, setVolume] = useState(1);
   const [error, setError] = useState(false);
-  const rates = [0.75, 1, 1.25, 1.5, 2];
-  const formatTime = value => {
-    const total = Math.max(0, Math.floor(Number(value) || 0));
-    return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
-  };
   useEffect(() => {
     const media = ref.current;
     if (!media) return;
-    const loaded = () => {
-      setDuration(Number.isFinite(media.duration) ? media.duration : 0);
-      setError(false);
-    };
-    const time = () => setCurrent(media.currentTime || 0);
+    const loaded = () => setError(false);
     const play = () => setPlaying(true);
     const pause = () => setPlaying(false);
-    const ended = () => {
-      setPlaying(false);
-      setCurrent(media.duration || 0);
-    };
-    const failed = () => {
-      setPlaying(false);
-      setError(true);
-    };
+    const failed = () => { setPlaying(false); setError(true); };
     media.addEventListener("loadedmetadata", loaded);
-    media.addEventListener("durationchange", loaded);
-    media.addEventListener("timeupdate", time);
     media.addEventListener("play", play);
     media.addEventListener("pause", pause);
-    media.addEventListener("ended", ended);
     media.addEventListener("error", failed);
-    media.playbackRate = rate;
-    media.volume = volume;
     return () => {
       media.removeEventListener("loadedmetadata", loaded);
-      media.removeEventListener("durationchange", loaded);
-      media.removeEventListener("timeupdate", time);
       media.removeEventListener("play", play);
       media.removeEventListener("pause", pause);
-      media.removeEventListener("ended", ended);
       media.removeEventListener("error", failed);
       media.pause();
     };
   }, [src]);
-  const toggle = async event => {
-    event?.stopPropagation?.();
-    const media = ref.current;
-    if (!media) return;
-    try {
-      if (media.paused) await media.play();
-      else media.pause();
-    } catch {
-      setError(true);
-    }
-  };
-  const seek = event => {
-    const next = Number(event.target.value) || 0;
-    setCurrent(next);
-    if (ref.current && Number.isFinite(ref.current.duration)) ref.current.currentTime = next;
-  };
-  const changeRate = event => {
-    const next = Number(event.target.value) || 1;
-    setRate(next);
-    if (ref.current) ref.current.playbackRate = next;
-  };
-  const changeVolume = event => {
-    const next = Math.max(0, Math.min(1, Number(event.target.value)));
-    setVolume(next);
-    if (ref.current) ref.current.volume = next;
-  };
-  const fullscreen = event => {
-    event?.stopPropagation?.();
-    if (document.fullscreenElement) document.exitFullscreen?.();
-    else shellRef.current?.requestFullscreen?.();
-  };
-  const progress = duration ? Math.min(100, current / duration * 100) : 0;
   const mediaNode = type === "video"
-    ? h("video", { ref, className: `media-native ${className}`, src, preload: "metadata", playsInline: true, onClick: toggle })
-    : h("audio", { ref, className: `media-native ${className}`, src, preload: "metadata" });
-  const visual = type === "video"
-    ? h("div", { className: "media-video-stage", onClick: toggle }, mediaNode, !playing && h("button", { type: "button", className: "media-center-play", onClick: toggle, "aria-label": "播放视频" }, "▶"))
-    : h("div", { className: "media-audio-visual" },
-      h("div", { className: "audio-art", "aria-hidden": "true" }, "♪"),
-      h("div", { className: "audio-wave", "aria-hidden": "true" }, Array.from({ length: 18 }, (_, index) => h("i", { key: index, style: { height: `${18 + ((index * 17) % 28)}%` } }))),
-      mediaNode
-    );
-  const info = h("div", { className: "media-player-info" },
-    h("span", { className: "media-player-title", title: label }, label),
-    h("span", { className: "media-player-kind" }, type === "video" ? "视频" : "音频")
+    ? h("video", { ref, slot: "media", className: `media-native ${className}`, src, preload: "metadata", playsInline: true })
+    : h("audio", { ref, slot: "media", className: `media-native ${className}`, src, preload: "metadata" });
+  const visual = type === "audio" && h("div", { className: "media-audio-visual" },
+    h("div", { className: "audio-art", "aria-hidden": "true" }, "♪"),
+    h("div", { className: "audio-wave", "aria-hidden": "true" }, Array.from({ length: 22 }, (_, index) => h("i", { key: index, style: { height: `${22 + ((index * 13) % 42)}%` } }))),
+    h("span", { className: "media-audio-label" }, label)
   );
-  const progressBar = h("div", { className: "media-player-progress" },
-    h("input", { type: "range", min: 0, max: duration || 0, step: 0.01, value: Math.min(current, duration || 0), style: { "--media-progress": `${progress}%` }, onChange: seek, "aria-label": "媒体进度", disabled: !duration }),
-    h("div", { className: "media-player-time" }, h("span", null, formatTime(current)), h("span", null, formatTime(duration)))
+  const controls = h("media-control-bar", { className: "media-controls" },
+    h("media-play-button", null),
+    h("media-time-range", null),
+    h("media-time-display", { showduration: "" }),
+    h("media-mute-button", null),
+    h("media-volume-range", null),
+    h("media-playback-rate-button", { rates: "0.75 1 1.25 1.5 2" }),
+    type === "video" && h("media-pip-button", null),
+    type === "video" && h("media-fullscreen-button", null)
   );
-  const controls = h("div", { className: "media-player-controls" },
-    h("button", { type: "button", className: "media-control media-play", onClick: toggle, "aria-label": playing ? "暂停" : "播放" }, playing ? "Ⅱ" : "▶"),
-    h("div", { className: "media-volume" }, h("span", { "aria-hidden": "true" }, volume === 0 ? "×" : "◖"), h("input", { type: "range", min: 0, max: 1, step: 0.05, value: volume, onChange: changeVolume, "aria-label": "音量" })),
-    h("label", { className: "media-rate-select" }, h("span", null, "倍速"), h("select", { value: rate, onChange: changeRate, "aria-label": "播放倍速" }, rates.map(value => h("option", { key: value, value }, `${value}x`)))),
-    type === "video" && h("button", { type: "button", className: "media-control media-fullscreen", onClick: fullscreen, "aria-label": "全屏" }, "⛶")
-  );
-  return h("div", { ref: shellRef, className: `media-player media-player-${type} ${playing ? "is-playing" : ""} ${error ? "has-error" : ""}` }, visual, info, progressBar, controls, error && h("div", { className: "media-player-error", role: "status" }, "媒体加载失败，请重试或下载原文件"));
+  return h("media-controller", {
+    ref: shellRef,
+    className: `media-player media-player-${type} ${playing ? "is-playing" : ""} ${error ? "has-error" : ""}`,
+    "aria-label": label,
+    style: { "--media-primary-color": "#f4b860", "--media-control-height": "38px", "--media-font-family": "Inter, Noto Sans SC, sans-serif" }
+  }, mediaNode, visual, type === "video" && h("div", { className: "media-video-label" }, label), controls, error && h("div", { className: "media-player-error", role: "status" }, "媒体加载失败，请重试或下载原文件"));
 }
 
 function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onMention, onTogglePinMessage, pinnedEventIds = [], selecting, selected, onSelect, grouped = item?.grouped || false }) {
