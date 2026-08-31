@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "https://esm.sh/react@18.3.1";
 import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
 import * as Antd from "https://esm.sh/antd@5.27.4?bundle&deps=react@18.3.1,react-dom@18.3.1";
-import "https://esm.sh/media-chrome@4.13.0?bundle";
+import Plyr from "https://esm.sh/plyr@3.7.8?bundle";
 import * as MatrixSDK from "https://esm.sh/matrix-js-sdk@37.2.0?bundle&external=@matrix-org/matrix-sdk-crypto-wasm";
 import { decodeRecoveryKey } from "https://esm.sh/matrix-js-sdk@37.2.0/lib/crypto-api/recovery-key?bundle";
 
@@ -965,12 +965,21 @@ function EmojiRowMedia({ items = [], client, onOpen, fallback }) {
 
 function MediaPlayer({ src, type = "video", className = "", label = "媒体文件" }) {
   const ref = useRef(null);
-  const shellRef = useRef(null);
+  const playerRef = useRef(null);
   const [playing, setPlaying] = useState(false);
   const [error, setError] = useState(false);
   useEffect(() => {
     const media = ref.current;
     if (!media) return;
+    const player = new Plyr(media, {
+      controls: ["play", "progress", "current-time", "mute", "volume", "settings", "fullscreen"],
+      settings: ["speed"],
+      speed: { selected: 1, options: [0.75, 1, 1.25, 1.5, 2] },
+      tooltips: { controls: true, seek: true },
+      keyboard: { focused: true, global: false },
+      i18n: { play: "播放", pause: "暂停", seek: "跳转", seekLabel: "跳转 { seektime } 秒", played: "已播放", buffered: "已缓冲", currentTime: "当前时间", duration: "总时长", volume: "音量", mute: "静音", unmute: "取消静音", settings: "设置", speed: "倍速", normal: "正常", enterFullscreen: "全屏", exitFullscreen: "退出全屏", download: "下载" }
+    });
+    playerRef.current = player;
     const loaded = () => setError(false);
     const play = () => setPlaying(true);
     const pause = () => setPlaying(false);
@@ -984,33 +993,18 @@ function MediaPlayer({ src, type = "video", className = "", label = "媒体文�
       media.removeEventListener("play", play);
       media.removeEventListener("pause", pause);
       media.removeEventListener("error", failed);
-      media.pause();
+      player.destroy();
+      playerRef.current = null;
     };
   }, [src]);
   const mediaNode = type === "video"
-    ? h("video", { ref, slot: "media", className: `media-native ${className}`, src, preload: "metadata", playsInline: true })
-    : h("audio", { ref, slot: "media", className: `media-native ${className}`, src, preload: "metadata" });
-  const visual = type === "audio" && h("div", { className: "media-audio-visual" },
-    h("div", { className: "audio-art", "aria-hidden": "true" }, "♪"),
-    h("div", { className: "audio-wave", "aria-hidden": "true" }, Array.from({ length: 22 }, (_, index) => h("i", { key: index, style: { height: `${22 + ((index * 13) % 42)}%` } }))),
-    h("span", { className: "media-audio-label" }, label)
+    ? h("video", { ref, className: `media-native ${className}`, src, preload: "metadata", playsInline: true })
+    : h("audio", { ref, className: `media-native ${className}`, src, preload: "metadata" });
+  return h("div", { className: `media-player media-player-${type} ${playing ? "is-playing" : ""} ${error ? "has-error" : ""}` },
+    h("div", { className: "media-file-label", title: label }, label),
+    mediaNode,
+    error && h("div", { className: "media-player-error", role: "status" }, "媒体加载失败，请重试或下载原文件")
   );
-  const controls = h("media-control-bar", { className: "media-controls" },
-    h("media-play-button", null),
-    h("media-time-range", null),
-    h("media-time-display", { showduration: "" }),
-    h("media-mute-button", null),
-    h("media-volume-range", null),
-    h("media-playback-rate-button", { rates: "0.75 1 1.25 1.5 2" }),
-    type === "video" && h("media-pip-button", null),
-    type === "video" && h("media-fullscreen-button", null)
-  );
-  return h("media-controller", {
-    ref: shellRef,
-    className: `media-player media-player-${type} ${playing ? "is-playing" : ""} ${error ? "has-error" : ""}`,
-    "aria-label": label,
-    style: { "--media-primary-color": "#f4b860", "--media-control-height": "38px", "--media-font-family": "Inter, Noto Sans SC, sans-serif" }
-  }, mediaNode, visual, type === "video" && h("div", { className: "media-video-label" }, label), controls, error && h("div", { className: "media-player-error", role: "status" }, "媒体加载失败，请重试或下载原文件"));
 }
 
 function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onMention, onTogglePinMessage, pinnedEventIds = [], selecting, selected, onSelect, grouped = item?.grouped || false }) {
