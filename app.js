@@ -1493,7 +1493,7 @@ function installEmojiSendInterceptor(client) {
 
 function App() {
   const [connected, setConnected] = useState(null); const [rooms, setRooms] = useState([]); const [invites, setInvites] = useState([]); const [messages, setMessages] = useState({}); const [typingByRoom, setTypingByRoom] = useState({}); const [selectedId, setSelectedId] = useState(null); const [showLogin, setShowLogin] = useState(false); const [showRoom, setShowRoom] = useState(false); const [showSpace, setShowSpace] = useState(false); const [showSpaceRooms, setShowSpaceRooms] = useState(false); const [showAccount, setShowAccount] = useState(false); const [showInvite, setShowInvite] = useState(false); const [showSearch, setShowSearch] = useState(false); const [replyTo, setReplyTo] = useState(null); const [threadRoot, setThreadRoot] = useState(null); const [editing, setEditing] = useState(null); const [syncing, setSyncing] = useState(false); const [presence, setPresence] = useState("online"); const [viewMode, setViewMode] = useState("messages"); const [activeSpaceId, setActiveSpaceId] = useState(null);
-  const excludedRoomIdsRef = useRef(new Set()); const refreshTimer = useRef(null); const selectedIdRef = useRef(null); const [detailsCollapsed, setDetailsCollapsed] = useState(false); const [forwardItems, setForwardItems] = useState([]); const [selecting, setSelecting] = useState(false); const [showForward, setShowForward] = useState(false); const [, setEmojiCatalogReady] = useState(0);
+  const excludedRoomIdsRef = useRef(new Set()); const pendingJoinRoomIdsRef = useRef(new Set()); const optimisticJoinedRoomsRef = useRef(new Map()); const refreshTimer = useRef(null); const selectedIdRef = useRef(null); const [detailsCollapsed, setDetailsCollapsed] = useState(false); const [forwardItems, setForwardItems] = useState([]); const [selecting, setSelecting] = useState(false); const [showForward, setShowForward] = useState(false); const [, setEmojiCatalogReady] = useState(0);
   useEffect(() => { selectedIdRef.current = selectedId; }, [selectedId]);
   useEffect(() => {
     const client = connected?.client;
@@ -1548,19 +1548,51 @@ function App() {
   }, [forwardItems.length]);
   const [cryptoState, setCryptoState] = useState({ available: false, backupInfo: null, activeVersion: null, verified: false, localTrusted: false, keyRestored: false, restoring: false, restoreProgress: 0, error: null });
   const refreshCrypto = async client => { const crypto = client?.getCrypto?.(); if (!crypto) return setCryptoState(s => ({ ...s, available: false, error: s.error || "加密模块尚未就绪，请重新登录或刷新页面" })); try { const backupInfo = await crypto.getKeyBackupInfo?.(); const activeVersion = await crypto.getActiveSessionBackupVersion?.(); const currentStatus = await Promise.resolve(crypto.getDeviceVerificationStatus?.(client.getUserId?.(), client.getDeviceId?.())).catch(() => null); const deviceVerified = Boolean(currentStatus?.crossSigningVerified); const localTrusted = Boolean(currentStatus?.localVerified); setCryptoState(s => ({ ...s, available: true, verified: deviceVerified, localTrusted, backupInfo: backupInfo || null, activeVersion: activeVersion || backupInfo?.version || null, error: null })); } catch (error) { setCryptoState(s => ({ ...s, available: true, error: error?.message || "无法读取密钥备份状态" })); } };
-  const refresh = async client => { const allRooms = client.getRooms(); const pending = allRooms.filter(room => room.getMyMembership?.() === "invite").map(room => roomToView(room, client)); setInvites(pending); const next = allRooms.filter(room => room.getMyMembership?.() === "join").map(room => roomToView(room, client)).sort((a, b) => { if (a.pinned !== b.pinned) return a.pinned ? -1 : 1; return (b.matrixRoom.getLastLiveEvent?.()?.getTs?.() || 0) - (a.matrixRoom.getLastLiveEvent?.()?.getTs?.() || 0); }); setRooms(next); setSelectedId(id => id || next[0]?.id || null); const nextMessages = {}; await Promise.all(next.map(async room => { nextMessages[room.id] = await roomMessages(room.matrixRoom, client.getUserId(), client); })); setMessages(current => ({ ...current, ...nextMessages })); const me = client.getUser?.(client.getUserId?.()); if (me?.presence) setPresence(me.presence); };
+  const refresh = async client => {
+    const allRooms = client.getRooms();
+    const pendingJoinIds = pendingJoinRoomIdsRef.current;
+    const optimisticJoined = optimisticJoinedRoomsRef.current;
+    // Once the sync loop reflects the join, the temporary optimistic entry is
+    // no longer needed. Until then, keep the room out of the invite section.
+    allRooms.forEach(room => {
+      if (room.getMyMembership?.() === "join") {
+        pendingJoinIds.delete(room.roomId);
+        optimisticJoined.delete(room.roomId);
+      }
+    });
+    const pending = allRooms.filter(room => room.getMyMembership?.() === "invite" && !pendingJoinIds.has(room.roomId)).map(room => roomToView(room, client));
+    setInvites(pending);
+    const joinedViews = allRooms.filter(room => room.getMyMembership?.() === "join" || pendingJoinIds.has(room.roomId)).map(room => roomToView(room, client));
+    const joinedIds = new Set(joinedViews.map(room => room.id));
+    const fallbackViews = [...optimisticJoined.values()].filter(room => !joinedIds.has(room.id));
+    const next = [...joinedViews, ...fallbackViews].sort((a, b) => { if (a.pinned !== b.pinned) return a.pinned ? -1 : 1; return (b.matrixRoom.getLastLiveEvent?.()?.getTs?.() || b.lastTs || 0) - (a.matrixRoom.getLastLiveEvent?.()?.getTs?.() || a.lastTs || 0); });
+    setRooms(next); setSelectedId(id => id || next[0]?.id || null);
+    const nextMessages = {}; await Promise.all(next.map(async room => { nextMessages[room.id] = await roomMessages(room.matrixRoom, client.getUserId(), client); })); setMessages(current => ({ ...current, ...nextMessages })); const me = client.getUser?.(client.getUserId?.()); if (me?.presence) setPresence(me.presence);
+  };
   const acceptInvite = async invite => { try {
     // matrix-js-sdk exposes room joins as joinRoom(); older Orbit builds used
     // client.join(), which is not present in the current SDK and caused the
     // invite action to fail before any request was sent.
     const join = connected.client?.joinRoom || connected.client?.join;
     if (typeof join !== "function") throw new Error("当前 Matrix SDK 不支持加入房间");
+    pendingJoinRoomIdsRef.current.add(invite.id);
+    // Keep a renderable copy in case the SDK waits for the next sync response
+    // before exposing the newly joined room through getRooms().
+    optimisticJoinedRoomsRef.current.set(invite.id, { ...invite, unread: 0, hasUnread: false, lastTs: Date.now(), time: "刚刚" });
     await join.call(connected.client, invite.id);
     Toast.success(`已加入「${invite.name}」`);
-    await refresh(connected.client);
-    setViewMode(invite.isGroup ? "groups" : "messages");
+    setInvites(current => current.filter(item => item.id !== invite.id));
+    setRooms(current => [optimisticJoinedRoomsRef.current.get(invite.id), ...current.filter(item => item.id !== invite.id)]);
+    setViewMode(invite.isSpace ? "spaces" : invite.isGroup ? "groups" : "messages");
+    if (invite.isSpace) setActiveSpaceId(invite.id);
     setSelectedId(invite.id);
-  } catch (error) { Toast.error(`接受邀请失败：${error?.message || "请稍后重试"}`); } };
+    await refresh(connected.client);
+  } catch (error) {
+    pendingJoinRoomIdsRef.current.delete(invite.id);
+    optimisticJoinedRoomsRef.current.delete(invite.id);
+    await refresh(connected.client).catch(() => {});
+    Toast.error(`接受邀请失败：${error?.message || "请稍后重试"}`);
+  } };
   const declineInvite = async invite => { try { await connected.client.leave(invite.id); Toast.success("已忽略房间邀请"); await refresh(connected.client); } catch (error) { Toast.error(`忽略邀请失败：${error?.message || "请稍后重试"}`); } };
   const queueRefresh = client => { if (refreshTimer.current) return; refreshTimer.current = setTimeout(() => { refreshTimer.current = null; refresh(client).catch(error => console.warn("刷新房间失败", error)); }, 250); };
   const restoreKeys = async ({ type, key, passphrase, version }) => { const crypto = connected?.client?.getCrypto?.(); if (!crypto || !version) return; setCryptoState(s => ({ ...s, restoring: true, restoreProgress: 0, error: null })); try {
@@ -1650,7 +1682,7 @@ function App() {
   const startCall = async kind => { if (!room || !connected?.client) return; try { const call = connected.client.createCall?.(room.id); if (!call) throw new Error("当前 Matrix SDK 未提供通话能力"); const method = kind === "video" ? (call.placeVideoCall || call.placeCall) : (call.placeVoiceCall || call.placeCall); if (typeof method !== "function") throw new Error("当前 homeserver 未启用 Matrix 通话"); await method.call(call, kind === "video"); Toast.success(kind === "video" ? "视频通话请求已发出" : "语音通话请求已发出"); } catch (error) { Toast.error(`通话发起失败：${error?.message || "请确认 TURN 与 VoIP 配置"}`); } };
   const jumpTo = async eventId => { if (!eventId) return; const safe = String(eventId).replace(/[^a-zA-Z0-9_-]/g, "_"); let node = document.getElementById(`event-${safe}`); if (!node && room) { try { await connected.client.scrollback(room.matrixRoom, 100); await refresh(connected.client); await new Promise(resolve => setTimeout(resolve, 80)); node = document.getElementById(`event-${safe}`); } catch {} } if (node) { node.scrollIntoView({ behavior: "smooth", block: "center" }); node.classList.add("message-highlight"); setTimeout(() => node.classList.remove("message-highlight"), 1600); } else Toast.info("原消息不在当前服务器返回的历史范围内"); };
   const leaveRoom = async () => { if (!room || !confirm(`确定离开「${room.name}」吗？`)) return; try { await connected.client.leave(room.id); setSelectedId(null); refresh(connected.client); Toast.success("已离开房间"); } catch (error) { Toast.error(`离开房间失败：${error?.message || "未知错误"}`); } };
-  const logout = async () => { try { await connected.client.logout(); } catch {} connected.client.stopClient(); window.orbitMatrixClient = null; localStorage.removeItem("orbit.matrix.session"); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); Toast.success("已退出 Matrix"); };
+  const logout = async () => { try { await connected.client.logout(); } catch {} connected.client.stopClient(); pendingJoinRoomIdsRef.current.clear(); optimisticJoinedRoomsRef.current.clear(); window.orbitMatrixClient = null; localStorage.removeItem("orbit.matrix.session"); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); Toast.success("已退出 Matrix"); };
   if (!connected) return h("div", { className: "app-shell" }, h("div", { className: "sidebar landing-sidebar" }, h("div", { className: "brand-row" }, h("div", { className: "brand" }, h("div", { className: "brand-mark" }, "O"), h("div", null, "Orbit", h("div", { className: "workspace-pill" }, "Matrix 工作台")))), h("div", { className: "sidebar-footer" }, h("div", { className: "connection-state" }, h("span", { className: "offline-dot" }), "未连接"))), h("main", { className: "main-panel" }, h("div", { className: "login-landing" }, h("div", { className: "landing-mark" }, "O"), h("div", { className: "landing-title" }, "连接你的 Matrix 世界"), h("div", { className: "landing-copy" }, "登录后同步真实房间、消息和成员。"), h("button", { className: "primary-btn landing-button", onClick: () => setShowLogin(true) }, "连接 Matrix 账户"))), showLogin && h(LoginDialog, { onConnected: connectedHandler, onClose: () => setShowLogin(false) }));
   const setSelectingState = active => {
     if (active === false) {
