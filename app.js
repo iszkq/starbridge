@@ -1549,7 +1549,18 @@ function App() {
   const [cryptoState, setCryptoState] = useState({ available: false, backupInfo: null, activeVersion: null, verified: false, localTrusted: false, keyRestored: false, restoring: false, restoreProgress: 0, error: null });
   const refreshCrypto = async client => { const crypto = client?.getCrypto?.(); if (!crypto) return setCryptoState(s => ({ ...s, available: false, error: s.error || "加密模块尚未就绪，请重新登录或刷新页面" })); try { const backupInfo = await crypto.getKeyBackupInfo?.(); const activeVersion = await crypto.getActiveSessionBackupVersion?.(); const currentStatus = await Promise.resolve(crypto.getDeviceVerificationStatus?.(client.getUserId?.(), client.getDeviceId?.())).catch(() => null); const deviceVerified = Boolean(currentStatus?.crossSigningVerified); const localTrusted = Boolean(currentStatus?.localVerified); setCryptoState(s => ({ ...s, available: true, verified: deviceVerified, localTrusted, backupInfo: backupInfo || null, activeVersion: activeVersion || backupInfo?.version || null, error: null })); } catch (error) { setCryptoState(s => ({ ...s, available: true, error: error?.message || "无法读取密钥备份状态" })); } };
   const refresh = async client => { const allRooms = client.getRooms(); const pending = allRooms.filter(room => room.getMyMembership?.() === "invite").map(room => roomToView(room, client)); setInvites(pending); const next = allRooms.filter(room => room.getMyMembership?.() === "join").map(room => roomToView(room, client)).sort((a, b) => { if (a.pinned !== b.pinned) return a.pinned ? -1 : 1; return (b.matrixRoom.getLastLiveEvent?.()?.getTs?.() || 0) - (a.matrixRoom.getLastLiveEvent?.()?.getTs?.() || 0); }); setRooms(next); setSelectedId(id => id || next[0]?.id || null); const nextMessages = {}; await Promise.all(next.map(async room => { nextMessages[room.id] = await roomMessages(room.matrixRoom, client.getUserId(), client); })); setMessages(current => ({ ...current, ...nextMessages })); const me = client.getUser?.(client.getUserId?.()); if (me?.presence) setPresence(me.presence); };
-  const acceptInvite = async invite => { try { await connected.client.join(invite.id); Toast.success(`已加入「${invite.name}」`); await refresh(connected.client); setViewMode(invite.isGroup ? "groups" : "messages"); setSelectedId(invite.id); } catch (error) { Toast.error(`接受邀请失败：${error?.message || "请稍后重试"}`); } };
+  const acceptInvite = async invite => { try {
+    // matrix-js-sdk exposes room joins as joinRoom(); older Orbit builds used
+    // client.join(), which is not present in the current SDK and caused the
+    // invite action to fail before any request was sent.
+    const join = connected.client?.joinRoom || connected.client?.join;
+    if (typeof join !== "function") throw new Error("当前 Matrix SDK 不支持加入房间");
+    await join.call(connected.client, invite.id);
+    Toast.success(`已加入「${invite.name}」`);
+    await refresh(connected.client);
+    setViewMode(invite.isGroup ? "groups" : "messages");
+    setSelectedId(invite.id);
+  } catch (error) { Toast.error(`接受邀请失败：${error?.message || "请稍后重试"}`); } };
   const declineInvite = async invite => { try { await connected.client.leave(invite.id); Toast.success("已忽略房间邀请"); await refresh(connected.client); } catch (error) { Toast.error(`忽略邀请失败：${error?.message || "请稍后重试"}`); } };
   const queueRefresh = client => { if (refreshTimer.current) return; refreshTimer.current = setTimeout(() => { refreshTimer.current = null; refresh(client).catch(error => console.warn("刷新房间失败", error)); }, 250); };
   const restoreKeys = async ({ type, key, passphrase, version }) => { const crypto = connected?.client?.getCrypto?.(); if (!crypto || !version) return; setCryptoState(s => ({ ...s, restoring: true, restoreProgress: 0, error: null })); try {
