@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "https://esm.sh/react@18.3.1";
 import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
+import { createPortal } from "https://esm.sh/react-dom@18.3.1";
 import * as Antd from "https://esm.sh/antd@5.27.4?bundle&deps=react@18.3.1,react-dom@18.3.1";
 import Plyr from "https://esm.sh/plyr@3.7.8?bundle";
 import * as MatrixSDK from "https://esm.sh/matrix-js-sdk@42.3.0?bundle&external=@matrix-org/matrix-sdk-crypto-wasm";
@@ -64,6 +65,11 @@ const colors = ["#6264dc", "#2e9d78", "#e58a45", "#b66ad0", "#db6872", "#4d91c6"
 const initials = (name = "?") => [...name.replace(/^[@#]/, "")].slice(0, 2).join("") || "?";
 const colorFor = (id = "") => colors[[...id].reduce((n, c) => n + c.charCodeAt(0), 0) % colors.length];
 const orbitNotifiedEvents = new Set();
+const orbitEmojiUploadCache = new Map();
+const orbitStickerUploadCache = new Map();
+const orbitMatrixAssetCache = new Map();
+const orbitMatrixAssetPending = new Map();
+const ORBIT_MATRIX_ASSET_CACHE_LIMIT = 320;
 const orbitOfficeEditorUrl = window.orbitOfficeEditorUrl || "https://124.222.193.241:6258/editor";
 
 function isNotifiableMessage(event) {
@@ -81,7 +87,8 @@ function notificationBody(event) {
   if (event?.getType?.() === "m.room.encrypted" && !event?.getClearContent?.()) {
     const sender = event?.getSender?.() || "未知用户";
     const member = event?.getRoomId?.() && window.orbitMatrixClient?.getRoom?.(event.getRoomId?.())?.getMember?.(sender);
-    return `来自 ${member?.name || sender}：加密消息（当前设备未恢复密钥）`;
+    const hasRecovery = Boolean(window.orbitRecoveryKeyBytes || (() => { try { return localStorage.getItem(`orbit.matrix.recovery-key:${window.orbitMatrixClient?.getUserId?.() || "anonymous"}`); } catch { return ""; } })());
+    return `来自 ${member?.name || sender}：加密消息（${hasRecovery ? "正在解密" : "需要恢复密钥"}）`;
   }
   if (content.msgtype === "m.image") return "发送了一张图片";
   if (content.msgtype === "m.video") return "发送了一段视频";
@@ -95,7 +102,10 @@ function notificationBody(event) {
 async function markRoomRead(client, roomId, event) {
   if (!client || !roomId || !event) return;
   if (typeof client.setRoomReadMarkers === "function" && event.getId?.()) {
-    await client.setRoomReadMarkers(roomId, event.getId(), event.getId());
+    // matrix-js-sdk expects the receipt argument to be the MatrixEvent, not
+    // another event-id string. Supplying the id here can leave the local SDK
+    // unread cache behind even though the server accepted the read marker.
+    await client.setRoomReadMarkers(roomId, event.getId(), event);
   } else {
     await client.sendReadReceipt?.(event);
   }
@@ -135,6 +145,13 @@ function encodeBase64Url(bytes) {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
+function encodeUnpaddedBase64(bytes) {
+  let binary = "";
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  for (let index = 0; index < view.length; index += 1) binary += String.fromCharCode(view[index]);
+  return btoa(binary).replace(/=+$/g, "");
+}
+
 function recoveryStorageKey(userId) {
   return `orbit.matrix.recovery-key:${String(userId || "anonymous")}`;
 }
@@ -161,16 +178,22 @@ async function uploadMatrixMedia(client, file, encrypted = false) {
   // then encrypted by the Matrix SDK as usual, while the `file` descriptor
   // lets every compatible client decrypt the downloaded bytes.
   const rawKey = new Uint8Array(32); const iv = new Uint8Array(16);
-  window.crypto.getRandomValues(rawKey); window.crypto.getRandomValues(iv);
+  window.crypto.getRandomValues(rawKey);
+  // Matrix encrypted attachments use a random 64-bit IV prefix and reserve
+  // the lower 64 bits for the AES-CTR counter.
+  window.crypto.getRandomValues(iv.subarray(0, 8));
   const key = await window.crypto.subtle.importKey("raw", rawKey, { name: "AES-CTR" }, false, ["encrypt"]);
   const cipher = await window.crypto.subtle.encrypt({ name: "AES-CTR", counter: iv, length: 64 }, key, await file.arrayBuffer());
   const digest = await window.crypto.subtle.digest("SHA-256", cipher);
-  const encryptedFile = new File([cipher], `${file.name || "attachment"}.encrypted`, { type: "application/octet-stream" });
-  const uploaded = await client.uploadContent(encryptedFile, { name: encryptedFile.name, type: encryptedFile.type });
+  const encryptedFile = new File([cipher], file.name || "attachment", { type: file.type || "application/octet-stream" });
+  const uploaded = await client.uploadContent(encryptedFile, { includeFilename: true, name: encryptedFile.name, type: encryptedFile.type });
   // Matrix encrypted media (MSC3916 / current clients) carries the MXC URL
   // inside the `file` descriptor.  Keep the descriptor URL-free here so the
   // caller can attach the URL returned by uploadContent exactly once.
-  return { uploaded, fileInfo: { v: "v2", key: { alg: "A256CTR", ext: true, k: encodeBase64Url(rawKey), key_ops: ["encrypt", "decrypt"], kty: "oct" }, iv: encodeBase64Url(iv), hashes: { sha256: encodeBase64Url(digest) }, mimetype: file.type || "application/octet-stream", size: file.size } };
+  // Cinny's matrix-encrypt-attachment implementation uses JWK base64url only
+  // for key.k. Matrix encrypted-file IVs and hashes are standard unpadded
+  // base64; encoding those as base64url makes strict clients reject the file.
+  return { uploaded, fileInfo: { v: "v2", key: { alg: "A256CTR", ext: true, k: encodeBase64Url(rawKey), key_ops: ["encrypt", "decrypt"], kty: "oct" }, iv: encodeUnpaddedBase64(iv), hashes: { sha256: encodeUnpaddedBase64(digest) } } };
 }
 
 function applyUploadedMedia(content, uploaded, fileInfo) {
@@ -184,14 +207,17 @@ function applyUploadedMedia(content, uploaded, fileInfo) {
 
 async function normalizeImageBlob(blob) {
   const declared = String(blob?.type || "").toLowerCase();
-  if (declared.startsWith("image/")) return blob;
-  const bytes = new Uint8Array(await blob.slice(0, 16).arrayBuffer());
+  const bytes = new Uint8Array(await blob.slice(0, 512).arrayBuffer());
   let mime = "";
   if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) mime = "image/gif";
   else if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) mime = "image/png";
   else if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) mime = "image/jpeg";
   else if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) mime = "image/webp";
-  return mime ? new Blob([blob], { type: mime }) : blob;
+  else if (String.fromCharCode(...bytes.slice(4, 12)).startsWith("ftyp") && /^(?:avif|avis)$/.test(String.fromCharCode(...bytes.slice(8, 12)))) mime = "image/avif";
+  else if (new TextDecoder().decode(bytes).trimStart().startsWith("<svg")) mime = "image/svg+xml";
+  else if (declared.startsWith("image/")) mime = declared;
+  else mime = "application/octet-stream";
+  return declared === mime ? blob : new Blob([blob], { type: mime });
 }
 
 async function fetchEmojiBlob(item) {
@@ -211,50 +237,124 @@ async function composeEmojiRowFile(items) {
   return new File([output], "emoji-row.png", { type: "image/png" });
 }
 
-// Keep emoji messages interoperable with Element and other Matrix clients.
-// Plain rooms use one formatted text event; encrypted rooms use standard
-// encrypted m.image events so every client can decrypt and render them.
-async function sendEmojiImageEvents(client, roomId, items, encryptedRoom, sendFn) {
-  if (!items?.length) return;
-  sendFn ||= (client.__orbitOriginalSendMessage || client.sendMessage)?.bind(client);
-  if (!sendFn) throw new Error("Matrix 当前不支持发送消息");
-  // In encrypted rooms each image must be a normal encrypted m.image event.
-  // This is the only representation understood by Element/Cinny and avoids
-  // putting a single opaque `file` descriptor on an HTML event.
-  if (encryptedRoom) {
-    for (const item of items) {
+function emojiFileName(item, mimeType) {
+  const safe = String(item?.fileName || item?.name || "emoji").replace(/[\\/:*?"<>|]/g, "_").replace(/\.[a-z0-9]{2,5}$/i, "");
+  const extension = ({ "image/gif": "gif", "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/avif": "avif", "image/svg+xml": "svg" })[String(mimeType).toLowerCase()] || "gif";
+  return `${safe || "emoji"}.${extension}`;
+}
+
+async function uploadRemoteEmojiMxc(client, item) {
+  if (String(item?.url || "").startsWith("mxc://")) return item.url;
+  const cacheKey = `${client.getUserId?.() || "anonymous"}:${item.url}`;
+  let uploadPromise = orbitEmojiUploadCache.get(cacheKey);
+  if (!uploadPromise) {
+    uploadPromise = (async () => {
       const blob = await fetchEmojiBlob(item);
-      const type = blob.type || item.mimeType || "image/gif";
-      const file = new File([blob], item.fileName || `${item.name || "emoji"}.${type.split("/")[1] || "gif"}`, { type });
-      const result = await uploadMatrixMedia(client, file, true);
-      const info = { mimetype: type, size: file.size };
-      try { const bitmap = await createImageBitmap(blob); info.w = bitmap.width; info.h = bitmap.height; bitmap.close?.(); } catch {}
-      await sendFn(roomId, applyUploadedMedia({ msgtype: "m.image", body: item.name || "表情", info, "org.orbit.sticker": true }, result.uploaded, result.fileInfo));
-    }
-    return;
+      const mimeType = blob.type || item.mimeType || "image/gif";
+      const fileName = emojiFileName(item, mimeType);
+      const file = new File([blob], fileName, { type: mimeType });
+      const uploaded = await client.uploadContent(file, { includeFilename: true, name: fileName, type: mimeType });
+      if (!uploaded?.content_uri) throw new Error("Matrix 未返回表情媒体地址");
+      return uploaded.content_uri;
+    })().catch(error => {
+      orbitEmojiUploadCache.delete(cacheKey);
+      throw error;
+    });
+    orbitEmojiUploadCache.set(cacheKey, uploadPromise);
   }
-  // Cinny's interoperable pattern: upload each remote emoji to Matrix, then
-  // put all original (including animated GIF/WebP) MXC URLs in one formatted
-  // HTML text event. This is one event, while every client can load the
-  // standard <img src="mxc://…"> elements and preserve animation.
-  const uploaded = [];
-  for (const item of items) {
-    const blob = await fetchEmojiBlob(item);
-    const type = blob.type || item.mimeType || "image/gif";
-    const ext = type.split("/")[1] || "gif";
-    const file = new File([blob], item.fileName || `${item.name || "emoji"}.${ext}`, { type });
-    // The media itself stays unencrypted here on purpose. The room event is
-    // encrypted by Matrix, while a plain MXC image in formatted_body is the
-    // only representation that Element/Cinny and other clients can render as
-    // an animated inline image. The source assets are public emoji artwork,
-    // not room content.
-    const result = await uploadMatrixMedia(client, file, false);
-    if (!result?.uploaded?.content_uri) throw new Error("Matrix 未返回表情媒体地址");
-    uploaded.push({ item, mxc: result.uploaded.content_uri });
+  return uploadPromise;
+}
+
+function emojiShortcode(item) {
+  return String(item?.name || item?.shortcode || "表情").replace(/^:+|:+$/g, "");
+}
+
+async function prepareRemoteEmoji(client, item) {
+  return { item, shortcode: emojiShortcode(item), mxc: await uploadRemoteEmojiMxc(client, item) };
+}
+
+// Exact Cinny wire format: the picker resolves the remote image to MXC before
+// it becomes an editor emoticon node. Sending only serializes those resolved
+// nodes; it never re-identifies an emoji later by its display name.
+function createEmojiTextContent(text, resolvedEmoji, mentions = []) {
+  let formattedBody = mentionHtml(text, mentions);
+  (resolvedEmoji || []).forEach(({ shortcode, mxc }) => {
+    if (!mxc?.startsWith?.("mxc://")) return;
+    const token = `:${String(shortcode || "表情").replace(/^:+|:+$/g, "")}:`;
+    const pattern = new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+    const safeShortcode = escapeEditorText(String(shortcode || "表情").replace(/^:+|:+$/g, ""));
+    formattedBody = formattedBody.replace(pattern, `<img data-mx-emoticon src="${escapeEditorText(mxc)}" alt="${safeShortcode}" title="${safeShortcode}" height="32" />`);
+  });
+  return { msgtype: "m.text", body: text, format: "org.matrix.custom.html", formatted_body: formattedBody };
+}
+
+async function createStickerEventContent(client, room, item) {
+  if (String(item?.url || "").startsWith("mxc://")) {
+    const info = { ...(item.info || {}) };
+    if (item.mimeType && !info.mimetype) info.mimetype = item.mimeType;
+    return { body: emojiShortcode(item) || "贴纸", url: item.url, ...(Object.keys(info).length ? { info } : {}) };
   }
-  const body = uploaded.map(({ item }) => `:${item.name || "表情"}:`).join(" ");
-  const formattedBody = uploaded.map(({ item, mxc }) => `<img src="${mxc}" alt="${escapeEditorText(item.name || "表情")}" title="${escapeEditorText(item.name || "表情")}" data-mx-emoticon="1">`).join(" ");
-  await sendFn(roomId, { msgtype: "m.text", body, format: "org.matrix.custom.html", formatted_body: formattedBody });
+  const encrypted = Boolean(room?.hasEncryptionStateEvent?.());
+  const cacheKey = `${encrypted ? `encrypted:${room.roomId}` : "plain"}:${item.url}`;
+  let uploadPromise = orbitStickerUploadCache.get(cacheKey);
+  if (!uploadPromise) {
+    uploadPromise = (async () => {
+      const blob = await fetchEmojiBlob(item);
+      const mimeType = blob.type || item.mimeType || "image/gif";
+      const fileName = emojiFileName(item, mimeType);
+      const file = new File([blob], fileName, { type: mimeType });
+      const { uploaded, fileInfo } = await uploadMatrixMedia(client, file, encrypted);
+      const info = { mimetype: mimeType, size: file.size };
+      try {
+        const bitmap = await createImageBitmap(blob);
+        info.w = bitmap.width; info.h = bitmap.height; bitmap.close?.();
+      } catch {}
+      // m.sticker content intentionally has no msgtype. This is the standard
+      // event shape used by Cinny and Element.
+      return applyUploadedMedia({ body: item.name || "贴纸", info }, uploaded, fileInfo);
+    })().catch(error => {
+      orbitStickerUploadCache.delete(cacheKey);
+      throw error;
+    });
+    orbitStickerUploadCache.set(cacheKey, uploadPromise);
+  }
+  return JSON.parse(JSON.stringify(await uploadPromise));
+}
+
+// Cinny sends stickers through a local MatrixEvent so encryption happens
+// before the event is posted, without waiting behind the normal message
+// queue. Fall back to the public SDK method when these SDK internals are not
+// available.
+async function sendStickerEvent(client, room, content) {
+  const MatrixEvent = MatrixSDK.MatrixEvent;
+  const EventStatus = MatrixSDK.EventStatus;
+  if (!client || !room || !MatrixEvent || !EventStatus || typeof client.encryptEventIfNeeded !== "function" || typeof client.sendEventHttpRequest !== "function") {
+    return client.sendEvent(room.roomId, "m.sticker", content);
+  }
+  const txnId = client.makeTxnId();
+  const localEvent = new MatrixEvent({
+    type: "m.sticker",
+    content,
+    event_id: `~${room.roomId}:${txnId}`,
+    sender: client.getUserId?.() || undefined,
+    room_id: room.roomId,
+    origin_server_ts: Date.now(),
+  });
+  localEvent.setTxnId(txnId);
+  localEvent.setStatus(EventStatus.SENDING);
+  room.addPendingEvent(localEvent, txnId);
+  try {
+    await client.encryptEventIfNeeded(localEvent, room);
+    if (localEvent.status === EventStatus.ENCRYPTING) room.updatePendingEvent(localEvent, EventStatus.SENDING);
+    const response = await client.sendEventHttpRequest(localEvent);
+    if (!response?.event_id) throw new Error("Matrix 未返回贴纸事件 ID");
+    room.updatePendingEvent(localEvent, EventStatus.SENT, response.event_id);
+    return response;
+  } catch (error) {
+    Object.assign(localEvent, { error });
+    room.updatePendingEvent(localEvent, EventStatus.NOT_SENT);
+    throw error;
+  }
 }
 
 function mediaRequestUrl(client, url) {
@@ -329,31 +429,116 @@ function fuzzyScore(value, query) {
   return Math.max(1, 1800 - gaps * 12 - (text.length - needle.length));
 }
 
+function matrixAssetCacheKey(client, rawUrl, width, height, resizeMethod, encryptedInfo) {
+  if (!rawUrl) return null;
+  const encryptedKey = encryptedInfo?.key?.k
+    ? [encryptedInfo.key.k, encryptedInfo.iv, encryptedInfo.hashes?.sha256, encryptedInfo.mimetype].map(value => value || "").join(":")
+    : "plain";
+  return [client?.getHomeserverUrl?.() || "", client?.getUserId?.() || "", rawUrl, width || "", height || "", resizeMethod || "", encryptedKey].join("|");
+}
+
+function trimMatrixAssetCache() {
+  if (orbitMatrixAssetCache.size <= ORBIT_MATRIX_ASSET_CACHE_LIMIT) return;
+  const idle = [...orbitMatrixAssetCache.entries()]
+    .filter(([, asset]) => !asset.refs)
+    .sort((left, right) => (left[1].lastUsed || 0) - (right[1].lastUsed || 0));
+  while (orbitMatrixAssetCache.size > ORBIT_MATRIX_ASSET_CACHE_LIMIT && idle.length) {
+    const [key, asset] = idle.shift();
+    if (asset.objectUrl) URL.revokeObjectURL(asset.src);
+    orbitMatrixAssetCache.delete(key);
+  }
+}
+
 function useMatrixAsset(client, rawUrl, width = null, height = null, resizeMethod = null, encryptedInfo = null) {
-  const [src, setSrc] = useState(null);
-  const [failed, setFailed] = useState(false);
-  const [resolvedUrl, setResolvedUrl] = useState(null);
+  const cacheKey = matrixAssetCacheKey(client, rawUrl, width, height, resizeMethod, encryptedInfo);
+  const initialAsset = cacheKey ? orbitMatrixAssetCache.get(cacheKey) : null;
+  const [assetState, setAssetState] = useState(() => ({ key: cacheKey, src: initialAsset?.src || null, url: initialAsset?.url || null, failed: false }));
+  const renderCached = cacheKey ? orbitMatrixAssetCache.get(cacheKey) : null;
+  const currentState = assetState.key === cacheKey ? assetState : { key: cacheKey, src: renderCached?.src || null, url: renderCached?.url || null, failed: false };
   useEffect(() => {
     let active = true;
-    let objectUrl = null;
-    setSrc(null); setFailed(false); setResolvedUrl(null);
-    if (!rawUrl) return () => {};
-    const encrypted = encryptedInfo?.key?.k && encryptedInfo?.iv;
+    let acquired = null;
+    const acquire = asset => {
+      if (!asset || acquired === asset) return;
+      acquired = asset;
+      asset.refs = (asset.refs || 0) + 1;
+      asset.lastUsed = Date.now();
+    };
+    const release = () => {
+      if (!acquired) return;
+      acquired.refs = Math.max(0, (acquired.refs || 1) - 1);
+      acquired.lastUsed = Date.now();
+      acquired = null;
+      trimMatrixAssetCache();
+    };
+    const cached = cacheKey && orbitMatrixAssetCache.get(cacheKey);
+    if (cached) {
+      acquire(cached);
+      setAssetState({ key: cacheKey, src: cached.src, url: cached.url, failed: false });
+      return () => { active = false; release(); };
+    }
+    setAssetState({ key: cacheKey, src: null, url: null, failed: false });
+    if (!rawUrl || !cacheKey) return () => {};
+    const encrypted = Boolean(encryptedInfo?.key?.k && encryptedInfo?.iv);
     const httpUrl = rawUrl.startsWith("mxc://") ? client?.mxcUrlToHttp?.(rawUrl, encrypted ? undefined : width, encrypted ? undefined : height, encrypted ? undefined : resizeMethod, false, true, true) : rawUrl;
-    if (!httpUrl) { setFailed(true); return () => {}; }
+    if (!httpUrl) {
+      setAssetState({ key: cacheKey, src: null, url: null, failed: true });
+      return () => {};
+    }
     const requestUrl = mediaRequestUrl(client, httpUrl);
-    setResolvedUrl(requestUrl);
     const token = client?.getAccessToken?.();
-    if (!token) { setSrc(requestUrl); return () => {}; }
-    const fetchMedia = async () => { let lastError = null; for (const candidate of mediaRequestCandidates(client, rawUrl, requestUrl)) { try { const response = await fetch(candidate, { headers: { Authorization: `Bearer ${token}` } }); if (response.ok) { if (candidate !== requestUrl && active) setResolvedUrl(candidate); return response.arrayBuffer(); } lastError = new Error(`媒体请求失败（${response.status}）`); } catch (error) { lastError = error; } } throw lastError || new Error("媒体请求失败"); };
-    fetchMedia().then(async buffer => {
-      if (!encrypted) return new Blob([buffer]);
-      const plain = await decryptMatrixBuffer(buffer, encryptedInfo);
-      return new Blob([plain], { type: encryptedInfo.mimetype || "application/octet-stream" });
-    }).then(blob => { if (active) { objectUrl = URL.createObjectURL(blob); setSrc(objectUrl); } }).catch(error => { console.warn("媒体解密失败", error); if (active) setFailed(true); });
-    return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [client, rawUrl, width, height, resizeMethod, encryptedInfo]);
-  return { src, failed, url: resolvedUrl };
+    if (!token) {
+      const asset = { src: requestUrl, url: requestUrl, objectUrl: false, refs: 0, lastUsed: Date.now() };
+      orbitMatrixAssetCache.set(cacheKey, asset);
+      acquire(asset);
+      setAssetState({ key: cacheKey, src: asset.src, url: asset.url, failed: false });
+      trimMatrixAssetCache();
+      return () => { active = false; release(); };
+    }
+    const load = async () => {
+      let lastError = null;
+      for (const candidate of mediaRequestCandidates(client, rawUrl, requestUrl)) {
+        try {
+          const response = await fetch(candidate, { headers: { Authorization: `Bearer ${token}` } });
+          if (response.ok) {
+            const buffer = await response.arrayBuffer();
+            const mimeType = encryptedInfo?.mimetype || response.headers.get("content-type") || "application/octet-stream";
+            const blob = encrypted
+              ? new Blob([await decryptMatrixBuffer(buffer, encryptedInfo)], { type: mimeType })
+              : new Blob([buffer], { type: mimeType });
+            return { src: URL.createObjectURL(blob), url: candidate, objectUrl: true, refs: 0, lastUsed: Date.now() };
+          }
+          lastError = new Error(`媒体请求失败（${response.status}）`);
+        } catch (error) { lastError = error; }
+      }
+      throw lastError || new Error("媒体请求失败");
+    };
+    let pending = orbitMatrixAssetPending.get(cacheKey);
+    if (!pending) {
+      pending = load().then(asset => {
+        const existing = orbitMatrixAssetCache.get(cacheKey);
+        if (existing) {
+          if (asset.objectUrl) URL.revokeObjectURL(asset.src);
+          return existing;
+        }
+        orbitMatrixAssetCache.set(cacheKey, asset);
+        trimMatrixAssetCache();
+        return asset;
+      });
+      orbitMatrixAssetPending.set(cacheKey, pending);
+      pending.finally(() => orbitMatrixAssetPending.delete(cacheKey)).catch(() => {});
+    }
+    pending.then(asset => {
+      if (!active) return;
+      acquire(asset);
+      setAssetState({ key: cacheKey, src: asset.src, url: asset.url, failed: false });
+    }).catch(error => {
+      console.warn("媒体解密失败", error);
+      if (active) setAssetState({ key: cacheKey, src: null, url: requestUrl, failed: true });
+    });
+    return () => { active = false; release(); };
+  }, [client, cacheKey]);
+  return { src: currentState.src, failed: currentState.failed, url: currentState.url };
 }
 
 function MatrixAvatar({ client, mxcUrl, httpUrl, size = 38, className = "room-avatar", style, fallback, alt }) {
@@ -361,6 +546,20 @@ function MatrixAvatar({ client, mxcUrl, httpUrl, size = 38, className = "room-av
   const [imageFailed, setImageFailed] = useState(false);
   useEffect(() => setImageFailed(false), [asset.src]);
   return h("div", { className, style, title: alt }, asset.src && !asset.failed && !imageFailed ? h("img", { src: asset.src, alt: alt || "", onError: () => setImageFailed(true) }) : fallback);
+}
+
+// Presence in Matrix is optional and many homeservers report a freshly
+// connected user's own presence as `offline` until the first presence event.
+// Keep the local session truthful while preserving an explicit offline state
+// for other members.
+function matrixPresence(client, userId) {
+  const user = client?.getUser?.(userId);
+  const raw = String(user?.presence || "").toLowerCase();
+  if (userId && userId === client?.getUserId?.() && client?.isRunning?.() !== false) return "online";
+  if (raw === "online" || raw.includes("busy")) return raw.includes("busy") ? "busy" : "online";
+  if (raw === "unavailable" || user?.currentlyActive === true) return "unavailable";
+  if (raw === "offline") return "offline";
+  return "unknown";
 }
 
 function MessageText({ text }) {
@@ -401,18 +600,28 @@ function MediaLightbox({ viewer, onClose }) {
   const [rotation, setRotation] = useState(0); const [scale, setScale] = useState(1); const [offset, setOffset] = useState({ x: 0, y: 0 }); const [dragging, setDragging] = useState(false); const dragRef = useRef(null);
   useEffect(() => { setRotation(0); setScale(1); setOffset({ x: 0, y: 0 }); }, [viewer?.src]);
   useEffect(() => { if (scale <= 1) setOffset({ x: 0, y: 0 }); }, [scale]);
+  useEffect(() => {
+    if (!viewer) return;
+    const closeOnEscape = event => event.key === "Escape" && onClose?.();
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [viewer, onClose]);
   if (!viewer) return null;
   const adjustScale = delta => setScale(value => Math.min(4, Math.max(0.35, Number((value + delta).toFixed(2)))));
   const beginDrag = event => { if (scale <= 1) return; event.preventDefault(); dragRef.current = { x: event.clientX, y: event.clientY, offset }; setDragging(true); };
   const moveDrag = event => { if (!dragRef.current) return; const start = dragRef.current; setOffset({ x: start.offset.x + event.clientX - start.x, y: start.offset.y + event.clientY - start.y }); };
   const endDrag = () => { dragRef.current = null; setDragging(false); };
-  return h("div", { className: "media-lightbox", onMouseDown: event => event.target === event.currentTarget && onClose() },
+  // The lightbox originates inside a message row, whose timeline creates a
+  // lower stacking context than the composer. Portal it to body so the
+  // overlay consistently covers the entire app, including the editor.
+  return createPortal(h("div", { className: "media-lightbox", onMouseDown: event => event.target === event.currentTarget && onClose() },
     h("div", { className: "media-lightbox-toolbar" }, h("span", null, viewer.alt || "图片预览"), h("div", null, h(UiButton, { size: "small", title: "缩小", onClick: () => adjustScale(-0.2) }, "−"), h("span", { className: "media-zoom-value" }, `${Math.round(scale * 100)}%`), h(UiButton, { size: "small", title: "放大", onClick: () => adjustScale(0.2) }, "+"), h(UiButton, { size: "small", title: "重置缩放", onClick: () => setScale(1) }, "1:1"), h(UiButton, { size: "small", onClick: () => setRotation(value => value - 90) }, "↶"), h(UiButton, { size: "small", onClick: () => setRotation(value => value + 90) }, "↷"), h(UiButton, { size: "small", onClick: onClose }, "关闭"))),
-    h("div", { className: `media-lightbox-stage ${dragging ? "is-dragging" : ""}`, onWheel: event => { event.preventDefault(); adjustScale(event.deltaY > 0 ? -0.1 : 0.1); }, onMouseDown: event => event.target === event.currentTarget ? onClose?.() : beginDrag(event), onMouseMove: moveDrag, onMouseUp: endDrag, onMouseLeave: endDrag }, h("img", { className: "media-lightbox-image", src: viewer.src, alt: viewer.alt || "图片预览", draggable: false, style: { transform: `translate(${offset.x}px, ${offset.y}px) rotate(${rotation}deg) scale(${scale})` } })));
+    h("div", { className: `media-lightbox-stage ${dragging ? "is-dragging" : ""}`, onWheel: event => { event.preventDefault(); adjustScale(event.deltaY > 0 ? -0.1 : 0.1); }, onMouseDown: event => event.target === event.currentTarget ? onClose?.() : beginDrag(event), onMouseMove: moveDrag, onMouseUp: endDrag, onMouseLeave: endDrag }, h("img", { className: "media-lightbox-image", src: viewer.src, alt: viewer.alt || "图片预览", draggable: false, style: { transform: `translate(${offset.x}px, ${offset.y}px) rotate(${rotation}deg) scale(${scale})` } }))), document.body);
 }
 
 function EmojiPicker({ onSelect, onInsert }) {
   const [items, setItems] = useState([]); const [packs, setPacks] = useState([]); const [pack, setPack] = useState("all"); const [query, setQuery] = useState(""); const [loading, setLoading] = useState(false); const [hovered, setHovered] = useState(null); const [mode, setMode] = useState("emoji");
+  useEffect(() => { const move = event => { const target = event.target?.closest?.(".emoji-item-wrap"); if (!target) return; const rect = target.getBoundingClientRect(); const width = 164; const height = 180; const gap = 10; const x = window.innerWidth - rect.right >= width + gap ? rect.right + gap : Math.max(8, rect.left - width - gap); const y = rect.top >= height + gap ? rect.top - height - gap : Math.min(window.innerHeight - height - 8, rect.bottom + gap); document.documentElement.style.setProperty("--orbit-picker-preview-x", `${x}px`); document.documentElement.style.setProperty("--orbit-picker-preview-y", `${y}px`); }; document.addEventListener("mousemove", move); return () => document.removeEventListener("mousemove", move); }, []);
   useEffect(() => { let active = true; setLoading(true); ensureEmojiCatalog().then(nextItems => { if (active) { setItems(nextItems); setPacks(window.orbitEmojiPacks || []); } }).finally(() => active && setLoading(false)); return () => { active = false; }; }, []);
   const normalizedQuery = query.trim().toLowerCase();
   const shown = items.filter(item => (pack === "all" || item.packId === pack) && (!normalizedQuery || `${item.name} ${(item.keywords || []).join(" ")}`.toLowerCase().includes(normalizedQuery)));
@@ -420,10 +629,11 @@ function EmojiPicker({ onSelect, onInsert }) {
     h("button", { type: "button", className: `emoji-category ${pack === "all" ? "active" : ""}`, onClick: () => setPack("all") }, "全部", h("small", null, items.length)),
     packs.map(item => h("button", { type: "button", className: `emoji-category ${pack === item.id ? "active" : ""}`, key: item.id, title: item.description || item.name, onClick: () => setPack(item.id) }, h("span", null, item.name), h("small", null, item.itemCount || items.filter(entry => entry.packId === item.id).length)))
   );
-  const emojiGrid = loading ? h("div", { className: "emoji-loading" }, "正在加载表情…") : h("div", { className: "emoji-grid" }, shown.map(item => h("div", { className: "emoji-item-wrap", key: item.id, onMouseEnter: () => setHovered(item), onMouseLeave: () => setHovered(null) }, h("button", { type: "button", className: "emoji-item", title: mode === "emoji" ? `${item.name}：插入表情` : `${item.name}：发送贴纸`, onClick: () => mode === "emoji" ? onInsert?.(item) : onSelect?.(item) }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" })))));
+  const emojiGrid = loading ? h("div", { className: "emoji-loading" }, "正在加载表情…") : h("div", { className: "emoji-grid" }, shown.map(item => h("div", { className: "emoji-item-wrap", key: item.id, onMouseEnter: event => { const rect = event.currentTarget.getBoundingClientRect(); const previewWidth = 148; const previewHeight = 174; const gap = 10; const x = window.innerWidth - rect.right >= previewWidth + gap ? rect.right + gap : Math.max(8, rect.left - previewWidth - gap); const y = rect.top >= previewHeight + gap ? rect.top - previewHeight - gap : Math.min(window.innerHeight - previewHeight - 8, rect.bottom + gap); document.documentElement.style.setProperty("--orbit-picker-preview-x", `${x}px`); document.documentElement.style.setProperty("--orbit-picker-preview-y", `${y}px`); setHovered(item); }, onMouseLeave: () => setHovered(null) }, h("button", { type: "button", className: "emoji-item", title: mode === "emoji" ? `${item.name}：插入表情` : `${item.name}：发送贴纸`, onClick: () => mode === "emoji" ? onInsert?.(item) : onSelect?.(item) }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" })) )));
   const modeTabs = h("div", { className: "emoji-mode-tabs", role: "tablist" }, h("button", { type: "button", className: mode === "emoji" ? "active" : "", role: "tab", onClick: () => setMode("emoji") }, "表情", h("small", null, "插入文本")), h("button", { type: "button", className: mode === "sticker" ? "active" : "", role: "tab", onClick: () => setMode("sticker") }, "贴纸", h("small", null, "发送大图")));
-  const content = h("div", { className: "emoji-popover" }, modeTabs, h(Input, { size: "small", value: query, onChange: setQuery, placeholder: mode === "emoji" ? "搜索表情名称" : "搜索贴纸名称" }), h("div", { className: "emoji-browser" }, categoryNav, h("section", { className: "emoji-category-content" }, h("div", { className: "emoji-category-title" }, pack === "all" ? (mode === "emoji" ? "全部表情" : "全部贴纸") : packs.find(item => item.id === pack)?.name || "表情"), emojiGrid, hovered && h("div", { className: "emoji-hover-preview", role: "tooltip" }, h("img", { src: assetRequestUrl(hovered.url || hovered.thumbUrl), alt: hovered.name }), h("strong", null, hovered.name)))));
-  return h(AntPopover, { trigger: "click", placement: "topLeft", content }, h("button", { type: "button", className: "tool-button", title: "表情包" }, "☺"));
+  const hoverPreview = hovered ? createPortal(h("div", { className: "emoji-hover-preview", role: "tooltip" }, h("img", { src: assetRequestUrl(hovered.url || hovered.thumbUrl), alt: hovered.name }), h("strong", null, hovered.name)), document.body) : null;
+  const content = h(React.Fragment, null, h("div", { className: "emoji-popover" }, modeTabs, h(Input, { size: "small", value: query, onChange: setQuery, placeholder: mode === "emoji" ? "搜索表情名称" : "搜索贴纸名称" }), h("div", { className: "emoji-browser" }, categoryNav, h("section", { className: "emoji-category-content" }, h("div", { className: "emoji-category-title" }, pack === "all" ? (mode === "emoji" ? "全部表情" : "全部贴纸") : packs.find(item => item.id === pack)?.name || "表情"), emojiGrid))), hoverPreview);
+  return h(AntPopover, { trigger: "click", placement: "top", arrow: false, autoAdjustOverflow: true, getPopupContainer: node => node.closest?.(".composer-wrap") || document.body, content }, h("button", { type: "button", className: "tool-button", title: "表情包" }, "☺"));
 }
 
 function emojiItemForToken(token) {
@@ -659,7 +869,7 @@ function roomToView(room, client) {
   // (or it is present in m.direct). Small group rooms must remain groups.
   const directUserId = directRoom ? otherMember?.userId : (room.isDirect?.() ? otherMember?.userId : null);
   const directMember = directUserId && room.getMember?.(directUserId);
-  const unread = Number(room.getUnreadNotificationCount?.() || 0);
+  const unread = Number(room.getUnreadNotificationCount?.("total") || 0);
   return {
     id: room.roomId,
     name,
@@ -770,7 +980,7 @@ function eventToMessage(event, room, userId) {
       author: sender === userId ? "你" : displayName, handle: sender,
       avatar: initials(displayName), avatarMxc: memberAvatarMxc(member), color: colorFor(sender),
       time: event.getTs?.() ? new Date(event.getTs()).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) : "",
-      text: failed ? "此消息已加密，当前设备缺少解密密钥" : (content.body || ""), isMe: sender === userId,
+      text: failed ? "此消息已加密，正在等待解密" : (content.body || ""), isMe: sender === userId,
     };
   }
   const msgtype = stickerEvent ? "m.sticker" : content.msgtype;
@@ -813,7 +1023,7 @@ function eventToMessage(event, room, userId) {
     replyTo: reply,
     threadRoot,
     edited: replacement,
-    attachment: ["m.image", "m.file", "m.video", "m.audio", "m.sticker"].includes(msgtype) ? { name: content.body, url: content.url || content.file?.url, file: content.file, info: content.info || null, emoji: msgtype === "m.image" && (Array.isArray(content["org.orbit.emoji_items"]) || (content.body === "表情" && Number(content.info?.w || 0) <= 96 && Number(content.info?.h || 0) <= 96)), sticker: msgtype === "m.sticker" || content["org.orbit.sticker"] === true, type: msgtype === "m.sticker" ? "m.image" : msgtype } : null,
+    attachment: ["m.image", "m.file", "m.video", "m.audio", "m.sticker"].includes(msgtype) ? { name: content.body, url: content.url || content.file?.url, file: content.file ? { ...content.file, mimetype: content.info?.mimetype, size: content.info?.size } : null, info: content.info || null, emoji: msgtype === "m.image" && (Array.isArray(content["org.orbit.emoji_items"]) || (content.body === "表情" && Number(content.info?.w || 0) <= 96 && Number(content.info?.h || 0) <= 96)), sticker: msgtype === "m.sticker" || content["org.orbit.sticker"] === true, type: msgtype === "m.sticker" ? "m.image" : msgtype } : null,
   };
 }
 
@@ -1064,18 +1274,46 @@ function SearchDialog({ client, room, onClose, onJumpTo }) {
 function Sidebar({ rooms, allRooms: roomUniverse = rooms, invites = [], spaces, selectedId, connected, presence, viewMode, activeSpaceId, onViewMode, onSpaceSelect, onSelect, onCreate, onCreateSpace, onManageSpace, onLeaveSpace = window.orbitLeaveSpace, onAcceptInvite, onDeclineInvite, onAccount, onLogout }) {
   const [query, setQuery] = useState("");
   const [directSort, setDirectSort] = useState("active");
+  const [directPresenceByUser, setDirectPresenceByUser] = useState({});
   const scopedRooms = rooms;
   const filtered = scopedRooms.filter(room => !room.hidden && `${room.name} ${room.id}`.toLowerCase().includes(query.toLowerCase()));
   const currentUser = connected.client?.getUser?.(connected.userId); spaces = spaces.filter(space => !space.hidden);
-  const allRooms = window.orbitAllRooms || roomUniverse;
+  const directUserIds = [...new Set(rooms.map(room => room.directUserId).filter(Boolean))];
+  const directUserIdsKey = [...directUserIds].sort().join("|");
+  useEffect(() => {
+    const client = connected.client;
+    let active = true;
+    const commit = (userId, value) => {
+      if (!active || !userId) return;
+      const normalized = String(value || "unknown").toLowerCase();
+      const user = client?.getUser?.(userId);
+      if (user) user.presence = normalized;
+      setDirectPresenceByUser(current => current[userId] === normalized ? current : { ...current, [userId]: normalized });
+    };
+    const onPresence = (_event, user) => commit(user?.userId, user?.presence);
+    client?.on?.("User.presence", onPresence);
+    Promise.all(directUserIds.map(async userId => {
+      try {
+        const result = await client?.getPresence?.(userId);
+        commit(userId, result?.presence || matrixPresence(client, userId));
+      } catch {
+        commit(userId, matrixPresence(client, userId));
+      }
+    })).catch(() => {});
+    return () => { active = false; client?.off?.("User.presence", onPresence); };
+  }, [connected.client, directUserIdsKey]);
+  const directPresence = userId => directPresenceByUser[userId] || matrixPresence(connected.client, userId);
+  // Badge totals must come from this committed render's props.
+  const allRooms = roomUniverse;
   const totalUnread = allRooms.filter(room => room.id !== selectedId && room.isDirect).reduce((sum, room) => sum + (Number(room.unread) || 0), 0);
   const groupUnread = allRooms.filter(room => room.id !== selectedId && room.isGroup).reduce((sum, room) => sum + (Number(room.unread) || 0), 0);
   const unreadBadge = count => count > 0 ? h("span", { className: "nav-unread-badge", title: `${count} 条未读消息` }, count > 99 ? "99+" : count) : null;
   const sortedRooms = viewMode !== "messages" ? filtered : [...filtered].sort((a, b) => {
     if (directSort === "online") {
-      const aOnline = a.directUserId && connected.client?.getUser?.(a.directUserId)?.presence === "online" ? 1 : 0;
-      const bOnline = b.directUserId && connected.client?.getUser?.(b.directUserId)?.presence === "online" ? 1 : 0;
-      if (aOnline !== bOnline) return bOnline - aOnline;
+      const rank = { online: 0, busy: 1, unavailable: 2, unknown: 3, offline: 4 };
+      const aRank = rank[directPresence(a.directUserId)] ?? 3;
+      const bRank = rank[directPresence(b.directUserId)] ?? 3;
+      if (aRank !== bRank) return aRank - bRank;
     }
     return (b.lastTs || 0) - (a.lastTs || 0);
   });
@@ -1663,7 +1901,7 @@ function ThreadPanel({ root, replies = [], client, onClose, onJumpTo }) {
 }
 
 function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, onSend, onTyping, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onEmojiSelect, replyTo, threadRoot, editing, onCancelReply, onCancelThread, onCancelEdit, onUpload, detailsCollapsed, onToggleDetails, selecting, forwardItems, onSelectForward, onStartSelecting, pinnedEventIds, onTogglePinMessage, onOpenDetails, onStartCall }) {
-  const [draft, setDraft] = useState(""); const [draftHtml, setDraftHtml] = useState(""); const [remoteTyping, setRemoteTyping] = useState([]); const inputRef = useRef(null); const fileRef = useRef(null); const scrollRef = useRef(null); const forceScrollRef = useRef(false); const pendingRoomScrollRef = useRef(null); const loadingEarlierRef = useRef(false); const [showJump, setShowJump] = useState(false); const [loadingEarlier, setLoadingEarlier] = useState(false); const [historyExhausted, setHistoryExhausted] = useState(false);
+  const [draft, setDraft] = useState(""); const [draftHtml, setDraftHtml] = useState(""); const [remoteTyping, setRemoteTyping] = useState([]); const inputRef = useRef(null); const fileRef = useRef(null); const scrollRef = useRef(null); const forceScrollRef = useRef(false); const stickToBottomRef = useRef(true); const previousTailRef = useRef({ roomId: null, eventId: null }); const pendingRoomScrollRef = useRef(null); const loadingEarlierRef = useRef(false); const preparedEmojiRef = useRef(new Map()); const pendingEmojiRef = useRef(new Map()); const [preparingEmoji, setPreparingEmoji] = useState(""); const [showJump, setShowJump] = useState(false); const [loadingEarlier, setLoadingEarlier] = useState(false); const [historyExhausted, setHistoryExhausted] = useState(false);
   React.useEffect(() => {
     if (!client || !room?.id) { setRemoteTyping([]); return; }
     const update = (_event, member) => {
@@ -1679,68 +1917,149 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
     return () => client.off?.("RoomMember.typing", update);
   }, [client, room?.id]);
   typingUsers = remoteTyping;
-  const [emojiSuggestions, setEmojiSuggestions] = useState([]); const emojiQueryRef = useRef(0);
+  const prepareEmojiSelection = React.useCallback(item => {
+    if (!client || !room?.id || !item) return Promise.reject(new Error("当前房间不可用"));
+    const shortcode = emojiShortcode(item);
+    const key = `${room.id}|:${shortcode}:`;
+    const prepared = preparedEmojiRef.current.get(key);
+    if (prepared) return Promise.resolve(prepared);
+    const existing = pendingEmojiRef.current.get(key);
+    if (existing) return existing;
+    setPreparingEmoji(shortcode);
+    const pending = prepareRemoteEmoji(client, item).then(result => {
+      preparedEmojiRef.current.set(key, result);
+      return result;
+    }).finally(() => {
+      pendingEmojiRef.current.delete(key);
+      setPreparingEmoji(current => current === shortcode ? "" : current);
+    });
+    pendingEmojiRef.current.set(key, pending);
+    return pending;
+  }, [client, room?.id]);
+  const [emojiSuggestions, setEmojiSuggestions] = useState([]); const emojiQueryRef = useRef(0); const emojiActionRef = useRef("typing"); const [hoveredSuggestion, setHoveredSuggestion] = useState(null);
   const updateEmojiSuggestions = value => {
     const match = String(value || "").match(/(?:^|[\s:])([^\s:]*)$/);
     if (!match || !match[1]) { setEmojiSuggestions([]); return; }
+    emojiActionRef.current = "typing";
     const q = match[1].toLowerCase();
     const requestId = ++emojiQueryRef.current;
     ensureEmojiCatalog().then(items => { if (requestId !== emojiQueryRef.current) return; const ranked = (items || []).map(item => ({ item, score: Math.max(fuzzyScore(item.name, q), ...(item.keywords || []).map(keyword => fuzzyScore(keyword, q)), 0) })).filter(entry => entry.score > 0).sort((a, b) => b.score - a.score || String(a.item.name).localeCompare(String(b.item.name), "zh-CN")); setEmojiSuggestions(ranked.slice(0, 80).map(entry => entry.item)); });
   };
   const [emojiSuggestionMode, setEmojiSuggestionMode] = useState("emoji");
   React.useEffect(() => {
-    const bar = document.querySelector(".emoji-inline-suggestions");
-    if (!bar) return;
-    const old = bar.querySelector(".emoji-suggestion-mode");
-    old?.remove();
-    const controls = document.createElement("div");
-    controls.className = "emoji-suggestion-mode";
-    controls.innerHTML = `<button type="button" data-mode="emoji" class="${emojiSuggestionMode === "emoji" ? "active" : ""}">表情</button><button type="button" data-mode="sticker" class="${emojiSuggestionMode === "sticker" ? "active" : ""}">贴纸</button>`;
-    controls.addEventListener("mousedown", event => {
-      const button = event.target.closest("button[data-mode]");
+    const move = event => {
+      const button = event.target?.closest?.(".emoji-suggestion-items > button");
       if (!button) return;
-      event.preventDefault(); event.stopPropagation(); setEmojiSuggestionMode(button.dataset.mode);
-    });
-    bar.prepend(controls);
-    bar.dataset.sendMode = emojiSuggestionMode;
-    const onChoose = event => {
-      if (bar.dataset.sendMode !== "sticker") return;
-      const button = event.target.closest(":scope > button:not(.emoji-suggestion-mode button)");
-      if (!button) return;
-      const name = button.querySelector("img")?.alt;
-      const item = (window.orbitEmojiItems || []).find(entry => entry.name === name);
-      if (!item) return;
-      event.preventDefault(); event.stopPropagation(); setEmojiSuggestions([]); onEmojiSelect?.(item);
+      const rect = button.getBoundingClientRect();
+      document.documentElement.style.setProperty("--orbit-emoji-preview-x", `${rect.left + rect.width / 2}px`);
     };
-    bar.addEventListener("mousedown", onChoose, true);
-    return () => bar.removeEventListener("mousedown", onChoose, true);
-  }, [emojiSuggestions.length, emojiSuggestionMode, draft, onEmojiSelect]);
+    document.addEventListener("mousemove", move);
+    return () => document.removeEventListener("mousemove", move);
+  }, []);
+  React.useEffect(() => {
+    const interceptEmojiSelection = event => {
+      if (emojiSuggestionMode !== "emoji") return;
+      const button = event.target?.closest?.(".emoji-suggestion-items > button");
+      if (!button) return;
+      const label = String(button.querySelector("span")?.textContent || "").replace(/^:+|:+$/g, "");
+      const item = (window.orbitEmojiItems || []).find(entry => emojiShortcode(entry) === label);
+      if (!item) return;
+      event.preventDefault();
+      event.stopPropagation();
+      prepareEmojiSelection(item).then(result => {
+        const token = `:${result.shortcode}:`;
+        setDraft(value => `${String(value).replace(/[^\s:]*$/, "")}${token} `);
+        setEmojiSuggestions([]);
+        requestAnimationFrame(() => inputRef.current?.focus?.());
+      }).catch(error => Toast.error(`表情准备失败：${error?.message || "无法上传到 Matrix"}`));
+    };
+    document.addEventListener("mousedown", interceptEmojiSelection, true);
+    return () => document.removeEventListener("mousedown", interceptEmojiSelection, true);
+  }, [emojiSuggestionMode, prepareEmojiSelection]);
   React.useEffect(() => { if (!draft) setEmojiSuggestions([]); }, [draft]);
+  React.useEffect(() => {
+    if (!draft.trim() || emojiSuggestions.length || emojiActionRef.current !== "typing") return;
+    const timer = setTimeout(() => updateEmojiSuggestions(draft), 80);
+    return () => clearTimeout(timer);
+  }, [draft, emojiSuggestions.length]);
   const [mentionTargets, setMentionTargets] = useState([]);
-  React.useEffect(() => { setDraft(editing?.text || ""); setDraftHtml(""); setMentionTargets([]); setHistoryExhausted(false); if (room?.id) pendingRoomScrollRef.current = room.id; }, [room?.id, editing?.id]);
+  React.useEffect(() => { setDraft(editing?.text || ""); setDraftHtml(""); setMentionTargets([]); setHistoryExhausted(false); preparedEmojiRef.current.clear(); pendingEmojiRef.current.clear(); setPreparingEmoji(""); stickToBottomRef.current = true; previousTailRef.current = { roomId: room?.id || null, eventId: null }; if (room?.id) pendingRoomScrollRef.current = room.id; }, [room?.id, editing?.id]);
   React.useEffect(() => {
     const el = scrollRef.current;
     if (!el || !room?.id || pendingRoomScrollRef.current !== room.id || !messages.length) return;
-    const readUpTo = room.matrixRoom?.getEventReadUpTo?.(client?.getUserId?.(), true);
-    const readIndex = readUpTo ? messages.findIndex(item => item.id === readUpTo) : -1;
-    const firstUnread = readIndex >= 0 ? messages.slice(readIndex + 1).find(item => item.type !== "empty" && item.id) : null;
-    const targetId = firstUnread?.id;
+    // Always reveal the tail of the live timeline when entering a room. The
+    // server's unread receipt may lag behind (or point outside the cached
+    // window), which previously reopened chats on already-seen history.
+    const targetId = null;
     requestAnimationFrame(() => {
       if (!scrollRef.current || pendingRoomScrollRef.current !== room.id) return;
-      const target = targetId && document.getElementById(`event-${String(targetId).replace(/[^a-zA-Z0-9_-]/g, "_")}`);
-      if (target) { el.scrollTop = Math.max(0, target.offsetTop - 54); setShowJump(true); }
-      else { el.scrollTop = el.scrollHeight; setShowJump(false); }
+      // Media and decrypted event content can increase scrollHeight after the
+      // first paint. Re-apply the tail position for a short settling window so
+      // an image load cannot push the user back into old history.
+      const settle = () => { if (scrollRef.current && window.orbitActiveRoomId === room.id) { scrollRef.current.scrollTop = scrollRef.current.scrollHeight; setShowJump(false); } };
+      settle();
+      const timers = [120, 350, 800, 1500, 2600].map(delay => setTimeout(settle, delay));
       pendingRoomScrollRef.current = null;
+      return () => timers.forEach(clearTimeout);
     });
   }, [room?.id, messages.length, client]);
   React.useEffect(() => { const el = scrollRef.current; if (!el || !forceScrollRef.current) return; requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; forceScrollRef.current = false; }); }, [messages.length]);
-  const send = async () => { const text = draft.trim(); if (!text) return; const pending = (window.orbitPendingMentions || {})[room?.id] || []; const mentions = [...mentionTargets, ...pending].filter((entry, index, list) => entry?.userId && text.includes(`@${String(entry.name || "").replace(/^@/, "")}`) && list.findIndex(other => other.userId === entry.userId) === index); setDraft(""); setDraftHtml(""); setMentionTargets([]); forceScrollRef.current = true; await onSend(text, draftHtml, mentions); setTimeout(() => { const el = scrollRef.current; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); setShowJump(false); }, 350); };
+  const tailEventId = messages.length ? messages[messages.length - 1]?.id || null : null;
+  React.useLayoutEffect(() => {
+    const previous = previousTailRef.current;
+    const sameRoom = previous.roomId === room?.id;
+    const appended = sameRoom && previous.eventId && tailEventId && previous.eventId !== tailEventId;
+    previousTailRef.current = { roomId: room?.id || null, eventId: tailEventId };
+    if (!appended || !stickToBottomRef.current || loadingEarlierRef.current) return;
+    const revealTail = () => {
+      const el = scrollRef.current;
+      if (!el || window.orbitActiveRoomId !== room?.id || !stickToBottomRef.current) return;
+      el.scrollTop = el.scrollHeight;
+      setShowJump(false);
+    };
+    revealTail();
+    const frame = requestAnimationFrame(revealTail);
+    const timers = [120, 420, 1000].map(delay => setTimeout(revealTail, delay));
+    return () => { cancelAnimationFrame(frame); timers.forEach(clearTimeout); };
+  }, [room?.id, tailEventId]);
+  const send = async () => {
+    const text = draft.trim();
+    if (!text || !room?.id) return;
+    const roomPrefix = `${room.id}|`;
+    const preparing = [...pendingEmojiRef.current.entries()].filter(([key]) => key.startsWith(roomPrefix)).map(([, promise]) => promise);
+    if (preparing.length) await Promise.all(preparing);
+    const resolvedEmoji = [...preparedEmojiRef.current.entries()]
+      .filter(([key, entry]) => key.startsWith(roomPrefix) && text.includes(`:${entry.shortcode}:`))
+      .map(([, entry]) => entry);
+    const pending = (window.orbitPendingMentions || {})[room.id] || [];
+    const mentions = [...mentionTargets, ...pending].filter((entry, index, list) => entry?.userId && text.includes(`@${String(entry.name || "").replace(/^@/, "")}`) && list.findIndex(other => other.userId === entry.userId) === index);
+    await onSend(text, draftHtml, mentions, resolvedEmoji);
+    setDraft(""); setDraftHtml(""); setMentionTargets([]);
+    [...preparedEmojiRef.current.keys()].filter(key => key.startsWith(roomPrefix)).forEach(key => preparedEmojiRef.current.delete(key));
+    forceScrollRef.current = true;
+    setTimeout(() => { const el = scrollRef.current; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); setShowJump(false); }, 350);
+  };
   React.useEffect(() => { window.orbitActiveRoomId = room?.id || null; }, [room?.id]);
+  React.useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const rememberPosition = () => { stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 120; };
+    el.addEventListener("scroll", rememberPosition, { passive: true });
+    rememberPosition();
+    return () => el.removeEventListener("scroll", rememberPosition);
+  }, [room?.id]);
   const keyDown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
   const loadEarlier = async () => { if (loadingEarlierRef.current || historyExhausted) return; const el = scrollRef.current; loadingEarlierRef.current = true; setLoadingEarlier(true); const beforeHeight = el?.scrollHeight || 0; try { const loaded = await onLoadMore?.(); if (loaded === false) setHistoryExhausted(true); requestAnimationFrame(() => { if (el) el.scrollTop += el.scrollHeight - beforeHeight; }); } finally { loadingEarlierRef.current = false; setLoadingEarlier(false); } };
-  const jumpBottom = () => { const el = scrollRef.current; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); };
+  const jumpBottom = () => { const el = scrollRef.current; stickToBottomRef.current = true; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); setShowJump(false); };
   if (!room) return h("main", { className: "main-panel" }, h("div", { className: "empty-messages" }, "登录后选择一个房间开始聊天"));
-  const insertEmoji = item => { const token = `:${item.name}:`; setDraft(value => `${String(value).replace(/[^\s:]*$/, "")}${token} `); setEmojiSuggestions([]); requestAnimationFrame(() => inputRef.current?.focus?.()); };
+  const insertEmoji = item => {
+    prepareEmojiSelection(item).then(result => {
+      const token = `:${result.shortcode}:`;
+      setDraft(value => `${String(value).replace(/[^\s:]*$/, "")}${token} `);
+      setEmojiSuggestions([]);
+      requestAnimationFrame(() => inputRef.current?.focus?.());
+    }).catch(error => Toast.error(`表情准备失败：${error?.message || "无法上传到 Matrix"}`));
+  };
   const insertMention = mention => { const userId = mention?.userId; const name = String(mention?.name || userId || "").replace(/^@/, "").trim(); if (!userId || !name) return; setMentionTargets(current => current.some(entry => entry.userId === userId) ? current : [...current, { userId, name }]); const current = String(draft || ""); const prefix = current && !/[\s\n]$/.test(current) ? " " : ""; inputRef.current?.insertText?.(`${prefix}@${name} `); };
   const handleFiles = files => { const list = [...(files || [])].filter(file => file && file.size >= 0); if (!list.length || !onUpload) return; list.reduce((chain, file) => chain.then(() => onUpload(file)), Promise.resolve()).catch(() => {}); };
   const threadReplies = threadRoot ? messages.filter(item => item.type !== "empty" && item.threadRoot === threadRoot.id) : [];
@@ -1748,7 +2067,7 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
   return h("main", { className: `main-panel ${threadRoot ? "thread-open" : ""}` },
     h("header", { className: "chat-header" }, h("div", { className: "chat-heading" }, h(MatrixAvatar, { client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 40, style: { background: room.color, width: 40, height: 40 }, fallback: room.initials, alt: room.name }), h("div", null, h("div", { className: "chat-title" }, room.name), h("div", { className: room.directUserId ? (client?.getUser?.(room.directUserId)?.presence === "online" ? "chat-subtitle direct-presence" : "chat-subtitle direct-offline") : "chat-subtitle" }, room.directUserId ? `${client?.getUser?.(room.directUserId)?.presence === "online" ? "在线" : "离线"} · ${client?.getUser?.(room.directUserId)?.displayName || room.directUserId}` : `${room.members} 位成员 · ${room.desc}`))), h("div", { className: "header-actions" }, h("button", { className: "icon-button", title: "搜索消息", onClick: onSearch }, h(Icon, { name: "search" })), h("button", { className: "icon-button", title: "发起语音通话", onClick: () => onStartCall?.("voice") }, h(Icon, { name: "phone" })), h("button", { className: "icon-button", title: "发起视频通话", onClick: () => onStartCall?.("video") }, h(Icon, { name: "video" })), h("button", { className: `icon-button header-selection-toggle ${selecting ? "is-active" : ""}`, title: selecting ? "退出多选" : "多选消息", onClick: () => selecting ? onStartSelecting?.(false) : onStartSelecting?.(true) }, h(Icon, { name: "list" })), h("button", { className: "icon-button", title: "查看置顶消息", onClick: () => Toast.info(pinnedEventIds?.length ? `本房间有 ${pinnedEventIds.length} 条置顶消息，请从消息菜单管理` : "暂无置顶消息") }, h(Icon, { name: "pin" })), h("button", { className: "icon-button room-details-toggle", title: "房间详情（点击展开/收起）", onClick: onOpenDetails }, h(Icon, { name: "room", size: 18 })))),
     h("div", { className: "message-scroll", ref: scrollRef, onScroll: e => { const current = e.currentTarget; setShowJump(current.scrollHeight - current.scrollTop - current.clientHeight > 260); if (current.scrollTop <= 72 && !loadingEarlierRef.current && !historyExhausted) loadEarlier(); } }, h(UiButton, { className: "load-more", disabled: loadingEarlier || historyExhausted, onClick: loadEarlier }, loadingEarlier ? "正在加载更早的消息…" : historyExhausted ? "没有更早的消息了" : "加载更早的消息"), messages.map((item, i) => h(Message, { key: item.id || `empty-${i}`, item, client, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onMention: mention => { const user = mention?.userId ? client?.getUser?.(mention.userId) : null; const raw = mention?.name === "你" ? (user?.displayName || mention?.userId || "") : (mention?.name || mention?.userId || ""); const name = String(raw).replace(/^@/, "").trim(); if (!name) return; const current = String(draft || ""); const prefix = current && !/[\\s\\n]$/.test(current) ? " " : ""; inputRef.current?.insertText?.(`${prefix}@${name} `); } , onTogglePinMessage, pinnedEventIds, selecting, selected: forwardItems?.some?.(entry => entry.id === item.id), onSelect: onSelectForward })), showJump && h(UiButton, { className: "jump-bottom", onClick: jumpBottom }, "↓ 回到最新消息")),
-    h("div", { className: "composer-wrap" }, typingUsers.length > 0 && h("div", { className: "typing-indicator", role: "status" }, h("span", { className: "typing-dots", "aria-hidden": "true" }, h("i"), h("i"), h("i")), h("span", null, typingUsers.length === 1 ? `${typingUsers[0]} 正在输入…` : `${typingUsers.slice(0, 2).join("、")} 正在输入…`)), (replyTo || threadRoot || editing) && h("div", { className: "reply-bar" }, h("span", null, editing ? "✎ 正在编辑消息" : threadRoot ? `⌁ 正在线程中回复：${String(threadRoot.text || threadRoot.attachment?.name || "消息").slice(0, 60)}` : `↩ 正在回复：${String(replyTo.text || replyTo.attachment?.name || "消息").slice(0, 60)}`), h("button", { onClick: editing ? onCancelEdit : threadRoot ? onCancelThread : onCancelReply }, "×")), emojiSuggestions.length > 0 && h("div", { className: "emoji-inline-suggestions", role: "listbox" }, emojiSuggestions.map(item => h("button", { type: "button", key: item.id, onMouseDown: event => { event.preventDefault(); const token = `:${item.name}:`; setDraft(value => `${String(value).replace(/[^\\s:]*$/, "")}${token} `); setEmojiSuggestions([]); requestAnimationFrame(() => inputRef.current?.focus?.()); } }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name }), h("span", null, `:${item.name}:`)))), h("div", { className: "composer" }, h(RichEditor, { ref: inputRef, value: draft, onChange: value => { setDraft(value); updateEmojiSuggestions(value); onTyping(true); }, onBlur: () => { onTyping(false); setEmojiSuggestions([]); }, onKeyDown: keyDown, onFiles: handleFiles, placeholder: `发送消息到 ${room.name}` }), h("div", { className: "composer-tools" }, h("div", { className: "tool-group" }, ["B", "I", "↗"].map((x, i) => h("button", { className: "tool-button", key: i, title: i === 0 ? "加粗" : i === 1 ? "斜体" : "插入链接", onClick: () => i < 2 ? inputRef.current?.format(i === 0 ? "bold" : "italic") : document.execCommand("createLink", false, prompt("输入链接地址")) }, x)), h(EmojiPicker, { onSelect: onEmojiSelect, onInsert: insertEmoji }), h("button", { className: "tool-button", title: "上传文件", onClick: () => fileRef.current?.click() }, "⊕"), h("input", { ref: fileRef, type: "file", hidden: true, multiple: true, onChange: e => { handleFiles(e.target.files); e.target.value = ""; } })), h(UiButton, { variant: "primary", className: "send-button", onClick: send }, editing ? "保存　↵" : "发送　↵"))), h("div", { className: "composer-hint" }, "Enter 发送 · Shift + Enter 换行")),
+    h("div", { className: "composer-wrap" }, typingUsers.length > 0 && h("div", { className: "typing-indicator", role: "status" }, h("span", { className: "typing-dots", "aria-hidden": "true" }, h("i"), h("i"), h("i")), h("span", null, typingUsers.length === 1 ? `${typingUsers[0]} 正在输入…` : `${typingUsers.slice(0, 2).join("、")} 正在输入…`)), (replyTo || threadRoot || editing) && h("div", { className: "reply-bar" }, h("span", null, editing ? "✎ 正在编辑消息" : threadRoot ? `⌁ 正在线程中回复：${String(threadRoot.text || threadRoot.attachment?.name || "消息").slice(0, 60)}` : `↩ 正在回复：${String(replyTo.text || replyTo.attachment?.name || "消息").slice(0, 60)}`), h("button", { onClick: editing ? onCancelEdit : threadRoot ? onCancelThread : onCancelReply }, "×")), emojiSuggestions.length > 0 && h("div", { className: "emoji-inline-suggestions", role: "listbox" }, h("div", { className: "emoji-suggestion-mode", role: "tablist" }, h("button", { type: "button", className: emojiSuggestionMode === "emoji" ? "active" : "", onMouseDown: e => { e.preventDefault(); setEmojiSuggestionMode("emoji"); } }, "表情"), h("button", { type: "button", className: emojiSuggestionMode === "sticker" ? "active" : "", onMouseDown: e => { e.preventDefault(); setEmojiSuggestionMode("sticker"); } }, "贴纸")), h("div", { className: "emoji-suggestion-items" }, emojiSuggestions.map(item => h("button", { type: "button", key: item.id, onMouseEnter: () => setHoveredSuggestion(item), onMouseLeave: () => setHoveredSuggestion(null), onMouseDown: event => { event.preventDefault(); if (emojiSuggestionMode === "sticker") { emojiActionRef.current = "select"; setEmojiSuggestions([]); onEmojiSelect?.(item); return; } const token = `:${item.name}:`; setDraft(value => `${String(value).replace(/[^\\s:]*$/, "")}${token} `); setEmojiSuggestions([]); requestAnimationFrame(() => inputRef.current?.focus?.()); } }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name }), h("span", null, `:${item.name}:`))), hoveredSuggestion && h("div", { className: "emoji-inline-preview", role: "tooltip" }, h("img", { src: assetRequestUrl(hoveredSuggestion.url || hoveredSuggestion.thumbUrl), alt: hoveredSuggestion.name }), h("strong", null, `:${hoveredSuggestion.name}:`)))), h("div", { className: "composer" }, h(RichEditor, { ref: inputRef, value: draft, onChange: value => { setDraft(value); updateEmojiSuggestions(value); onTyping(true); }, onBlur: () => { onTyping(false); setEmojiSuggestions([]); }, onKeyDown: keyDown, onFiles: handleFiles, placeholder: `发送消息到 ${room.name}` }), h("div", { className: "composer-tools" }, h("div", { className: "tool-group" }, ["B", "I", "↗"].map((x, i) => h("button", { className: "tool-button", key: i, title: i === 0 ? "加粗" : i === 1 ? "斜体" : "插入链接", onClick: () => i < 2 ? inputRef.current?.format(i === 0 ? "bold" : "italic") : document.execCommand("createLink", false, prompt("输入链接地址")) }, x)), h(EmojiPicker, { onSelect: onEmojiSelect, onInsert: insertEmoji }), h("button", { className: "tool-button", title: "上传文件", onClick: () => fileRef.current?.click() }, "⊕"), h("input", { ref: fileRef, type: "file", hidden: true, multiple: true, onChange: e => { handleFiles(e.target.files); e.target.value = ""; } })), h(UiButton, { variant: "primary", className: "send-button", onClick: send }, editing ? "保存　↵" : "发送　↵"))), h("div", { className: "composer-hint" }, "Enter 发送 · Shift + Enter 换行")),
     h(ThreadPanel, { root: threadRoot, replies: threadReplies, client, onClose: onCancelThread, onJumpTo })
   );
 }
@@ -1758,6 +2077,7 @@ function Details({ room, client, onInvite, onLeave, collapsed, onToggle, onRoomU
   const [savingName, setSavingName] = useState(false);
   const [savingAvatar, setSavingAvatar] = useState(false);
   const [muted, setMuted] = useState(false);
+  const [presenceByUser, setPresenceByUser] = useState({});
   const avatarRef = useRef(null);
   useEffect(() => { if (room) setNameDraft(room.name || ""); }, [room?.id, room?.name]);
   useEffect(() => {
@@ -1766,6 +2086,22 @@ function Details({ room, client, onInvite, onLeave, collapsed, onToggle, onRoomU
       const rule = client.getRoomPushRule("global", room.id);
       setMuted(Boolean(rule?.actions?.includes?.("dont_notify")));
     } catch { setMuted(false); }
+  }, [room?.id, client]);
+  useEffect(() => {
+    let active = true;
+    const ids = room?.matrixRoom?.getJoinedMembers?.().map(member => member.userId).filter(Boolean) || [];
+    if (!ids.length || typeof client?.getPresence !== "function") return () => { active = false; };
+    (async () => {
+      const next = {};
+      for (let start = 0; start < ids.length; start += 20) {
+        const batch = await Promise.all(ids.slice(start, start + 20).map(async userId => {
+          try { const result = await client.getPresence(userId); const value = String(result?.presence || "").toLowerCase(); return [userId, value || "unknown"]; } catch { return [userId, "unknown"]; }
+        }));
+        batch.filter(Boolean).forEach(([userId, value]) => { next[userId] = value; });
+        if (active) setPresenceByUser(current => ({ ...current, ...next }));
+      }
+    })();
+    return () => { active = false; };
   }, [room?.id, client]);
   if (!room) return null;
   const members = room.matrixRoom?.getJoinedMembers?.() || [];
@@ -1791,13 +2127,13 @@ function Details({ room, client, onInvite, onLeave, collapsed, onToggle, onRoomU
   if (collapsed) return null;
   const memberData = members.map(member => {
     const user = client?.getUser?.(member.userId);
-    const presence = user?.presence || "unknown";
+    const presence = member.userId === client?.getUserId?.() ? "online" : (presenceByUser[member.userId] || matrixPresence(client, member.userId));
     const displayName = member.name || user?.displayName || member.userId;
     return { member, user, presence, displayName };
   });
   const presenceRank = { online: 0, busy: 1, unavailable: 2, unknown: 3, offline: 4 };
   const sortedMemberData = [...memberData].sort((a, b) => (presenceRank[a.presence] ?? 3) - (presenceRank[b.presence] ?? 3) || a.displayName.localeCompare(b.displayName, "zh-CN"));
-  const onlineCount = memberData.filter(item => item.presence === "online").length;
+  const onlineCount = memberData.filter(item => ["online", "busy", "unavailable"].includes(item.presence)).length;
   const offlineCount = memberData.filter(item => item.presence === "offline").length;
   const memberRows = sortedMemberData.map(({ member, presence, displayName }) => {
     const profile = h("div", { className: "member-popover" },
@@ -1826,30 +2162,16 @@ function Details({ room, client, onInvite, onLeave, collapsed, onToggle, onRoomU
     h("div", { className: "privacy-note" }, "🔒 房间事件和消息通过 Matrix Client-Server API 同步。加密状态由该房间的 Matrix 状态事件决定."));
 }
 
-function installEmojiSendInterceptor(client) {
-  if (!client || client.__orbitEmojiSendWrapped) return;
-  const original = client.sendMessage?.bind(client);
-  if (!original) return;
-  client.__orbitOriginalSendMessage = original;
-  client.sendMessage = async (roomId, content, ...rest) => {
-    const body = content?.body || "";
-    const tokens = [...String(body).matchAll(/:([^:\s]+):/g)];
-    const catalog = window.orbitEmojiItems?.length ? window.orbitEmojiItems : await ensureEmojiCatalog();
-    const emojiOnly = content?.msgtype === "m.text" && tokens.length > 0 && tokens.map(match => match[0]).join(" ").trim() === String(body).trim();
-    if (!emojiOnly || !tokens.every(match => catalog.some(item => item.name === match[1]))) return original(roomId, content, ...rest);
-    const selectedItems = tokens.map(match => catalog.find(item => item.name === match[1]));
-    if (selectedItems.some(item => !item)) return original(roomId, content, ...rest);
-    const encryptedRoom = Boolean(client.getRoom?.(roomId)?.hasEncryptionStateEvent?.());
-    await sendEmojiImageEvents(client, roomId, selectedItems, encryptedRoom, (targetRoomId, nextContent) => original(targetRoomId, nextContent, ...rest));
-    return { event_id: null };
-  };
-  client.__orbitEmojiSendWrapped = true;
-}
-
 function App() {
   const [connected, setConnected] = useState(null); const [rooms, setRooms] = useState([]); const [invites, setInvites] = useState([]); const [messages, setMessages] = useState({}); const [typingByRoom, setTypingByRoom] = useState({}); const [selectedId, setSelectedId] = useState(null); const [showLogin, setShowLogin] = useState(false); const [showRoom, setShowRoom] = useState(false); const [showSpace, setShowSpace] = useState(false); const [showSpaceRooms, setShowSpaceRooms] = useState(false); const [showAccount, setShowAccount] = useState(false); const [showInvite, setShowInvite] = useState(false); const [showSearch, setShowSearch] = useState(false); const [replyTo, setReplyTo] = useState(null); const [threadRoot, setThreadRoot] = useState(null); const [editing, setEditing] = useState(null); const [syncing, setSyncing] = useState(false); const [presence, setPresence] = useState("online"); const [viewMode, setViewMode] = useState("messages"); const [activeSpaceId, setActiveSpaceId] = useState(null);
-  const excludedRoomIdsRef = useRef(new Set()); const pendingJoinRoomIdsRef = useRef(new Set()); const optimisticJoinedRoomsRef = useRef(new Map()); const refreshTimer = useRef(null); const selectedIdRef = useRef(null); const [detailsCollapsed, setDetailsCollapsed] = useState(false); const [forwardItems, setForwardItems] = useState([]); const [selecting, setSelecting] = useState(false); const [showForward, setShowForward] = useState(false); const [, setEmojiCatalogReady] = useState(0);
+  const excludedRoomIdsRef = useRef(new Set()); const pendingJoinRoomIdsRef = useRef(new Set()); const optimisticJoinedRoomsRef = useRef(new Map()); const locallyReadRoomsRef = useRef(new Map()); const stickerSendingRef = useRef(false); const refreshTimer = useRef(null); const selectedIdRef = useRef(null); const [detailsCollapsed, setDetailsCollapsed] = useState(false); const [forwardItems, setForwardItems] = useState([]); const [selecting, setSelecting] = useState(false); const [showForward, setShowForward] = useState(false); const [, setEmojiCatalogReady] = useState(0);
   useEffect(() => { selectedIdRef.current = selectedId; }, [selectedId]);
+  useEffect(() => { window.orbitAllRooms = rooms; }, [rooms]);
+  const rememberRoomRead = (roomId, event) => {
+    const eventId = event?.getId?.();
+    if (!roomId || !eventId) return;
+    locallyReadRoomsRef.current.set(roomId, { eventId, ts: Number(event?.getTs?.() || Date.now()) });
+  };
   useEffect(() => {
     const client = connected?.client;
     const room = selectedId ? client?.getRoom?.(selectedId) : null;
@@ -1857,6 +2179,8 @@ function App() {
     const events = room.getLiveTimeline?.().getEvents?.() || [];
     const readUpTo = room.getEventReadUpTo?.(client.getUserId?.(), true); const readIndex = readUpTo ? events.findIndex(event => event.getId?.() === readUpTo) : -1; const target = readIndex >= 0 ? [...events.slice(readIndex + 1)].reverse().find(event => event?.getId?.() && !room.hasPendingEvent?.(event.getId())) : [...events].reverse().find(event => event?.getId?.() && !room.hasPendingEvent?.(event.getId()));
     if (!target) return;
+    rememberRoomRead(selectedId, target);
+    setRooms(current => current.map(entry => entry.id === selectedId ? { ...entry, unread: 0, hasUnread: false } : entry));
     markRoomRead(client, selectedId, target).then(() => queueRefresh(client)).catch(() => {});
   }, [connected?.client, selectedId, messages[selectedId]?.length]);
   useEffect(() => { const client = connected?.client; const crypto = client?.getCrypto?.(); if (!client) return; const eventName = MatrixSDK.CryptoEvent?.VerificationRequestReceived || "crypto.verificationRequestReceived"; const onRequest = request => { if (request && !request.initiatedByMe) Toast.info(`收到设备验证请求：${request.otherDeviceId || "其他设备"}，请打开“我的设置 → 设备与安全”`); }; client.on?.(eventName, onRequest); crypto?.on?.(eventName, onRequest); return () => { client.off?.(eventName, onRequest); crypto?.off?.(eventName, onRequest); }; }, [connected?.client]);
@@ -1890,7 +2214,6 @@ function App() {
     try { excludedRoomIdsRef.current.add(space.id); window.orbitExcludedRooms = excludedRoomIdsRef.current; await connected.client.leave(space.id); setRooms(current => current.filter(item => item.id !== space.id)); setActiveSpaceId(null); setSelectedId(null); setViewMode("messages"); await refresh(connected.client); Toast.success("已退出空间"); } catch (error) { Toast.error(`退出空间失败：${error?.message || "请确认空间权限"}`); }
   };
   window.orbitLeaveSpace = leaveSpace;
-  window.orbitAllRooms = rooms;
   React.useEffect(() => {
     window.orbitBatchRedact = redactSelected;
     const bar = document.querySelector(".forward-bar:not(.forward-bar-empty)");
@@ -1918,7 +2241,21 @@ function App() {
     });
     const pending = allRooms.filter(room => room.getMyMembership?.() === "invite" && !pendingJoinIds.has(room.roomId)).map(room => roomToView(room, client));
     setInvites(pending);
-    const joinedViews = allRooms.filter(room => room.getMyMembership?.() === "join" || pendingJoinIds.has(room.roomId)).map(room => roomToView(room, client));
+    const joinedViews = allRooms.filter(room => room.getMyMembership?.() === "join" || pendingJoinIds.has(room.roomId)).map(room => {
+      const view = roomToView(room, client);
+      const localRead = locallyReadRoomsRef.current.get(room.roomId);
+      if (!localRead) return view;
+      const last = room.getLastLiveEvent?.() || room.getLiveTimeline?.().getEvents?.().slice(-1)[0];
+      const lastId = last?.getId?.();
+      const lastTs = Number(last?.getTs?.() || 0);
+      // Do not let a lagging SDK unread cache resurrect a badge. A genuinely
+      // newer remote event removes this override in the timeline listener.
+      if (lastId === localRead.eventId || lastTs <= localRead.ts) {
+        view.unread = 0;
+        view.hasUnread = false;
+      }
+      return view;
+    });
     const joinedIds = new Set(joinedViews.map(room => room.id));
     const fallbackViews = [...optimisticJoined.values()].filter(room => !joinedIds.has(room.id));
     const next = [...joinedViews, ...fallbackViews].sort((a, b) => { if (a.pinned !== b.pinned) return a.pinned ? -1 : 1; return (b.matrixRoom.getLastLiveEvent?.()?.getTs?.() || b.lastTs || 0) - (a.matrixRoom.getLastLiveEvent?.()?.getTs?.() || a.lastTs || 0); });
@@ -2006,7 +2343,6 @@ function App() {
       } catch (error) { localStorage.removeItem("orbit.matrix.sso.pending"); Toast.error(`SSO 登录失败：${error?.message || "请重新尝试"}`); }
     })();
   }, []);
-  React.useEffect(() => { installEmojiSendInterceptor(connected?.client); }, [connected?.client]);
   React.useEffect(() => {
     const client = connected?.client; const userId = connected?.userId;
     if (!client) return;
@@ -2035,7 +2371,11 @@ function App() {
       if (content?.msgtype === "m.text" && pending.length) {
         const valid = pending.filter(entry => entry?.userId && String(content.body || "").includes(`@${String(entry.name || "").replace(/^@/, "")}`));
         if (valid.length) {
-          content = { ...content, "m.mentions": { user_ids: [...new Set(valid.map(entry => entry.userId))] }, format: "org.matrix.custom.html", formatted_body: mentionHtml(content.body, valid) };
+          content = { ...content, "m.mentions": { user_ids: [...new Set(valid.map(entry => entry.userId))] } };
+          if (!content.formatted_body) {
+            content.format = "org.matrix.custom.html";
+            content.formatted_body = mentionHtml(content.body, valid);
+          }
         }
         const next = { ...(window.orbitPendingMentions || {}) }; delete next[roomId]; window.orbitPendingMentions = next;
       }
@@ -2047,24 +2387,66 @@ function App() {
   const visibleRooms = useMemo(() => { if (viewMode === "spaces") { const space = spaces.find(item => item.id === activeSpaceId); if (!space) return []; const childIds = new Set(spaceChildIds(space.matrixRoom)); return rooms.filter(item => !item.isSpace && (childIds.has(item.id) || roomParentSpaceIds(item.matrixRoom).includes(space.id))); } if (viewMode === "groups") return rooms.filter(item => item.isGroup); return rooms.filter(item => !item.isSpace && item.isDirect); }, [rooms, spaces, viewMode, activeSpaceId]);
   const room = useMemo(() => visibleRooms.find(item => item.id === selectedId) || null, [visibleRooms, selectedId]);
   const loadMore = async () => { if (!connected || !room) return false; try { const before = (messages[room.id] || []).filter(item => item.type !== "empty").length; await connected.client.scrollback(room.matrixRoom, 40); const loaded = await roomMessages(room.matrixRoom, connected.userId, connected.client); setMessages(current => ({ ...current, [room.id]: loaded })); return loaded.filter(item => item.type !== "empty").length > before; } catch (error) { Toast.error(`历史消息加载失败：${error?.message || "未知错误"}`); return false; } };
-  const send = async (text, _html, mentions = []) => { if (!connected || !room) return; try { if (!editing && !replyTo && !threadRoot) { const catalog = window.orbitEmojiItems?.length ? window.orbitEmojiItems : await ensureEmojiCatalog(); const tokens = [...String(text).matchAll(/:([^:\s]+):/g)]; const emojiOnly = tokens.length > 0 && tokens.map(match => match[0]).join(" ").trim() === String(text).trim(); const emojiItems = emojiOnly ? tokens.map(match => catalog.find(item => item.name === match[1])).filter(Boolean) : []; if (emojiOnly && emojiItems.length === tokens.length) { await sendEmojiImageEvents(connected.client, room.id, emojiItems, Boolean(room.matrixRoom.hasEncryptionStateEvent?.())); refresh(connected.client); return; } } if (editing) { await connected.client.sendMessage(room.id, { msgtype: "m.text", body: `* ${text}`, "m.new_content": { msgtype: "m.text", body: text }, "m.relates_to": { rel_type: "m.replace", event_id: editing.id } }); setEditing(null); } else { const content = { msgtype: "m.text", body: text }; const validMentions = (mentions || []).filter(entry => entry?.userId && String(text).includes(`@${String(entry.name || "").replace(/^@/, "")}`)); if (validMentions.length) { content["m.mentions"] = { user_ids: [...new Set(validMentions.map(entry => entry.userId))] }; content.format = "org.matrix.custom.html"; content.formatted_body = mentionHtml(text, validMentions); } if (threadRoot) content["m.relates_to"] = { rel_type: "m.thread", event_id: threadRoot.id, "m.in_reply_to": { event_id: threadRoot.id } }; else if (replyTo) content["m.relates_to"] = { "m.in_reply_to": { event_id: replyTo.id } }; await connected.client.sendMessage(room.id, content); setReplyTo(null); setThreadRoot(null); } refresh(connected.client); } catch (error) { Toast.error(`消息发送失败：${error?.message || "未知错误"}`); throw error; } };
+  const send = async (text, _html, mentions = [], resolvedEmoji = []) => {
+    if (!connected || !room) return;
+    try {
+      if (editing) {
+        await connected.client.sendMessage(room.id, { msgtype: "m.text", body: `* ${text}`, "m.new_content": { msgtype: "m.text", body: text }, "m.relates_to": { rel_type: "m.replace", event_id: editing.id } });
+        setEditing(null);
+      } else {
+        const validMentions = (mentions || []).filter(entry => entry?.userId && String(text).includes(`@${String(entry.name || "").replace(/^@/, "")}`));
+        let content = resolvedEmoji.length
+          ? createEmojiTextContent(text, resolvedEmoji, validMentions)
+          : { msgtype: "m.text", body: text };
+        if (validMentions.length) {
+          content["m.mentions"] = { user_ids: [...new Set(validMentions.map(entry => entry.userId))] };
+          if (!content.formatted_body) {
+            content.format = "org.matrix.custom.html";
+            content.formatted_body = mentionHtml(text, validMentions);
+          }
+        }
+        if (threadRoot) content["m.relates_to"] = { rel_type: "m.thread", event_id: threadRoot.id, "m.in_reply_to": { event_id: threadRoot.id } };
+        else if (replyTo) content["m.relates_to"] = { "m.in_reply_to": { event_id: replyTo.id } };
+        await connected.client.sendMessage(room.id, content);
+        setReplyTo(null); setThreadRoot(null);
+      }
+      queueRefresh(connected.client);
+    } catch (error) {
+      Toast.error(`消息发送失败：${error?.message || "未知错误"}`);
+      throw error;
+    }
+  };
   const react = async (item, key = "👍") => { try { const matrixRoom = room?.matrixRoom; const timelineEvents = matrixRoom?.getLiveTimeline?.().getEvents?.() || []; let candidates = timelineEvents; try { const relations = matrixRoom?.getRelationsForEvent?.(item.id, "m.annotation", "m.reaction"); const relatedEvents = relations?.getRelations?.() || relations?.events || []; if (relatedEvents.length) candidates = [...candidates, ...relatedEvents]; } catch {} const mine = candidates.find(event => event.getType?.() === "m.reaction" && event.getSender?.() === connected.userId && event.getContent?.()?.["m.relates_to"]?.event_id === item.id && event.getContent?.()?.["m.relates_to"]?.key === key); if (mine) await connected.client.redactEvent(room.id, mine.getId?.()); else await connected.client.sendEvent(room.id, "m.reaction", { "m.relates_to": { rel_type: "m.annotation", event_id: item.id, key } }); refresh(connected.client); } catch (error) { Toast.error(`回应操作失败：${error?.message || "未知错误"}`); } };
   const redact = async item => { if (!confirm("确定撤回这条消息吗？")) return; try { await connected.client.redactEvent(room.id, item.id); refresh(connected.client); } catch (error) { Toast.error(`撤回失败：${error?.message || "未知错误"}`); } };
   const upload = async file => { try { const encryptedRoom = Boolean(room.matrixRoom.hasEncryptionStateEvent?.()); const { uploaded, fileInfo } = await uploadMatrixMedia(connected.client, file, encryptedRoom); const type = file.type.startsWith("image/") ? "m.image" : file.type.startsWith("video/") ? "m.video" : file.type.startsWith("audio/") ? "m.audio" : "m.file"; const content = applyUploadedMedia({ msgtype: type, body: file.name, info: { mimetype: file.type, size: file.size } }, uploaded, fileInfo); await connected.client.sendMessage(room.id, content); Toast.success(encryptedRoom ? "加密文件已发送" : "文件已发送"); refresh(connected.client); } catch (error) { Toast.error(`文件发送失败：${error?.message || "未知错误"}`); } };
-  const sendEmoji = async item => { try { const response = await fetch(assetRequestUrl(item.url)); if (!response.ok) throw new Error(`表情包下载失败（${response.status}）`); const blob = await normalizeImageBlob(await response.blob()); const file = new File([blob], item.fileName || `${item.name}.gif`, { type: item.mimeType || blob.type || "image/gif" }); const { uploaded, fileInfo } = await uploadMatrixMedia(connected.client, file, Boolean(room.matrixRoom.hasEncryptionStateEvent?.()));
-    // Stickers are their own Matrix event type (m.sticker), as used by
-    // Cinny/Element. Sending this standard event lets other clients render
-    // the image instead of receiving an app-specific text token.
-    const info = { mimetype: file.type, size: file.size };
-    try { const bitmap = await createImageBitmap(blob); info.w = bitmap.width; info.h = bitmap.height; bitmap.close?.(); } catch {}
-    const content = applyUploadedMedia({ msgtype: "m.image", body: item.fileName || item.name, info, "org.orbit.sticker": true }, uploaded, fileInfo);
-    // Use the standard m.room.message/m.image shape for interoperability.
-    // Some clients do not render m.sticker reliably, especially when the
-    // media is encrypted and carries the v2 file descriptor.
-    await connected.client.sendMessage(room.id, content);
-    Toast.success("贴纸已发送"); refresh(connected.client); } catch (error) { Toast.error(`贴纸发送失败：${error?.message || "网络错误"}`); } };
+  const sendEmoji = async item => {
+    if (!connected?.client || !room || !item) return;
+    if (stickerSendingRef.current) return Toast.info("上一张贴纸正在发送，请稍候");
+    stickerSendingRef.current = true;
+    try {
+      const content = await createStickerEventContent(connected.client, room.matrixRoom, item);
+      if (threadRoot) content["m.relates_to"] = { rel_type: "m.thread", event_id: threadRoot.id, "m.in_reply_to": { event_id: threadRoot.id } };
+      else if (replyTo) content["m.relates_to"] = { "m.in_reply_to": { event_id: replyTo.id } };
+      await sendStickerEvent(connected.client, room.matrixRoom, content);
+      setReplyTo(null); setThreadRoot(null);
+      Toast.success("贴纸已发送");
+      queueRefresh(connected.client);
+    } catch (error) {
+      Toast.error(`贴纸发送失败：${error?.message || "网络错误"}`);
+    } finally {
+      stickerSendingRef.current = false;
+    }
+  };
   const typing = value => { if (connected && room) connected.client.sendTyping(room.id, value, 5000).catch(() => {}); };
-  const markRead = id => { setRooms(current => current.map(entry => entry.id === id ? { ...entry, unread: 0, hasUnread: false } : entry)); const targetRoom = connected?.client.getRoom(id); const target = targetRoom?.getLiveTimeline?.().getEvents?.().slice(-1)[0]; if (target) setTimeout(() => Promise.resolve(markRoomRead(connected.client, id, target)).then(() => queueRefresh(connected.client)).catch(() => {}), 1200); else if (connected?.client) queueRefresh(connected.client); };
+  const markRead = id => {
+    setRooms(current => current.map(entry => entry.id === id ? { ...entry, unread: 0, hasUnread: false } : entry));
+    const targetRoom = connected?.client.getRoom(id);
+    const target = targetRoom?.getLiveTimeline?.().getEvents?.().slice(-1)[0];
+    if (target) {
+      rememberRoomRead(id, target);
+      Promise.resolve(markRoomRead(connected.client, id, target)).then(() => queueRefresh(connected.client)).catch(() => {});
+    } else if (connected?.client) queueRefresh(connected.client);
+  };
   const togglePinMessage = async item => { if (!room || !item?.id) return; try { const state = room.matrixRoom.currentState?.getStateEvents?.("m.room.pinned_events", ""); const current = Array.isArray(state) ? state[0]?.getContent?.()?.pinned : state?.getContent?.()?.pinned; const pinnedIds = Array.isArray(current) ? current : []; const next = pinnedIds.includes(item.id) ? pinnedIds.filter(id => id !== item.id) : [...pinnedIds, item.id].slice(-50); await connected.client.sendStateEvent(room.id, "m.room.pinned_events", { pinned: next }, ""); await refresh(connected.client); Toast.success(next.includes(item.id) ? "消息已置顶" : "已取消消息置顶"); } catch (error) { Toast.error(`消息置顶失败：${error?.message || "当前 homeserver 不支持置顶消息"}`); } };
   const startCall = async kind => { if (!room || !connected?.client) return; try { const call = connected.client.createCall?.(room.id); if (!call) throw new Error("当前 Matrix SDK 未提供通话能力"); const method = kind === "video" ? (call.placeVideoCall || call.placeCall) : (call.placeVoiceCall || call.placeCall); if (typeof method !== "function") throw new Error("当前 homeserver 未启用 Matrix 通话"); await method.call(call, kind === "video"); Toast.success(kind === "video" ? "视频通话请求已发出" : "语音通话请求已发出"); } catch (error) { Toast.error(`通话发起失败：${error?.message || "请确认 TURN 与 VoIP 配置"}`); } };
   const jumpTo = async eventId => { if (!eventId) return; const safe = String(eventId).replace(/[^a-zA-Z0-9_-]/g, "_"); let node = document.getElementById(`event-${safe}`); if (!node && room) { try { await connected.client.scrollback(room.matrixRoom, 100); await refresh(connected.client); await new Promise(resolve => setTimeout(resolve, 80)); node = document.getElementById(`event-${safe}`); } catch {} } if (node) { node.scrollIntoView({ behavior: "smooth", block: "center" }); node.classList.add("message-highlight"); setTimeout(() => node.classList.remove("message-highlight"), 1600); } else Toast.info("原消息不在当前服务器返回的历史范围内"); };

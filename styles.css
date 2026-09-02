@@ -449,7 +449,7 @@ button { cursor: pointer; }
 .reply-jump { color: #3370ff; font-size: 10px; white-space: nowrap; }
 .thread-reference { display: inline-block; margin-top: 7px; padding: 4px 8px; border-radius: 5px; background: #f2f4f7; color: #667085; font-size: 10px; }
 .message-image { cursor: zoom-in; }
-.media-lightbox { position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 28px; background: rgba(15,23,42,.82); }
+.media-lightbox { position: fixed; inset: 0; z-index: 3000; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 28px; background: rgba(15,23,42,.82); }
 .media-lightbox-image { max-width: 92vw; max-height: 82vh; object-fit: contain; border-radius: 8px; transition: transform .2s ease; box-shadow: 0 16px 44px rgba(0,0,0,.32); }
 .media-lightbox-toolbar { width: min(900px, 92vw); display: flex; align-items: center; justify-content: space-between; color: #fff; font-size: 13px; }
 .media-lightbox-toolbar > div { display: flex; gap: 8px; }
@@ -1521,7 +1521,16 @@ button { cursor: pointer; }
 .emoji-hover-preview { position: absolute; right: 12px; top: 54px; z-index: 80; display: grid; width: 148px; padding: 10px; place-items: center; gap: 5px; border: 1px solid #dfe5ef; border-radius: 12px; background: #fff; box-shadow: 0 14px 30px rgba(16,24,40,.2); pointer-events: none; }
 .emoji-hover-preview img { width: 118px; height: 118px; object-fit: contain; }
 .emoji-hover-preview strong { max-width: 100%; overflow: hidden; color: #344054; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.composer-wrap { position: relative; }
+.composer-wrap {
+  /* Keep inline suggestions above the timeline, but below every app modal.
+     A value above .modal-backdrop (20) made the editor pierce settings,
+     search, invite, and other overlays. */
+  position: relative;
+  z-index: 2;
+}
+.message-scroll { position: relative; z-index: 1; }
+.message-scroll:has(.message-context-menu) { z-index: 5; }
+.message-scroll:has(.document-modal-backdrop) { z-index: 1201; }
 .emoji-inline-suggestions { position: absolute; right: 18px; bottom: 96px; z-index: 30; display: flex; gap: 6px; max-width: min(520px, calc(100% - 36px)); padding: 8px; border: 1px solid #dfe5ef; border-radius: 12px; background: #fff; box-shadow: 0 12px 28px rgba(16,24,40,.16); }
 .emoji-inline-suggestions button { display: inline-flex; align-items: center; gap: 5px; padding: 5px 7px; border: 0; border-radius: 7px; color: #344054; background: #f8fafc; cursor: pointer; }
 .emoji-inline-suggestions button:hover { background: #eaf1ff; color: #1d4ed8; }
@@ -1535,12 +1544,44 @@ button { cursor: pointer; }
 
 /* Match the compact reference layout for the full picker. */
 .emoji-popover { width: min(520px, calc(100vw - 28px)) !important; padding: 4px 2px 2px; }
-.emoji-browser { grid-template-columns: 122px minmax(0, 1fr); gap: 12px; min-height: 390px; }
-.emoji-category-nav { max-height: 390px; }
+.emoji-popover > .ant-input { box-sizing: border-box; width: calc(100% - 4px); max-width: calc(100% - 4px); }
+.emoji-browser { grid-template-columns: 122px minmax(0, 1fr); gap: 12px; min-height: 390px; min-width: 0; overflow: hidden; }
+.emoji-category-nav, .emoji-category-content { min-width: 0; max-width: 100%; }
+.emoji-category-nav { max-height: 390px; overflow-x: hidden; }
 .emoji-category-content .emoji-grid { grid-template-columns: repeat(7, minmax(42px, 1fr)); gap: 7px; max-height: 355px; padding-right: 4px; }
 .emoji-item-wrap, .emoji-item-wrap .emoji-item { width: 44px; height: 44px; }
 .emoji-hover-preview { width: 148px; min-height: 148px; }
 .emoji-hover-preview img { width: 118px; height: 118px; }
+.emoji-hover-preview { position: fixed !important; left: var(--orbit-picker-preview-x, 50%) !important; top: var(--orbit-picker-preview-y, 20%) !important; right: auto !important; transform: none !important; z-index: 250 !important; }
+.composer-wrap > .ant-popover:has(.emoji-popover) { transform: translateY(-156px) !important; }
+
+/* Inline suggestions stay exactly inside the composer content box. Tabs occupy
+   their own row so they never consume or cover the emoji result strip. */
+.emoji-inline-suggestions { left: 22px !important; right: 22px !important; width: auto !important; max-width: none !important; height: auto; max-height: 116px; display: block !important; padding: 6px 8px 7px; overflow: hidden !important; box-sizing: border-box; }
+.emoji-suggestion-mode { display: flex; width: 100%; height: 30px; margin: 0 0 5px; padding: 0 0 4px; border-right: 0; border-bottom: 1px solid #edf1f7; }
+.emoji-suggestion-mode button { flex: 0 0 auto; min-width: 48px !important; height: 26px; }
+.emoji-suggestion-items { display: flex; align-items: center; gap: 6px; width: 100%; min-width: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
+.emoji-suggestion-items > button { flex: 0 0 auto; min-width: 96px; height: 42px; }
+.emoji-inline-suggestions { overflow: visible !important; }
+.emoji-suggestion-items { position: relative; }
+.emoji-inline-preview { position: fixed; left: clamp(76px, var(--orbit-emoji-preview-x, 50%), calc(100vw - 76px)); bottom: clamp(210px, 29vh, 260px); transform: translateX(-50%); z-index: 200; display: grid; width: 132px; padding: 9px; place-items: center; gap: 5px; border: 1px solid #dfe5ef; border-radius: 12px; background: #fff; box-shadow: 0 14px 30px rgba(16,24,40,.2); pointer-events: none; }
+.emoji-inline-preview img { width: 104px; height: 104px; object-fit: contain; }
+.emoji-inline-preview strong { max-width: 100%; overflow: hidden; color: #344054; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.ant-popover:has(.emoji-popover) { max-width: calc(100vw - 20px); margin-top: 0; transform: none !important; }
+.ant-popover:has(.emoji-popover) .ant-popover-inner { padding: 0; overflow: hidden; border: 1px solid #e5eaf2; border-radius: 16px; box-shadow: 0 18px 46px rgba(31,45,75,.18); }
+.emoji-popover { width: min(640px, calc(100vw - 24px)) !important; max-height: min(560px, calc(100vh - 108px)); overflow: hidden; background: #fff; }
+.emoji-popover > .ant-input { height: 38px; margin: 12px 12px 10px; width: calc(100% - 24px); max-width: none; border: 1px solid #e7ebf3; border-radius: 10px; background: #f8faff; }
+.emoji-mode-tabs { margin: 0 12px 10px; padding: 3px; background: #f4f6fa; }
+.emoji-browser { grid-template-columns: 132px minmax(0, 1fr); gap: 14px; min-height: 0; max-height: 444px; padding: 0 12px 12px; }
+.emoji-category-nav { max-height: 424px; padding: 4px 8px 4px 0; border-right: 1px solid #edf0f5; }
+.emoji-category-nav::before { content: "收藏与分类"; display: block; padding: 0 8px 7px; color: #98a2b3; font-size: 10px; font-weight: 600; letter-spacing: .02em; }
+.emoji-category { color: #667085; background: transparent; text-align: left; }
+.emoji-category.active { color: #1d4ed8; background: #eaf1ff; font-weight: 600; }
+.emoji-category-content .emoji-grid { max-height: 392px; padding: 2px 2px 10px; grid-template-columns: repeat(auto-fill, minmax(46px, 1fr)); gap: 8px; overflow-x: hidden; }
+.emoji-category-title { color: #344054; font-weight: 600; }
+.emoji-item-wrap, .emoji-item-wrap .emoji-item { width: 46px; height: 46px; }
+.emoji-item-wrap:hover { background: #eef4ff; transform: translateY(-2px); }
+.emoji-category-content .emoji-grid { grid-template-columns: repeat(auto-fill, 46px); grid-auto-rows: 46px; justify-content: start; align-content: start; gap: 8px; }
 .search-result { width: 100%; border: 0; border-bottom: 1px solid #edf1f7; background: transparent; text-align: left; cursor: pointer; }
 .search-result:hover { background: #f5f8ff; }
 .toast-notification-link { display: block; width: 100%; padding: 0; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; }
