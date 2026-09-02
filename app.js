@@ -2,8 +2,9 @@ import React, { useEffect, useMemo, useRef, useState } from "https://esm.sh/reac
 import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
 import * as Antd from "https://esm.sh/antd@5.27.4?bundle&deps=react@18.3.1,react-dom@18.3.1";
 import Plyr from "https://esm.sh/plyr@3.7.8?bundle";
-import * as MatrixSDK from "https://esm.sh/matrix-js-sdk@37.2.0?bundle&external=@matrix-org/matrix-sdk-crypto-wasm";
-import { decodeRecoveryKey } from "https://esm.sh/matrix-js-sdk@37.2.0/lib/crypto-api/recovery-key?bundle";
+import * as MatrixSDK from "https://esm.sh/matrix-js-sdk@42.3.0?bundle&external=@matrix-org/matrix-sdk-crypto-wasm";
+import { decodeRecoveryKey } from "https://esm.sh/matrix-js-sdk@42.3.0/lib/crypto-api/recovery-key?bundle";
+import { SlidingSync } from "https://esm.sh/matrix-js-sdk@42.3.0/lib/sliding-sync.js?bundle&external=@matrix-org/matrix-sdk-crypto-wasm";
 
 // esm.sh's bundled SDK points the Rust WASM request at a non-existent path.
 // Redirect that one asset to the published crypto-wasm package while leaving
@@ -11,8 +12,8 @@ import { decodeRecoveryKey } from "https://esm.sh/matrix-js-sdk@37.2.0/lib/crypt
 const orbitFetch = window.fetch.bind(window);
 window.fetch = (input, init) => {
   const url = typeof input === "string" ? input : input?.url || "";
-  if (url.includes("/matrix-js-sdk@37.2.0/es2022/pkg/matrix_sdk_crypto_wasm_bg.wasm")) {
-    const fixed = url.replace("/matrix-js-sdk@37.2.0/es2022/pkg/", "/@matrix-org/matrix-sdk-crypto-wasm@14.0.1/es2022/pkg/");
+  if (url.includes("/matrix-js-sdk@42.3.0/es2022/pkg/matrix_sdk_crypto_wasm_bg.wasm")) {
+    const fixed = url.replace("/matrix-js-sdk@42.3.0/es2022/pkg/", "/@matrix-org/matrix-sdk-crypto-wasm@18.4.0/es2022/pkg/");
     return orbitFetch(fixed, init);
   }
   return orbitFetch(input, init);
@@ -393,19 +394,44 @@ async function resolveHomeserver(input) {
     }
   } catch {}
   let clientBaseUrl = homeserver;
+  let versions = null;
   try {
     const probe = await fetch(`${homeserver}/_matrix/client/versions`);
-    const data = await probe.json();
-    if (!probe.ok || !Array.isArray(data?.versions)) throw new Error("不是有效的 Matrix API");
+    versions = await probe.json();
+    if (!probe.ok || !Array.isArray(versions?.versions)) throw new Error("Matrix API invalid");
   } catch (error) {
     const local = ["localhost", "127.0.0.1"].includes(window.location.hostname);
     if (!local) throw new Error(`无法连接 Matrix homeserver：${error?.message || "网络错误"}`);
     clientBaseUrl = `${window.location.origin}/__matrix_proxy/${encodeURIComponent(homeserver)}`;
     const probe = await fetch(`${clientBaseUrl}/_matrix/client/versions`);
-    const data = await probe.json().catch(() => null);
-    if (!probe.ok || !Array.isArray(data?.versions)) throw new Error("该地址不是 Matrix homeserver");
+    versions = await probe.json().catch(() => null);
+    if (!probe.ok || !Array.isArray(versions?.versions)) throw new Error("Invalid Matrix homeserver");
   }
-  return { homeserver, clientBaseUrl };
+  const unstable = versions?.unstable_features || {};
+  const slidingSync = unstable["org.matrix.simplified_msc3575"] === true || unstable["org.matrix.msc3575"] === true;
+  return { homeserver, clientBaseUrl, slidingSync };
+}
+
+// Use MSC3575 when the homeserver advertises it; otherwise retain /sync.
+async function startOrbitSync(client, { clientBaseUrl, slidingSync = false } = {}) {
+  const fallback = () => client.startClient({ initialSyncLimit: 30 });
+  if (!slidingSync || typeof SlidingSync !== "function") return fallback();
+  try {
+    const lists = new Map([
+      ["all", { ranges: [[0, 50]], sort: ["by_recency"], filters: { is_invite: false } }],
+      ["invites", { ranges: [[0, 20]], sort: ["by_recency"], filters: { is_invite: true } }]
+    ]);
+    const roomSubscriptionInfo = {
+      required_state: [["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["m.room.topic", ""]],
+      timeline_limit: 30
+    };
+    const slidingClient = new SlidingSync(clientBaseUrl, lists, roomSubscriptionInfo, client, 30000);
+    client.startClient({ initialSyncLimit: 30, slidingSync: slidingClient });
+    client.__orbitSlidingSync = slidingClient;
+  } catch (error) {
+    console.warn("Unable to start Sliding Sync; using regular sync", error);
+    fallback();
+  }
 }
 
 async function initCryptoSafely(client) {
@@ -667,7 +693,7 @@ function LoginDialog({ onConnected, onClose }) {
       localStorage.setItem("orbit.matrix.session", JSON.stringify({ homeserver: resolved.homeserver, userId: result.user_id, accessToken: result.access_token, deviceId: result.device_id }));
       window.orbitMatrixClient = client;
       onConnected({ client, userId: result.user_id, homeserver: resolved.homeserver });
-      client.startClient({ initialSyncLimit: 30 });
+      startOrbitSync(client, resolved);
       Toast.success("登录成功，正在同步房间");
     } catch (error) { Toast.error(`登录失败：${error?.message || "请检查地址、账号和密码"}`); }
     finally { setLoading(false); }
@@ -707,7 +733,7 @@ function RoomDialog({ client, onClose, onCreated, space }) {
 
 function InviteDialog({ client, room, onClose }) {
   const [userId, setUserId] = useState(""); const [loading, setLoading] = useState(false);
-  const submit = async e => { e.preventDefault(); setLoading(true); try { await client.invite(room.id, userId.trim()); Toast.success("邀请已发送"); onClose(); } catch (error) { Toast.error(`邀请失败：${error?.message || "请确认 Matrix ID"}`); } finally { setLoading(false); } };
+  const submit = async e => { e.preventDefault(); setLoading(true); try { const targetUserId = userId.trim(); const crypto = client.getCrypto?.(); if (room.matrixRoom?.hasEncryptionStateEvent?.() && crypto?.shareRoomHistoryWithUser && targetUserId) { try { await crypto.shareRoomHistoryWithUser(room.id, targetUserId); } catch (error) { console.warn("Unable to share encrypted history", error); } } await client.invite(room.id, targetUserId); Toast.success(room.matrixRoom?.hasEncryptionStateEvent?.() ? "邀请已发送，并共享可用的加密历史" : "邀请已发送"); onClose(); } catch (error) { Toast.error(`邀请失败：${error?.message || "请确认 Matrix ID"}`); } finally { setLoading(false); } };
   return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card" }, h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "邀请成员"), h("div", { className: "modal-copy" }, `邀请成员加入「${room.name}」`)), h("button", { className: "icon-button", onClick: onClose }, "×")), h("form", { className: "modal-form", onSubmit: submit }, h("label", { className: "form-label" }, "成员", h(UserPicker, { client, value: userId, onChange: setUserId, placeholder: "输入昵称或 @user:server" })), h("div", { className: "modal-actions" }, h("button", { type: "button", className: "ghost-btn", onClick: onClose }, "取消"), h("button", { className: "primary-btn", disabled: loading }, loading ? "邀请中…" : "发送邀请")))));
 }
 
@@ -1579,7 +1605,12 @@ function App() {
     // Keep a renderable copy in case the SDK waits for the next sync response
     // before exposing the newly joined room through getRooms().
     optimisticJoinedRoomsRef.current.set(invite.id, { ...invite, unread: 0, hasUnread: false, lastTs: Date.now(), time: "刚刚" });
+    const inviteMember = invite.matrixRoom?.getMember?.(connected.userId);
+    const inviterId = inviteMember?.events?.member?.getSender?.() || inviteMember?.events?.member?.getContent?.()?.sender;
+    const crypto = connected.client.getCrypto?.();
+    if (inviterId) { try { await crypto?.markRoomAsPendingKeyBundle?.(invite.id, inviterId); } catch (error) { console.warn("Unable to mark pending history bundle", error); } }
     await join.call(connected.client, invite.id);
+    if (inviterId) { try { await crypto?.maybeAcceptKeyBundle?.(invite.id, inviterId); } catch (error) { console.warn("Unable to import encrypted history bundle", error); } }
     Toast.success(`已加入「${invite.name}」`);
     setInvites(current => current.filter(item => item.id !== invite.id));
     setRooms(current => [optimisticJoinedRoomsRef.current.get(invite.id), ...current.filter(item => item.id !== invite.id)]);
@@ -1618,7 +1649,7 @@ function App() {
     if (type === "secret") { if (typeof crypto.loadSessionBackupPrivateKeyFromSecretStorage === "function") { try { await crypto.loadSessionBackupPrivateKeyFromSecretStorage(); } catch (error) { const stored = await crypto.isKeyBackupKeyStored?.(version); if (!stored) throw error; } } }
     const result = type === "passphrase" ? await crypto.restoreKeyBackupWithPassphrase(passphrase, { progressCallback: p => setCryptoState(s => ({ ...s, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })) }) : await crypto.restoreKeyBackup({ progressCallback: p => setCryptoState(s => ({ ...s, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })) }); try { await crypto.bootstrapCrossSigning?.({ authUploadDeviceSigningKeys: async () => ({}) }); } catch {} await connected.client.retryImmediatelyDecryption?.(); await refresh(connected.client); setCryptoState(s => ({ ...s, restoring: false, restoreProgress: 100, keyRestored: true })); Toast.success(`密钥恢复完成，导入 ${result?.imported ?? 0} 个会话。若其他客户端仍显示未验证，请完成一次设备验证。`); } catch (error) { const raw = error?.message || "密钥恢复失败"; const mismatch = /does not match|mismatch|match.*decryption key/i.test(raw); const message = mismatch ? `恢复密钥与服务器备份版本 ${version} 不匹配。请确认这是该账号当前 Secret Storage 的恢复密钥；如果备份曾重置，请从 Element“设置 → 安全与隐私”获取最新密钥。` : raw; setCryptoState(s => ({ ...s, restoring: false, error: message })); Toast.error(message); } };
   const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); setSyncing(true); setTimeout(() => setSyncing(false), 15000); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const authExpired = /unknown token|M_UNKNOWN_TOKEN|401/i.test(text); const message = authExpired ? "Matrix 登录状态已失效，请重新登录" : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired) { client.stopClient?.(); window.orbitMatrixClient = null; localStorage.removeItem("orbit.matrix.session"); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); } }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const selectedRoom = room?.roomId === selectedIdRef.current; if (selectedRoom && !document.hidden) { Promise.resolve(client.sendReadReceipt?.(event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && eventId && (room?.roomId !== selectedIdRef.current || document.hidden || !document.hasFocus?.()); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { orbitNotifiedEvents.add(eventId); if (orbitNotifiedEvents.size > 500) orbitNotifiedEvents.delete(orbitNotifiedEvents.values().next().value); const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); let desktopShown = false; if (typeof Notification !== "undefined" && Notification.permission === "granted") { try { new Notification(title, { body, tag: `orbit-${room?.roomId || "room"}` }); desktopShown = true; } catch {} } if (!desktopShown || !document.hidden) Toast.info(`${title}：${body}`); } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", () => queueRefresh(client)); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user.presence || "online"); queueRefresh(client); }); client.on("Event.decrypted", () => queueRefresh(client)); queueRefresh(client); setShowLogin(false); };
-  React.useEffect(() => { const saved = localStorage.getItem("orbit.matrix.session"); if (!saved) return; (async () => { try { const session = JSON.parse(saved); const resolved = await resolveHomeserver(session.homeserver); const client = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, userId: session.userId, accessToken: session.accessToken, deviceId: session.deviceId, cryptoCallbacks: orbitCryptoCallbacks }); await initCryptoSafely(client); window.orbitMatrixClient = client; connectedHandler({ client, userId: session.userId, homeserver: resolved.homeserver }); client.startClient({ initialSyncLimit: 30 }); } catch { localStorage.removeItem("orbit.matrix.session"); } })(); }, []);
+  React.useEffect(() => { const saved = localStorage.getItem("orbit.matrix.session"); if (!saved) return; (async () => { try { const session = JSON.parse(saved); const resolved = await resolveHomeserver(session.homeserver); const client = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, userId: session.userId, accessToken: session.accessToken, deviceId: session.deviceId, cryptoCallbacks: orbitCryptoCallbacks }); await initCryptoSafely(client); window.orbitMatrixClient = client; connectedHandler({ client, userId: session.userId, homeserver: resolved.homeserver }); startOrbitSync(client, resolved); } catch { localStorage.removeItem("orbit.matrix.session"); } })(); }, []);
   React.useEffect(() => { installEmojiSendInterceptor(connected?.client); }, [connected?.client]);
   React.useEffect(() => {
     const client = connected?.client; const userId = connected?.userId;
