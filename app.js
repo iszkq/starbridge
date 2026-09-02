@@ -418,6 +418,22 @@ function promiseWithTimeout(promise, timeoutMs = 15000) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+async function getMatrixLoginFlows(baseUrl) {
+  const response = await fetchWithTimeout(`${baseUrl}/_matrix/client/v3/login`, {}, 5000);
+  const body = await response.json().catch(() => null);
+  if (!response.ok || !Array.isArray(body?.flows)) throw new Error("无法读取 Matrix 登录方式");
+  return body.flows.map(flow => flow?.type).filter(Boolean);
+}
+
+async function loginWithMatrixToken(homeserver, token) {
+  const resolved = await resolveHomeserver(homeserver);
+  const loginClient = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, cryptoCallbacks: orbitCryptoCallbacks });
+  const result = await promiseWithTimeout(loginClient.login("m.login.token", { token }));
+  const client = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, userId: result.user_id, accessToken: result.access_token, deviceId: result.device_id, cryptoCallbacks: orbitCryptoCallbacks });
+  await initCryptoSafely(client);
+  return { resolved, result, client };
+}
+
 async function resolveHomeserver(input, { detect = true } = {}) {
   let homeserver = normalizeHomeserverInput(input);
   try {
@@ -458,10 +474,10 @@ async function startOrbitSync(client, { clientBaseUrl, slidingSync = false } = {
   if (!slidingSync || typeof SlidingSync !== "function") return fallback();
   try {
     const lists = new Map([
-      ["all", { ranges: [[0, 50]], sort: ["by_recency"], filters: { is_invite: false }, required_state: [["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["m.room.topic", ""]], timeline_limit: 30 }],
-      ["invites", { ranges: [[0, 20]], sort: ["by_recency"], filters: { is_invite: true }, required_state: [["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["m.room.topic", ""]], timeline_limit: 30 }]
+      ["all", { ranges: [[0, 50]], sort: ["by_recency"], filters: { is_invite: false }, required_state: [["m.room.create", ""], ["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["m.room.topic", ""], ["m.space.child", "*"], ["m.space.parent", "*"]], timeline_limit: 30 }],
+      ["invites", { ranges: [[0, 20]], sort: ["by_recency"], filters: { is_invite: true }, required_state: [["m.room.create", ""], ["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["m.room.topic", ""], ["m.space.child", "*"], ["m.space.parent", "*"]], timeline_limit: 30 }]
     ]);
-    const roomSubscriptionInfo = { required_state: [["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["m.room.topic", ""]], timeline_limit: 30 };
+    const roomSubscriptionInfo = { required_state: [["m.room.create", ""], ["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["m.room.topic", ""], ["m.space.child", "*"], ["m.space.parent", "*"]], timeline_limit: 30 };
     const slidingClient = new SlidingSync(clientBaseUrl, lists, roomSubscriptionInfo, client, 30000);
     client.startClient({ initialSyncLimit: 30, slidingSync: slidingClient });
     client.__orbitSlidingSync = slidingClient;
@@ -661,6 +677,18 @@ function eventToMessage(event, room, userId) {
   };
 }
 
+async function retryLoadedRoomDecryption(client) {
+  if (!client?.decryptEventIfNeeded) return 0;
+  const encryptedEvents = [];
+  for (const room of client.getRooms?.() || []) {
+    for (const event of room.getLiveTimeline?.().getEvents?.() || []) {
+      if (event?.getType?.() === "m.room.encrypted" || event?.isEncrypted?.()) encryptedEvents.push(event);
+    }
+  }
+  await Promise.all(encryptedEvents.map(event => Promise.resolve(client.decryptEventIfNeeded(event)).catch(() => {})));
+  return encryptedEvents.length;
+}
+
 async function roomMessages(room, userId, client) {
   const events = room?.getLiveTimeline?.().getEvents?.() || [];
   const redacted = new Set(); const reactions = new Map(); const edits = new Map(); const replacements = new Map(); const updates = new Map(); const byId = new Map();
@@ -717,6 +745,28 @@ function LoginDialog({ onConnected, onClose }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+  const [loginFlows, setLoginFlows] = useState([]);
+  const [checkingFlows, setCheckingFlows] = useState(false);
+  const checkLoginFlows = async () => {
+    if (!homeserver.trim()) return;
+    setCheckingFlows(true);
+    try {
+      const resolved = await resolveHomeserver(homeserver, { detect: false });
+      setLoginFlows(await getMatrixLoginFlows(resolved.clientBaseUrl));
+    } catch { setLoginFlows([]); }
+    finally { setCheckingFlows(false); }
+  };
+  const startSsoLogin = async () => {
+    setLoading(true);
+    try {
+      const resolved = await resolveHomeserver(homeserver, { detect: false });
+      const flows = await getMatrixLoginFlows(resolved.clientBaseUrl);
+      if (!flows.includes("m.login.sso")) throw new Error("当前 homeserver 未启用 SSO 登录");
+      const redirectUrl = `${window.location.origin}${window.location.pathname}?matrix_sso=1`;
+      localStorage.setItem("orbit.matrix.sso.pending", JSON.stringify({ homeserver: resolved.homeserver }));
+      window.location.assign(`${resolved.clientBaseUrl}/_matrix/client/v3/login/sso/redirect?redirectUrl=${encodeURIComponent(redirectUrl)}`);
+    } catch (error) { setLoading(false); Toast.error(`SSO 登录失败：${error?.message || "无法启动单点登录"}`); }
+  };
   const submit = async e => {
     e.preventDefault(); setLoading(true);
     try {
@@ -743,10 +793,10 @@ function LoginDialog({ onConnected, onClose }) {
   return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card" },
     h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "连接 Matrix 账户"), h("div", { className: "modal-copy" }, "支持直接填写域名，Orbit 会自动补全 HTTPS；服务能力在后台检测，不影响登录。")), h(UiButton, { className: "icon-button", type: "text", "aria-label": "关闭", onClick: onClose }, "×")),
     h("form", { className: "modal-form", onSubmit: submit },
-      h("label", { className: "form-label" }, "Homeserver 或域名", h(Input, { value: homeserver, onChange: setHomeserver, required: true, placeholder: "mtx01.cc、matrix.example.com 或 https://matrix.example.com" })),
+      h("label", { className: "form-label" }, "Homeserver 或域名", h(Input, { value: homeserver, onChange: setHomeserver, onBlur: checkLoginFlows, required: true, placeholder: "mtx01.cc、matrix.example.com 或 https://matrix.example.com" })),
       h("label", { className: "form-label" }, "用户名", h(Input, { value: username, onChange: setUsername, required: true, placeholder: "alice 或 @alice:example.com" })),
       h("label", { className: "form-label" }, "密码", h(AntInput.Password, { value: password, onChange: event => setPassword(event.target.value), required: true, placeholder: "请输入 Matrix 密码", visibilityToggle: true })),
-      h("div", { className: "modal-actions" }, h(UiButton, { htmlType: "button", className: "ghost-btn", onClick: onClose }, "取消"), h(UiButton, { htmlType: "submit", variant: "primary", className: "primary-btn", disabled: loading }, loading ? "登录中…" : "登录并同步"))
+      h("div", { className: "modal-actions" }, h(UiButton, { htmlType: "button", className: "ghost-btn", onClick: onClose }, "取消"), loginFlows.includes("m.login.sso") && h(UiButton, { htmlType: "button", className: "ghost-btn", disabled: loading || checkingFlows, onClick: startSsoLogin }, "使用 SSO 登录"), h(UiButton, { htmlType: "submit", variant: "primary", className: "primary-btn", disabled: loading }, loading ? "登录中…" : "登录并同步"))
     )
   ));
 }
@@ -1689,9 +1739,30 @@ function App() {
       }
     }
     if (type === "secret") { if (typeof crypto.loadSessionBackupPrivateKeyFromSecretStorage === "function") { try { await crypto.loadSessionBackupPrivateKeyFromSecretStorage(); } catch (error) { const stored = await crypto.isKeyBackupKeyStored?.(version); if (!stored) throw error; } } }
-    const result = type === "passphrase" ? await crypto.restoreKeyBackupWithPassphrase(passphrase, { progressCallback: p => setCryptoState(s => ({ ...s, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })) }) : await crypto.restoreKeyBackup({ progressCallback: p => setCryptoState(s => ({ ...s, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })) }); try { await crypto.bootstrapCrossSigning?.({ authUploadDeviceSigningKeys: async () => ({}) }); } catch {} await connected.client.retryImmediatelyDecryption?.(); await refresh(connected.client); setCryptoState(s => ({ ...s, restoring: false, restoreProgress: 100, keyRestored: true })); Toast.success(`密钥恢复完成，导入 ${result?.imported ?? 0} 个会话。若其他客户端仍显示未验证，请完成一次设备验证。`); } catch (error) { const raw = error?.message || "密钥恢复失败"; const mismatch = /does not match|mismatch|match.*decryption key/i.test(raw); const message = mismatch ? `恢复密钥与服务器备份版本 ${version} 不匹配。请确认这是该账号当前 Secret Storage 的恢复密钥；如果备份曾重置，请从 Element“设置 → 安全与隐私”获取最新密钥。` : raw; setCryptoState(s => ({ ...s, restoring: false, error: message })); Toast.error(message); } };
+    const result = type === "passphrase" ? await crypto.restoreKeyBackupWithPassphrase(passphrase, { progressCallback: p => setCryptoState(s => ({ ...s, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })) }) : await crypto.restoreKeyBackup({ progressCallback: p => setCryptoState(s => ({ ...s, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })) }); try { await crypto.bootstrapCrossSigning?.({ authUploadDeviceSigningKeys: async () => ({}) }); } catch {} const retried = await retryLoadedRoomDecryption(connected.client); await refresh(connected.client); setCryptoState(s => ({ ...s, restoring: false, restoreProgress: 100, keyRestored: true })); Toast.success(`密钥恢复完成，导入 ${result?.imported ?? 0} 个会话，已重试解密 ${retried} 条已加载消息。`); } catch (error) { const raw = error?.message || "密钥恢复失败"; const mismatch = /does not match|mismatch|match.*decryption key/i.test(raw); const message = mismatch ? `恢复密钥与服务器备份版本 ${version} 不匹配。请确认这是该账号当前 Secret Storage 的恢复密钥；如果备份曾重置，请从 Element“设置 → 安全与隐私”获取最新密钥。` : raw; setCryptoState(s => ({ ...s, restoring: false, error: message })); Toast.error(message); } };
   const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); setSyncing(true); setTimeout(() => setSyncing(false), 15000); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const authExpired = /unknown token|M_UNKNOWN_TOKEN|401/i.test(text); const message = authExpired ? "Matrix 登录状态已失效，请重新登录" : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired) { client.stopClient?.(); window.orbitMatrixClient = null; localStorage.removeItem("orbit.matrix.session"); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); } }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const selectedRoom = room?.roomId === selectedIdRef.current; if (selectedRoom && !document.hidden) { Promise.resolve(client.sendReadReceipt?.(event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && eventId && (room?.roomId !== selectedIdRef.current || document.hidden || !document.hasFocus?.()); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { orbitNotifiedEvents.add(eventId); if (orbitNotifiedEvents.size > 500) orbitNotifiedEvents.delete(orbitNotifiedEvents.values().next().value); const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); let desktopShown = false; if (typeof Notification !== "undefined" && Notification.permission === "granted") { try { new Notification(title, { body, tag: `orbit-${room?.roomId || "room"}` }); desktopShown = true; } catch {} } if (!desktopShown || !document.hidden) Toast.info(`${title}：${body}`); } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", () => queueRefresh(client)); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user.presence || "online"); queueRefresh(client); }); client.on("Event.decrypted", () => queueRefresh(client)); queueRefresh(client); setShowLogin(false); };
   React.useEffect(() => { const saved = localStorage.getItem("orbit.matrix.session"); if (!saved) return; (async () => { try { const session = JSON.parse(saved); const resolved = await resolveHomeserver(session.homeserver); const client = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, userId: session.userId, accessToken: session.accessToken, deviceId: session.deviceId, cryptoCallbacks: orbitCryptoCallbacks }); await initCryptoSafely(client); window.orbitMatrixClient = client; connectedHandler({ client, userId: session.userId, homeserver: resolved.homeserver }); startOrbitSync(client, resolved); } catch { localStorage.removeItem("orbit.matrix.session"); } })(); }, []);
+  React.useEffect(() => {
+    const url = new URL(window.location.href);
+    const loginToken = url.searchParams.get("loginToken");
+    if (!loginToken) return;
+    const pendingRaw = localStorage.getItem("orbit.matrix.sso.pending");
+    url.searchParams.delete("loginToken"); url.searchParams.delete("matrix_sso");
+    window.history.replaceState({}, document.title, `${url.pathname}${url.search}${url.hash}`);
+    if (!pendingRaw) return Toast.error("SSO 登录信息已过期，请重新开始登录");
+    (async () => {
+      try {
+        const pending = JSON.parse(pendingRaw);
+        const { resolved, result, client } = await loginWithMatrixToken(pending.homeserver, loginToken);
+        localStorage.removeItem("orbit.matrix.sso.pending");
+        localStorage.setItem("orbit.matrix.session", JSON.stringify({ homeserver: resolved.homeserver, userId: result.user_id, accessToken: result.access_token, deviceId: result.device_id }));
+        window.orbitMatrixClient = client;
+        connectedHandler({ client, userId: result.user_id, homeserver: resolved.homeserver });
+        startOrbitSync(client, resolved);
+        Toast.success("SSO 登录成功，正在同步房间");
+      } catch (error) { localStorage.removeItem("orbit.matrix.sso.pending"); Toast.error(`SSO 登录失败：${error?.message || "请重新尝试"}`); }
+    })();
+  }, []);
   React.useEffect(() => { installEmojiSendInterceptor(connected?.client); }, [connected?.client]);
   React.useEffect(() => {
     const client = connected?.client; const userId = connected?.userId;
