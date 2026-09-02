@@ -1472,6 +1472,29 @@ button { cursor: pointer; }
   .media-volume { min-width: 62px; }
   .media-rate-select span { display: none; }
 }
+
+/* The browser fullscreen surface is Plyr's generated wrapper, not the
+   original .media-player element.  Stretch both layers so portrait media is
+   centered at the largest possible size instead of remaining a tiny column. */
+.media-player .plyr:fullscreen,
+.media-player .plyr.plyr--fullscreen-active,
+.media-player:fullscreen { width: 100vw !important; height: 100vh !important; max-width: none; border-radius: 0; background: #050914; }
+.media-player .plyr:fullscreen .plyr__video-wrapper,
+.media-player .plyr.plyr--fullscreen-active .plyr__video-wrapper { height: 100vh; display: grid; place-items: center; background: #050914; }
+.media-player .plyr:fullscreen video,
+.media-player .plyr.plyr--fullscreen-active video,
+.media-player video:fullscreen { width: 100%; height: 100%; max-height: none; object-fit: contain; background: #050914; }
+
+/* A larger hover preview keeps the dense picker useful without changing the
+   compact grid layout. */
+.emoji-item-wrap { position: relative; }
+.emoji-item-wrap::after { content: attr(data-emoji-name); position: absolute; left: 50%; bottom: calc(100% + 8px); z-index: 50; width: 128px; height: 128px; padding: 8px; border: 1px solid #dfe5ef; border-radius: 12px; background: #fff; box-shadow: 0 14px 30px rgba(16,24,40,.18); background-image: var(--emoji-preview); background-repeat: no-repeat; background-position: center; background-size: 112px 112px; opacity: 0; pointer-events: none; transform: translate(-50%, 4px) scale(.96); transition: opacity .14s ease, transform .14s ease; }
+.emoji-item-wrap:hover::after, .emoji-item-wrap:focus-within::after { opacity: 1; transform: translate(-50%, 0) scale(1); }
+.composer-wrap { position: relative; }
+.emoji-inline-suggestions { position: absolute; right: 18px; bottom: 96px; z-index: 30; display: flex; gap: 6px; max-width: min(520px, calc(100% - 36px)); padding: 8px; border: 1px solid #dfe5ef; border-radius: 12px; background: #fff; box-shadow: 0 12px 28px rgba(16,24,40,.16); }
+.emoji-inline-suggestions button { display: inline-flex; align-items: center; gap: 5px; padding: 5px 7px; border: 0; border-radius: 7px; color: #344054; background: #f8fafc; cursor: pointer; }
+.emoji-inline-suggestions button:hover { background: #eaf1ff; color: #1d4ed8; }
+.emoji-inline-suggestions img { width: 30px; height: 30px; object-fit: contain; }
 .message-image.message-sticker {
   width: auto;
   max-width: min(280px, 72vw);
@@ -1721,4 +1744,3 @@ button { cursor: pointer; }
 /* Final toolbar cleanup: render only the SVG icon assigned by Message. */
 .message-actions > button::before,
 .message-actions > button::after { content: none !important; display: none !important; }
-
