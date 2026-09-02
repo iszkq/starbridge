@@ -383,8 +383,24 @@ const RichEditor = React.forwardRef(function RichEditor({ value, onChange, onKey
   });
 });
 
+function normalizeHomeserverInput(value) {
+  const raw = String(value || "").trim();
+  if (!raw) throw new Error("请输入 Homeserver 或域名");
+  const candidate = /^[a-z][a-z\d+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`;
+  let url;
+  try {
+    url = new URL(candidate);
+  } catch {
+    throw new Error("请输入有效的 Matrix 域名");
+  }
+  if (!["http:", "https:"].includes(url.protocol) || !url.hostname || url.username || url.password || url.search || url.hash) {
+    throw new Error("请输入有效的 Matrix 域名");
+  }
+  return `${url.origin}${url.pathname}`.replace(/\/+$/, "");
+}
+
 async function resolveHomeserver(input) {
-  let homeserver = input.trim().replace(/\/$/, "");
+  let homeserver = normalizeHomeserverInput(input);
   try {
     const discovery = await fetch(`${homeserver}/.well-known/matrix/client`);
     if (discovery.ok) {
@@ -683,8 +699,7 @@ function LoginDialog({ onConnected, onClose }) {
   const submit = async e => {
     e.preventDefault(); setLoading(true);
     try {
-      const input = homeserver.trim().replace(/\/$/, "");
-      if (!/^https?:\/\//i.test(input)) throw new Error("Homeserver 必须是 http(s) 地址");
+      const input = normalizeHomeserverInput(homeserver);
       const resolved = await resolveHomeserver(input);
       const loginClient = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, cryptoCallbacks: orbitCryptoCallbacks });
       const result = await loginClient.login("m.login.password", { identifier: { type: "m.id.user", user: username.trim() }, password });
@@ -699,12 +714,12 @@ function LoginDialog({ onConnected, onClose }) {
     finally { setLoading(false); }
   };
   return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card" },
-    h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "连接 Matrix 账户"), h("div", { className: "modal-copy" }, "支持直接填写 Element 域名，Orbit 会自动发现真实 Homeserver。")), h(UiButton, { className: "icon-button", type: "text", "aria-label": "关闭", onClick: onClose }, "×")),
+    h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "连接 Matrix 账户"), h("div", { className: "modal-copy" }, "支持直接填写域名，Orbit 会自动补全 HTTPS 并检测 Matrix 服务。")), h(UiButton, { className: "icon-button", type: "text", "aria-label": "关闭", onClick: onClose }, "×")),
     h("form", { className: "modal-form", onSubmit: submit },
-      h("label", { className: "form-label" }, "Homeserver 或 Element 地址", h(Input, { value: homeserver, onChange: setHomeserver, required: true, placeholder: "https://matrix.example.com" })),
+      h("label", { className: "form-label" }, "Homeserver 或域名", h(Input, { value: homeserver, onChange: setHomeserver, required: true, placeholder: "mtx01.cc、matrix.example.com 或 https://matrix.example.com" })),
       h("label", { className: "form-label" }, "用户名", h(Input, { value: username, onChange: setUsername, required: true, placeholder: "alice 或 @alice:example.com" })),
       h("label", { className: "form-label" }, "密码", h(Input, { type: "password", value: password, onChange: setPassword, required: true, placeholder: "请输入 Matrix 密码" })),
-      h("div", { className: "modal-actions" }, h(UiButton, { htmlType: "button", className: "ghost-btn", onClick: onClose }, "取消"), h(UiButton, { htmlType: "submit", variant: "primary", className: "primary-btn", disabled: loading }, loading ? "登录中…" : "登录并同步"))
+      h("div", { className: "modal-actions" }, h(UiButton, { htmlType: "button", className: "ghost-btn", onClick: onClose }, "取消"), h(UiButton, { htmlType: "submit", variant: "primary", className: "primary-btn", disabled: loading }, loading ? "检测并登录中…" : "登录并同步"))
     )
   ));
 }
