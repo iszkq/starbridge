@@ -1674,6 +1674,34 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
     const requestId = ++emojiQueryRef.current;
     ensureEmojiCatalog().then(items => { if (requestId !== emojiQueryRef.current) return; const ranked = (items || []).map(item => ({ item, score: Math.max(fuzzyScore(item.name, q), ...(item.keywords || []).map(keyword => fuzzyScore(keyword, q)), 0) })).filter(entry => entry.score > 0).sort((a, b) => b.score - a.score || String(a.item.name).localeCompare(String(b.item.name), "zh-CN")); setEmojiSuggestions(ranked.slice(0, 80).map(entry => entry.item)); });
   };
+  const [emojiSuggestionMode, setEmojiSuggestionMode] = useState("emoji");
+  React.useEffect(() => {
+    const bar = document.querySelector(".emoji-inline-suggestions");
+    if (!bar) return;
+    const old = bar.querySelector(".emoji-suggestion-mode");
+    old?.remove();
+    const controls = document.createElement("div");
+    controls.className = "emoji-suggestion-mode";
+    controls.innerHTML = `<button type="button" data-mode="emoji" class="${emojiSuggestionMode === "emoji" ? "active" : ""}">表情</button><button type="button" data-mode="sticker" class="${emojiSuggestionMode === "sticker" ? "active" : ""}">贴纸</button>`;
+    controls.addEventListener("mousedown", event => {
+      const button = event.target.closest("button[data-mode]");
+      if (!button) return;
+      event.preventDefault(); event.stopPropagation(); setEmojiSuggestionMode(button.dataset.mode);
+    });
+    bar.prepend(controls);
+    bar.dataset.sendMode = emojiSuggestionMode;
+    const onChoose = event => {
+      if (bar.dataset.sendMode !== "sticker") return;
+      const button = event.target.closest(":scope > button:not(.emoji-suggestion-mode button)");
+      if (!button) return;
+      const name = button.querySelector("img")?.alt;
+      const item = (window.orbitEmojiItems || []).find(entry => entry.name === name);
+      if (!item) return;
+      event.preventDefault(); event.stopPropagation(); setEmojiSuggestions([]); onEmojiSelect?.(item);
+    };
+    bar.addEventListener("mousedown", onChoose, true);
+    return () => bar.removeEventListener("mousedown", onChoose, true);
+  }, [emojiSuggestions.length, emojiSuggestionMode, draft, onEmojiSelect]);
   React.useEffect(() => { if (!draft) setEmojiSuggestions([]); }, [draft]);
   React.useEffect(() => {
     const el = scrollRef.current;
