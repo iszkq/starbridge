@@ -399,27 +399,51 @@ function normalizeHomeserverInput(value) {
   return `${url.origin}${url.pathname}`.replace(/\/+$/, "");
 }
 
-async function resolveHomeserver(input) {
+async function fetchWithTimeout(input, init = {}, timeoutMs = 6000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("请求超时");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function promiseWithTimeout(promise, timeoutMs = 15000) {
+  let timer;
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Matrix 登录请求超时，请检查服务器或网络")), timeoutMs); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function resolveHomeserver(input, { detect = true } = {}) {
   let homeserver = normalizeHomeserverInput(input);
   try {
-    const discovery = await fetch(`${homeserver}/.well-known/matrix/client`);
+    const discovery = await fetchWithTimeout(`${homeserver}/.well-known/matrix/client`, {}, 2500);
     if (discovery.ok) {
       const config = await discovery.json();
       const discovered = config?.["m.homeserver"]?.base_url;
-      if (discovered) homeserver = discovered.replace(/\/$/, "");
+      if (discovered) homeserver = normalizeHomeserverInput(discovered);
     }
   } catch {}
   let clientBaseUrl = homeserver;
+  if (!detect) {
+    const local = ["localhost", "127.0.0.1"].includes(window.location.hostname);
+    if (local) clientBaseUrl = `${window.location.origin}/__matrix_proxy/${encodeURIComponent(homeserver)}`;
+    return { homeserver, clientBaseUrl, slidingSync: false, detectionPending: true };
+  }
   let versions = null;
   try {
-    const probe = await fetch(`${homeserver}/_matrix/client/versions`);
+    const probe = await fetchWithTimeout(`${homeserver}/_matrix/client/versions`);
     versions = await probe.json();
     if (!probe.ok || !Array.isArray(versions?.versions)) throw new Error("Matrix API invalid");
   } catch (error) {
     const local = ["localhost", "127.0.0.1"].includes(window.location.hostname);
     if (!local) throw new Error(`无法连接 Matrix homeserver：${error?.message || "网络错误"}`);
     clientBaseUrl = `${window.location.origin}/__matrix_proxy/${encodeURIComponent(homeserver)}`;
-    const probe = await fetch(`${clientBaseUrl}/_matrix/client/versions`);
+    const probe = await fetchWithTimeout(`${clientBaseUrl}/_matrix/client/versions`);
     versions = await probe.json().catch(() => null);
     if (!probe.ok || !Array.isArray(versions?.versions)) throw new Error("Invalid Matrix homeserver");
   }
@@ -434,13 +458,10 @@ async function startOrbitSync(client, { clientBaseUrl, slidingSync = false } = {
   if (!slidingSync || typeof SlidingSync !== "function") return fallback();
   try {
     const lists = new Map([
-      ["all", { ranges: [[0, 50]], sort: ["by_recency"], filters: { is_invite: false } }],
-      ["invites", { ranges: [[0, 20]], sort: ["by_recency"], filters: { is_invite: true } }]
+      ["all", { ranges: [[0, 50]], sort: ["by_recency"], filters: { is_invite: false }, required_state: [["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["m.room.topic", ""]], timeline_limit: 30 }],
+      ["invites", { ranges: [[0, 20]], sort: ["by_recency"], filters: { is_invite: true }, required_state: [["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["m.room.topic", ""]], timeline_limit: 30 }]
     ]);
-    const roomSubscriptionInfo = {
-      required_state: [["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["m.room.topic", ""]],
-      timeline_limit: 30
-    };
+    const roomSubscriptionInfo = { required_state: [["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["m.room.topic", ""]], timeline_limit: 30 };
     const slidingClient = new SlidingSync(clientBaseUrl, lists, roomSubscriptionInfo, client, 30000);
     client.startClient({ initialSyncLimit: 30, slidingSync: slidingClient });
     client.__orbitSlidingSync = slidingClient;
@@ -700,26 +721,32 @@ function LoginDialog({ onConnected, onClose }) {
     e.preventDefault(); setLoading(true);
     try {
       const input = normalizeHomeserverInput(homeserver);
-      const resolved = await resolveHomeserver(input);
+      const resolved = await resolveHomeserver(input, { detect: false });
+      let detectedResolved = null;
+      const detectionPromise = resolveHomeserver(input).then(value => { detectedResolved = value; return value; }).catch(() => null);
       const loginClient = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, cryptoCallbacks: orbitCryptoCallbacks });
-      const result = await loginClient.login("m.login.password", { identifier: { type: "m.id.user", user: username.trim() }, password });
+      const result = await promiseWithTimeout(loginClient.login("m.login.password", { identifier: { type: "m.id.user", user: username.trim() }, password }));
       const client = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, userId: result.user_id, accessToken: result.access_token, deviceId: result.device_id, cryptoCallbacks: orbitCryptoCallbacks });
       await initCryptoSafely(client);
       localStorage.setItem("orbit.matrix.session", JSON.stringify({ homeserver: resolved.homeserver, userId: result.user_id, accessToken: result.access_token, deviceId: result.device_id }));
       window.orbitMatrixClient = client;
-      onConnected({ client, userId: result.user_id, homeserver: resolved.homeserver });
-      startOrbitSync(client, resolved);
+      const syncResolved = detectedResolved || resolved;
+      onConnected({ client, userId: result.user_id, homeserver: syncResolved.homeserver });
+      startOrbitSync(client, syncResolved);
+      detectionPromise.then(detected => {
+        if (detected?.slidingSync && !syncResolved.slidingSync) Toast.info("已检测到 Sliding Sync，下次登录时启用");
+      });
       Toast.success("登录成功，正在同步房间");
     } catch (error) { Toast.error(`登录失败：${error?.message || "请检查地址、账号和密码"}`); }
     finally { setLoading(false); }
   };
   return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card" },
-    h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "连接 Matrix 账户"), h("div", { className: "modal-copy" }, "支持直接填写域名，Orbit 会自动补全 HTTPS 并检测 Matrix 服务。")), h(UiButton, { className: "icon-button", type: "text", "aria-label": "关闭", onClick: onClose }, "×")),
+    h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "连接 Matrix 账户"), h("div", { className: "modal-copy" }, "支持直接填写域名，Orbit 会自动补全 HTTPS；服务能力在后台检测，不影响登录。")), h(UiButton, { className: "icon-button", type: "text", "aria-label": "关闭", onClick: onClose }, "×")),
     h("form", { className: "modal-form", onSubmit: submit },
       h("label", { className: "form-label" }, "Homeserver 或域名", h(Input, { value: homeserver, onChange: setHomeserver, required: true, placeholder: "mtx01.cc、matrix.example.com 或 https://matrix.example.com" })),
       h("label", { className: "form-label" }, "用户名", h(Input, { value: username, onChange: setUsername, required: true, placeholder: "alice 或 @alice:example.com" })),
-      h("label", { className: "form-label" }, "密码", h(Input, { type: "password", value: password, onChange: setPassword, required: true, placeholder: "请输入 Matrix 密码" })),
-      h("div", { className: "modal-actions" }, h(UiButton, { htmlType: "button", className: "ghost-btn", onClick: onClose }, "取消"), h(UiButton, { htmlType: "submit", variant: "primary", className: "primary-btn", disabled: loading }, loading ? "检测并登录中…" : "登录并同步"))
+      h("label", { className: "form-label" }, "密码", h(AntInput.Password, { value: password, onChange: event => setPassword(event.target.value), required: true, placeholder: "请输入 Matrix 密码", visibilityToggle: true })),
+      h("div", { className: "modal-actions" }, h(UiButton, { htmlType: "button", className: "ghost-btn", onClick: onClose }, "取消"), h(UiButton, { htmlType: "submit", variant: "primary", className: "primary-btn", disabled: loading }, loading ? "登录中…" : "登录并同步"))
     )
   ));
 }
