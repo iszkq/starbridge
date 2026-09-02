@@ -62,7 +62,7 @@ function notificationBody(event) {
 async function markRoomRead(client, roomId, event) {
   if (!client || !roomId || !event) return;
   if (typeof client.setRoomReadMarkers === "function" && event.getId?.()) {
-    await client.setRoomReadMarkers(roomId, event.getId(), event);
+    await client.setRoomReadMarkers(roomId, event.getId(), event.getId());
   } else {
     await client.sendReadReceipt?.(event);
   }
@@ -72,6 +72,16 @@ function roomAvatarMxc(room) {
   const event = room?.currentState?.getStateEvents?.("m.room.avatar", "");
   const content = Array.isArray(event) ? event[0]?.getContent?.() : event?.getContent?.();
   return room?.getMxcAvatarUrl?.() || content?.url || room?.getAvatarUrl?.() || null;
+}
+
+function isMatrixSpace(room) {
+  const type = room?.getType?.();
+  if (type === "m.space") return true;
+  try {
+    const create = room?.currentState?.getStateEvents?.("m.room.create", "");
+    const content = Array.isArray(create) ? create[0]?.getContent?.() : create?.getContent?.();
+    return content?.type === "m.space";
+  } catch { return false; }
 }
 
 function memberAvatarMxc(member) {
@@ -90,6 +100,17 @@ function encodeBase64Url(bytes) {
   const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
   for (let index = 0; index < view.length; index += 1) binary += String.fromCharCode(view[index]);
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function recoveryStorageKey(userId) {
+  return `orbit.matrix.recovery-key:${String(userId || "anonymous")}`;
+}
+
+function loadPersistedRecoveryKey(userId) {
+  try {
+    const encoded = localStorage.getItem(recoveryStorageKey(userId));
+    if (encoded) window.orbitRecoveryKeyBytes = decodeBase64(encoded);
+  } catch {}
 }
 
 async function decryptMatrixBuffer(buffer, encryptedInfo) {
@@ -214,11 +235,24 @@ function mediaRequestUrl(client, url) {
   return url;
 }
 
+function matrixHomeserverUrl(client) {
+  const configured = client?.getHomeserverUrl?.() || "";
+  try {
+    const parsed = new URL(configured);
+    if (["localhost", "127.0.0.1"].includes(parsed.hostname) && parsed.pathname.startsWith("/__matrix_proxy/")) {
+      const encoded = parsed.pathname.slice("/__matrix_proxy/".length).split("/")[0];
+      const decoded = decodeURIComponent(encoded);
+      if (/^https?:\/\//i.test(decoded)) return decoded.replace(/\/+$/, "");
+    }
+  } catch {}
+  return configured.replace(/\/+$/, "");
+}
+
 function mediaRequestCandidates(client, rawUrl, requestUrl) {
   const candidates = [requestUrl];
   if (rawUrl?.startsWith("mxc://")) {
     const [, server, mediaId] = rawUrl.match(/^mxc:\/\/([^/]+)\/(.+)$/) || [];
-    const home = client?.getHomeserverUrl?.();
+    const home = matrixHomeserverUrl(client);
     if (server && mediaId && home) {
       // Synapse deployments increasingly disable the legacy unauthenticated
       // media API. Try the authenticated Client-Server v1 route first, then
@@ -328,10 +362,17 @@ function MediaLightbox({ viewer, onClose }) {
 }
 
 function EmojiPicker({ onSelect, onInsert }) {
-  const [items, setItems] = useState([]); const [packs, setPacks] = useState([]); const [pack, setPack] = useState("all"); const [query, setQuery] = useState(""); const [loading, setLoading] = useState(false);
+  const [items, setItems] = useState([]); const [packs, setPacks] = useState([]); const [pack, setPack] = useState("all"); const [query, setQuery] = useState(""); const [loading, setLoading] = useState(false); const [hovered, setHovered] = useState(null); const [mode, setMode] = useState("emoji");
   useEffect(() => { let active = true; setLoading(true); ensureEmojiCatalog().then(nextItems => { if (active) { setItems(nextItems); setPacks(window.orbitEmojiPacks || []); } }).finally(() => active && setLoading(false)); return () => { active = false; }; }, []);
-  const shown = items.filter(item => (pack === "all" || item.packId === pack) && (!query.trim() || `${item.name} ${(item.keywords || []).join(" ")}`.toLowerCase().includes(query.trim().toLowerCase()))).slice(0, 180);
-  const content = h("div", { className: "emoji-popover" }, h(Input, { size: "small", value: query, onChange: setQuery, placeholder: "搜索表情包" }), h("div", { className: "emoji-browser" }, h("nav", { className: "emoji-category-nav", "aria-label": "表情分类" }, h("button", { type: "button", className: `emoji-category ${pack === "all" ? "active" : ""}`, onClick: () => setPack("all") }, "全部", h("small", null, items.length)), packs.map(item => h("button", { type: "button", className: `emoji-category ${pack === item.id ? "active" : ""}`, key: item.id, title: item.description || item.name, onClick: () => setPack(item.id) }, h("span", null, item.name), h("small", null, item.itemCount || items.filter(entry => entry.packId === item.id).length)))), h("section", { className: "emoji-category-content" }, h("div", { className: "emoji-category-title" }, pack === "all" ? "全部表情" : packs.find(item => item.id === pack)?.name || "表情"), loading ? h("div", { className: "emoji-loading" }, "正在加载表情包…") : h("div", { className: "emoji-grid" }, shown.map(item => h("div", { className: "emoji-item-wrap", key: item.id, "data-emoji-name": item.name, style: { "--emoji-preview": `url(${assetRequestUrl(item.url || item.thumbUrl)})` } }, h("button", { type: "button", className: "emoji-item", title: `${item.name}：插入小表情`, onClick: () => onInsert?.(item) }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" })), h("button", { type: "button", className: "emoji-sticker-action", title: "作为大图贴纸发送", onClick: () => onSelect?.(item) }, "↗")))))));
+  const normalizedQuery = query.trim().toLowerCase();
+  const shown = items.filter(item => (pack === "all" || item.packId === pack) && (!normalizedQuery || `${item.name} ${(item.keywords || []).join(" ")}`.toLowerCase().includes(normalizedQuery)));
+  const categoryNav = h("nav", { className: "emoji-category-nav", "aria-label": "表情分类" },
+    h("button", { type: "button", className: `emoji-category ${pack === "all" ? "active" : ""}`, onClick: () => setPack("all") }, "全部", h("small", null, items.length)),
+    packs.map(item => h("button", { type: "button", className: `emoji-category ${pack === item.id ? "active" : ""}`, key: item.id, title: item.description || item.name, onClick: () => setPack(item.id) }, h("span", null, item.name), h("small", null, item.itemCount || items.filter(entry => entry.packId === item.id).length)))
+  );
+  const emojiGrid = loading ? h("div", { className: "emoji-loading" }, "正在加载表情…") : h("div", { className: "emoji-grid" }, shown.map(item => h("div", { className: "emoji-item-wrap", key: item.id, onMouseEnter: () => setHovered(item), onMouseLeave: () => setHovered(null) }, h("button", { type: "button", className: "emoji-item", title: mode === "emoji" ? `${item.name}：插入表情` : `${item.name}：发送贴纸`, onClick: () => mode === "emoji" ? onInsert?.(item) : onSelect?.(item) }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" })))));
+  const modeTabs = h("div", { className: "emoji-mode-tabs", role: "tablist" }, h("button", { type: "button", className: mode === "emoji" ? "active" : "", role: "tab", onClick: () => setMode("emoji") }, "表情", h("small", null, "插入文本")), h("button", { type: "button", className: mode === "sticker" ? "active" : "", role: "tab", onClick: () => setMode("sticker") }, "贴纸", h("small", null, "发送大图")));
+  const content = h("div", { className: "emoji-popover" }, modeTabs, h(Input, { size: "small", value: query, onChange: setQuery, placeholder: mode === "emoji" ? "搜索表情名称" : "搜索贴纸名称" }), h("div", { className: "emoji-browser" }, categoryNav, h("section", { className: "emoji-category-content" }, h("div", { className: "emoji-category-title" }, pack === "all" ? (mode === "emoji" ? "全部表情" : "全部贴纸") : packs.find(item => item.id === pack)?.name || "表情"), emojiGrid, hovered && h("div", { className: "emoji-hover-preview", role: "tooltip" }, h("img", { src: assetRequestUrl(hovered.url || hovered.thumbUrl), alt: hovered.name }), h("strong", null, hovered.name)))));
   return h(AntPopover, { trigger: "click", placement: "topLeft", content }, h("button", { type: "button", className: "tool-button", title: "表情包" }, "☺"));
 }
 
@@ -375,7 +416,7 @@ function renderRichEditor(node, value) {
   }).join("");
 }
 
-const RichEditor = React.forwardRef(function RichEditor({ value, onChange, onKeyDown, onFiles, placeholder }, ref) {
+const RichEditor = React.forwardRef(function RichEditor({ value, onChange, onKeyDown, onFiles, placeholder, onFocus, onBlur }, ref) {
   const nodeRef = useRef(null);
   React.useImperativeHandle(ref, () => ({
     focus: () => nodeRef.current?.focus(),
@@ -404,6 +445,8 @@ const RichEditor = React.forwardRef(function RichEditor({ value, onChange, onKey
   return h("div", { ref: nodeRef, className: "rich-editor", contentEditable: true, role: "textbox", "aria-label": placeholder, "data-placeholder": placeholder, suppressContentEditableWarning: true,
     onInput: event => onChange?.(readRichEditor(event.currentTarget), event.currentTarget.innerHTML),
     onKeyDown,
+    onFocus,
+    onBlur,
     onPaste: event => { const files = [...(event.clipboardData?.files || [])]; if (files.length) { event.preventDefault(); onFiles?.(files); return; } event.preventDefault(); const text = event.clipboardData?.getData("text/plain") || ""; document.execCommand("insertText", false, text); },
     onDragOver: event => { event.preventDefault(); event.currentTarget.classList.add("drag-active"); },
     onDragLeave: event => event.currentTarget.classList.remove("drag-active"),
@@ -584,8 +627,8 @@ function roomToView(room, client) {
     directUserId: joinedMembers.length <= 2 ? directUserId : null,
     pinnedEventIds: (() => { const event = room.currentState?.getStateEvents?.("m.room.pinned_events", ""); const content = Array.isArray(event) ? event[0]?.getContent?.() : event?.getContent?.(); return Array.isArray(content?.pinned) ? content.pinned : []; })(),
     isDirect: Boolean(directUserId),
-    isGroup: room.getType?.() !== "m.space" && !directUserId,
-    isSpace: room.getType?.() === "m.space",
+    isGroup: !isMatrixSpace(room) && !directUserId,
+    isSpace: isMatrixSpace(room),
     matrixRoom: room,
     hidden: Boolean(window.orbitExcludedRooms?.has(room.roomId)),
   };
@@ -883,7 +926,7 @@ function LegacyAccountDialog({ client, onClose, onBack, cryptoState, onRestore }
   const [notificationPermission, setNotificationPermission] = useState(() => typeof Notification === "undefined" ? "unsupported" : Notification.permission);
   React.useEffect(() => { Promise.resolve(client.getDevices ? client.getDevices() : { devices: [] }).then(async data => { const list = data?.devices || []; setDevices(list); const crypto = client.getCrypto?.(); if (crypto?.getDeviceVerificationStatus) { const statuses = {}; await Promise.all(list.map(async device => { try { statuses[device.device_id] = await crypto.getDeviceVerificationStatus(client.getUserId(), device.device_id); } catch {} })); setDeviceStatuses(statuses); } }).catch(() => {}).finally(() => setLoading(false)); }, [client]);
   React.useEffect(() => { const crypto = client.getCrypto?.(); const currentUserId = client.getUserId?.(); const existing = crypto?.getVerificationRequestsToDeviceInProgress?.(currentUserId)?.[0]; if (existing) setVerification({ request: existing, deviceId: existing.otherDeviceId, status: existing.initiatedByMe ? "waiting" : "incoming" }); const onRequest = request => { if (request) setVerification({ request, deviceId: request.otherDeviceId, status: request.initiatedByMe ? "waiting" : "incoming" }); }; const eventName = MatrixSDK.CryptoEvent?.VerificationRequestReceived || "crypto.verificationRequestReceived"; client.on?.(eventName, onRequest); crypto?.on?.(eventName, onRequest); return () => { client.off?.(eventName, onRequest); crypto?.off?.(eventName, onRequest); }; }, [client]);
-  const runVerification = async (request, deviceId) => { if (!request) return; setVerification({ request, deviceId, status: request.initiatedByMe ? "waiting" : "incoming" }); let started = false; const start = async () => { if (started || request.phase < 3) return; started = true; try { const verifier = request.verifier || await request.startVerification?.("m.sas.v1"); if (!verifier) throw new Error("当前设备不支持 SAS 验证"); const onSas = sasCallbacks => setVerification(value => ({ ...value, verifier, sas: sasCallbacks, status: "confirm" })); verifier.on?.("show_sas", onSas); verifier.on?.("cancel", error => setVerification(value => ({ ...value, verifier, status: "error", error: error?.message || "验证已取消" }))); setVerification(value => ({ ...value, verifier, status: "verifying" })); const existingSas = verifier.getShowSasCallbacks?.(); if (existingSas) onSas(existingSas); await verifier.verify(); const crypto = client.getCrypto?.(); if (crypto?.crossSignDevice && deviceId && deviceId !== client.getDeviceId?.()) await crypto.crossSignDevice(deviceId); await crypto?.setDeviceVerified?.(client.getUserId?.(), deviceId, true); const nextStatus = await Promise.resolve(crypto?.getDeviceVerificationStatus?.(client.getUserId?.(), deviceId)).catch(() => null); if (nextStatus) setDeviceStatuses(current => ({ ...current, [deviceId]: nextStatus })); setVerification(value => ({ ...value, verifier, status: "done" })); Toast.success("设备验证完成，已发布跨签名信任"); } catch (error) { setVerification(value => ({ ...value, status: "error", error: error?.message || "设备验证失败" })); } }; request.on?.("change", start); if (!request.initiatedByMe) { await request.accept?.(); } await start(); };
+  const runVerification = async (request, deviceId) => { if (!request) return; setVerification({ request, deviceId, status: request.initiatedByMe ? "waiting" : "incoming" }); let started = false; const start = async () => { if (started || request.phase < 3) return; started = true; try { const verifier = request.verifier || await request.startVerification?.("m.sas.v1"); if (!verifier) throw new Error("当前设备不支持 SAS 验证"); const onSas = sasCallbacks => setVerification(value => ({ ...value, verifier, sas: sasCallbacks, status: "confirm" })); verifier.on?.("show_sas", onSas); verifier.on?.("cancel", error => setVerification(value => ({ ...value, verifier, status: "error", error: error?.message || "验证已取消" }))); setVerification(value => ({ ...value, verifier, status: "verifying" })); const existingSas = verifier.getShowSasCallbacks?.(); if (existingSas) onSas(existingSas); await verifier.verify(); const crypto = client.getCrypto?.(); if (crypto?.crossSignDevice && deviceId && deviceId !== client.getDeviceId?.()) await crypto.crossSignDevice(deviceId); await crypto?.setDeviceVerified?.(client.getUserId?.(), deviceId, true); try { localStorage.setItem(localVerificationKey(client), "1"); } catch {} const nextStatus = await Promise.resolve(crypto?.getDeviceVerificationStatus?.(client.getUserId?.(), deviceId)).catch(() => null); if (nextStatus) setDeviceStatuses(current => ({ ...current, [deviceId]: nextStatus })); setVerification(value => ({ ...value, verifier, status: "done" })); Toast.success("设备验证完成，已发布跨签名信任"); } catch (error) { setVerification(value => ({ ...value, status: "error", error: error?.message || "设备验证失败" })); } }; request.on?.("change", start); if (!request.initiatedByMe) { await request.accept?.(); } await start(); };
   const verify = async deviceId => { try { const crypto = client.getCrypto?.(); if (!crypto?.requestDeviceVerification) throw new Error("加密模块尚未就绪，请重新登录后再试"); const request = await crypto.requestDeviceVerification(client.getUserId(), deviceId); await runVerification(request, deviceId); Toast.info("验证请求已发送，请在另一台设备上接受"); } catch (error) { Toast.error(`无法发起设备验证：${error?.message || "请检查加密配置"}`); } };
   const confirmSas = async () => { try { await verification?.sas?.confirm?.(); setVerification(value => ({ ...value, status: "verifying" })); } catch (error) { setVerification(value => ({ ...value, status: "error", error: error?.message || "确认验证失败" })); } };
   const mismatchSas = () => { try { verification?.sas?.mismatch?.(); } catch {} setVerification(value => ({ ...value, status: "error", error: "安全码不匹配，验证已取消" })); };
@@ -939,7 +982,12 @@ function SearchDialog({ client, room, onClose }) {
     else if (typeof client.searchMessageText === "function") response = await client.searchMessageText({ query: term });
     else throw new Error("当前 homeserver 不支持搜索接口");
     const raw = response?.results || response?.search_categories?.room_events?.results || [];
-    setResults(decorateResults(raw, term));
+    const remote = decorateResults(raw, term);
+    if (remote.length) { setResults(remote); return; }
+    const matrixRoom = room.matrixRoom || room;
+    const localEvents = matrixRoom.getLiveTimeline?.().getEvents?.() || [];
+    const local = decorateResults(localEvents.map(event => ({ result: { room_id: room.id, event_id: event.getId?.(), sender: event.getSender?.(), origin_server_ts: event.getTs?.(), content: event.getClearContent?.() || event.getContent?.() || {} } })).filter(item => scoreResult(item, term) > 0), term);
+    setResults(local);
   } catch (error) {
     try {
       const response = await client.searchMessageText?.({ query: term });
@@ -947,7 +995,7 @@ function SearchDialog({ client, room, onClose }) {
       const remote = decorateResults(raw, term);
       if (remote.length) { setResults(remote); return; }
     } catch {}
-    const localEvents = room.getLiveTimeline?.().getEvents?.() || [];
+    const localEvents = (room.matrixRoom || room).getLiveTimeline?.().getEvents?.() || [];
     const local = decorateResults(localEvents.map(event => ({ result: { room_id: room.id, sender: event.getSender?.(), origin_server_ts: event.getTs?.(), content: event.getClearContent?.() || event.getContent?.() || {} } })).filter(item => scoreResult(item, term) > 0), term);
     setResults(local);
     if (!local.length) Toast.warning("服务器搜索不可用，仅搜索当前已加载的消息");
@@ -1148,6 +1196,7 @@ function MediaPlayer({ src, type = "video", className = "", label = "媒体文�
     const media = ref.current;
     if (!media) return;
     const player = new Plyr(media, {
+      fullscreen: { enabled: true, fallback: true, iosNative: false },
       controls: ["play", "progress", "current-time", "mute", "volume", "settings", "fullscreen"],
       settings: ["speed"],
       speed: { selected: 1, options: [0.75, 1, 1.25, 1.5, 2] },
@@ -1160,15 +1209,35 @@ function MediaPlayer({ src, type = "video", className = "", label = "媒体文�
     const play = () => setPlaying(true);
     const pause = () => setPlaying(false);
     const failed = () => { setPlaying(false); setError(true); };
+    let fullscreenElement = null;
+    const clearFullscreenStyles = element => {
+      if (!element) return;
+      element.classList.remove("orbit-native-fullscreen");
+      ["width", "height", "max-width", "max-height", "object-fit"].forEach(name => element.style.removeProperty(name));
+    };
+    const fullscreenChanged = () => {
+      clearFullscreenStyles(fullscreenElement);
+      fullscreenElement = document.fullscreenElement || null;
+      if (!fullscreenElement) return;
+      fullscreenElement.classList.add("orbit-native-fullscreen");
+      fullscreenElement.style.setProperty("width", "100vw", "important");
+      fullscreenElement.style.setProperty("height", "100vh", "important");
+      fullscreenElement.style.setProperty("max-width", "none", "important");
+      fullscreenElement.style.setProperty("max-height", "none", "important");
+      if (fullscreenElement.tagName === "VIDEO") fullscreenElement.style.setProperty("object-fit", "contain", "important");
+    };
     media.addEventListener("loadedmetadata", loaded);
     media.addEventListener("play", play);
     media.addEventListener("pause", pause);
     media.addEventListener("error", failed);
+    document.addEventListener("fullscreenchange", fullscreenChanged);
     return () => {
       media.removeEventListener("loadedmetadata", loaded);
       media.removeEventListener("play", play);
       media.removeEventListener("pause", pause);
       media.removeEventListener("error", failed);
+      document.removeEventListener("fullscreenchange", fullscreenChanged);
+      clearFullscreenStyles(fullscreenElement);
       player.destroy();
       playerRef.current = null;
     };
@@ -1552,14 +1621,15 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
     return () => client.off?.("RoomMember.typing", update);
   }, [client, room?.id]);
   typingUsers = remoteTyping;
-  const [emojiSuggestions, setEmojiSuggestions] = useState([]);
+  const [emojiSuggestions, setEmojiSuggestions] = useState([]); const emojiQueryRef = useRef(0);
   const updateEmojiSuggestions = value => {
-    const match = String(value || "").match(/:([^:\s]*)$/);
-    if (!match) { setEmojiSuggestions([]); return; }
+    const match = String(value || "").match(/(?:^|[\s:])([^\s:]*)$/);
+    if (!match || !match[1]) { setEmojiSuggestions([]); return; }
     const q = match[1].toLowerCase();
-    ensureEmojiCatalog().then(items => setEmojiSuggestions((items || []).filter(item => `${item.name} ${(item.keywords || []).join(" ")}`.toLowerCase().includes(q)).slice(0, 8)));
+    const requestId = ++emojiQueryRef.current;
+    ensureEmojiCatalog().then(items => { if (requestId !== emojiQueryRef.current) return; setEmojiSuggestions((items || []).filter(item => `${item.name} ${(item.keywords || []).join(" ")}`.toLowerCase().includes(q)).slice(0, 8)); });
   };
-  React.useEffect(() => { updateEmojiSuggestions(draft); }, [draft]);
+  React.useEffect(() => { if (!draft) setEmojiSuggestions([]); }, [draft]);
   React.useEffect(() => {
     const el = scrollRef.current;
     if (!el || !room?.id || !messages.length) return;
@@ -1580,7 +1650,7 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
   const loadEarlier = async () => { if (loadingEarlierRef.current || historyExhausted) return; const el = scrollRef.current; loadingEarlierRef.current = true; setLoadingEarlier(true); const beforeHeight = el?.scrollHeight || 0; try { const loaded = await onLoadMore?.(); if (loaded === false) setHistoryExhausted(true); requestAnimationFrame(() => { if (el) el.scrollTop += el.scrollHeight - beforeHeight; }); } finally { loadingEarlierRef.current = false; setLoadingEarlier(false); } };
   const jumpBottom = () => { const el = scrollRef.current; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); };
   if (!room) return h("main", { className: "main-panel" }, h("div", { className: "empty-messages" }, "登录后选择一个房间开始聊天"));
-  const insertEmoji = item => { const token = `:${item.name}:`; setDraft(value => `${value}${value && !value.endsWith(" ") ? " " : ""}${token} `); requestAnimationFrame(() => inputRef.current?.focus?.()); };
+  const insertEmoji = item => { const token = `:${item.name}:`; setDraft(value => `${String(value).replace(/[^\s:]*$/, "")}${token} `); setEmojiSuggestions([]); requestAnimationFrame(() => inputRef.current?.focus?.()); };
   const insertMention = mention => { const userId = mention?.userId; const name = String(mention?.name || userId || "").replace(/^@/, "").trim(); if (!userId || !name) return; setMentionTargets(current => current.some(entry => entry.userId === userId) ? current : [...current, { userId, name }]); const current = String(draft || ""); const prefix = current && !/[\s\n]$/.test(current) ? " " : ""; inputRef.current?.insertText?.(`${prefix}@${name} `); };
   const handleFiles = files => { const list = [...(files || [])].filter(file => file && file.size >= 0); if (!list.length || !onUpload) return; list.reduce((chain, file) => chain.then(() => onUpload(file)), Promise.resolve()).catch(() => {}); };
   const threadReplies = threadRoot ? messages.filter(item => item.type !== "empty" && item.threadRoot === threadRoot.id) : [];
@@ -1588,7 +1658,7 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
   return h("main", { className: `main-panel ${threadRoot ? "thread-open" : ""}` },
     h("header", { className: "chat-header" }, h("div", { className: "chat-heading" }, h(MatrixAvatar, { client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 40, style: { background: room.color, width: 40, height: 40 }, fallback: room.initials, alt: room.name }), h("div", null, h("div", { className: "chat-title" }, room.name), h("div", { className: room.directUserId ? (client?.getUser?.(room.directUserId)?.presence === "online" ? "chat-subtitle direct-presence" : "chat-subtitle direct-offline") : "chat-subtitle" }, room.directUserId ? `${client?.getUser?.(room.directUserId)?.presence === "online" ? "在线" : "离线"} · ${client?.getUser?.(room.directUserId)?.displayName || room.directUserId}` : `${room.members} 位成员 · ${room.desc}`))), h("div", { className: "header-actions" }, h("button", { className: "icon-button", title: "搜索消息", onClick: onSearch }, h(Icon, { name: "search" })), h("button", { className: "icon-button", title: "发起语音通话", onClick: () => onStartCall?.("voice") }, h(Icon, { name: "phone" })), h("button", { className: "icon-button", title: "发起视频通话", onClick: () => onStartCall?.("video") }, h(Icon, { name: "video" })), h("button", { className: `icon-button header-selection-toggle ${selecting ? "is-active" : ""}`, title: selecting ? "退出多选" : "多选消息", onClick: () => selecting ? onStartSelecting?.(false) : onStartSelecting?.(true) }, h(Icon, { name: "list" })), h("button", { className: "icon-button", title: "查看置顶消息", onClick: () => Toast.info(pinnedEventIds?.length ? `本房间有 ${pinnedEventIds.length} 条置顶消息，请从消息菜单管理` : "暂无置顶消息") }, h(Icon, { name: "pin" })), h("button", { className: "icon-button room-details-toggle", title: "房间详情（点击展开/收起）", onClick: onOpenDetails }, h(Icon, { name: "room", size: 18 })))),
     h("div", { className: "message-scroll", ref: scrollRef, onScroll: e => { const current = e.currentTarget; setShowJump(current.scrollHeight - current.scrollTop - current.clientHeight > 260); if (current.scrollTop <= 72 && !loadingEarlierRef.current && !historyExhausted) loadEarlier(); } }, h(UiButton, { className: "load-more", disabled: loadingEarlier || historyExhausted, onClick: loadEarlier }, loadingEarlier ? "正在加载更早的消息…" : historyExhausted ? "没有更早的消息了" : "加载更早的消息"), messages.map((item, i) => h(Message, { key: item.id || `empty-${i}`, item, client, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onMention: mention => { const user = mention?.userId ? client?.getUser?.(mention.userId) : null; const raw = mention?.name === "你" ? (user?.displayName || mention?.userId || "") : (mention?.name || mention?.userId || ""); const name = String(raw).replace(/^@/, "").trim(); if (!name) return; const current = String(draft || ""); const prefix = current && !/[\\s\\n]$/.test(current) ? " " : ""; inputRef.current?.insertText?.(`${prefix}@${name} `); } , onTogglePinMessage, pinnedEventIds, selecting, selected: forwardItems?.some?.(entry => entry.id === item.id), onSelect: onSelectForward })), showJump && h(UiButton, { className: "jump-bottom", onClick: jumpBottom }, "↓ 回到最新消息")),
-    h("div", { className: "composer-wrap" }, typingUsers.length > 0 && h("div", { className: "typing-indicator", role: "status" }, h("span", { className: "typing-dots", "aria-hidden": "true" }, h("i"), h("i"), h("i")), h("span", null, typingUsers.length === 1 ? `${typingUsers[0]} 正在输入…` : `${typingUsers.slice(0, 2).join("、")} 正在输入…`)), (replyTo || threadRoot || editing) && h("div", { className: "reply-bar" }, h("span", null, editing ? "✎ 正在编辑消息" : threadRoot ? `⌁ 正在线程中回复：${String(threadRoot.text || threadRoot.attachment?.name || "消息").slice(0, 60)}` : `↩ 正在回复：${String(replyTo.text || replyTo.attachment?.name || "消息").slice(0, 60)}`), h("button", { onClick: editing ? onCancelEdit : threadRoot ? onCancelThread : onCancelReply }, "×")), emojiSuggestions.length > 0 && h("div", { className: "emoji-inline-suggestions", role: "listbox" }, emojiSuggestions.map(item => h("button", { type: "button", key: item.id, onMouseDown: event => { event.preventDefault(); const token = `:${item.name}:`; setDraft(value => `${value.replace(/:[^:\\s]*$/, "")}${token} `); setEmojiSuggestions([]); requestAnimationFrame(() => inputRef.current?.focus?.()); } }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name }), h("span", null, `:${item.name}:`)))), h("div", { className: "composer" }, h(RichEditor, { ref: inputRef, value: draft, onChange: value => { setDraft(value); onTyping(true); }, onBlur: () => onTyping(false), onKeyDown: keyDown, onFiles: handleFiles, placeholder: `发送消息到 ${room.name}` }), h("div", { className: "composer-tools" }, h("div", { className: "tool-group" }, ["B", "I", "↗"].map((x, i) => h("button", { className: "tool-button", key: i, title: i === 0 ? "加粗" : i === 1 ? "斜体" : "插入链接", onClick: () => i < 2 ? inputRef.current?.format(i === 0 ? "bold" : "italic") : document.execCommand("createLink", false, prompt("输入链接地址")) }, x)), h(EmojiPicker, { onSelect: onEmojiSelect, onInsert: insertEmoji }), h("button", { className: "tool-button", title: "上传文件", onClick: () => fileRef.current?.click() }, "⊕"), h("input", { ref: fileRef, type: "file", hidden: true, multiple: true, onChange: e => { handleFiles(e.target.files); e.target.value = ""; } })), h(UiButton, { variant: "primary", className: "send-button", onClick: send }, editing ? "保存　↵" : "发送　↵"))), h("div", { className: "composer-hint" }, "Enter 发送 · Shift + Enter 换行")),
+    h("div", { className: "composer-wrap" }, typingUsers.length > 0 && h("div", { className: "typing-indicator", role: "status" }, h("span", { className: "typing-dots", "aria-hidden": "true" }, h("i"), h("i"), h("i")), h("span", null, typingUsers.length === 1 ? `${typingUsers[0]} 正在输入…` : `${typingUsers.slice(0, 2).join("、")} 正在输入…`)), (replyTo || threadRoot || editing) && h("div", { className: "reply-bar" }, h("span", null, editing ? "✎ 正在编辑消息" : threadRoot ? `⌁ 正在线程中回复：${String(threadRoot.text || threadRoot.attachment?.name || "消息").slice(0, 60)}` : `↩ 正在回复：${String(replyTo.text || replyTo.attachment?.name || "消息").slice(0, 60)}`), h("button", { onClick: editing ? onCancelEdit : threadRoot ? onCancelThread : onCancelReply }, "×")), emojiSuggestions.length > 0 && h("div", { className: "emoji-inline-suggestions", role: "listbox" }, emojiSuggestions.map(item => h("button", { type: "button", key: item.id, onMouseDown: event => { event.preventDefault(); const token = `:${item.name}:`; setDraft(value => `${String(value).replace(/[^\\s:]*$/, "")}${token} `); setEmojiSuggestions([]); requestAnimationFrame(() => inputRef.current?.focus?.()); } }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name }), h("span", null, `:${item.name}:`)))), h("div", { className: "composer" }, h(RichEditor, { ref: inputRef, value: draft, onChange: value => { setDraft(value); updateEmojiSuggestions(value); onTyping(true); }, onBlur: () => { onTyping(false); setEmojiSuggestions([]); }, onKeyDown: keyDown, onFiles: handleFiles, placeholder: `发送消息到 ${room.name}` }), h("div", { className: "composer-tools" }, h("div", { className: "tool-group" }, ["B", "I", "↗"].map((x, i) => h("button", { className: "tool-button", key: i, title: i === 0 ? "加粗" : i === 1 ? "斜体" : "插入链接", onClick: () => i < 2 ? inputRef.current?.format(i === 0 ? "bold" : "italic") : document.execCommand("createLink", false, prompt("输入链接地址")) }, x)), h(EmojiPicker, { onSelect: onEmojiSelect, onInsert: insertEmoji }), h("button", { className: "tool-button", title: "上传文件", onClick: () => fileRef.current?.click() }, "⊕"), h("input", { ref: fileRef, type: "file", hidden: true, multiple: true, onChange: e => { handleFiles(e.target.files); e.target.value = ""; } })), h(UiButton, { variant: "primary", className: "send-button", onClick: send }, editing ? "保存　↵" : "发送　↵"))), h("div", { className: "composer-hint" }, "Enter 发送 · Shift + Enter 换行")),
     h(ThreadPanel, { root: threadRoot, replies: threadReplies, client, onClose: onCancelThread, onJumpTo })
   );
 }
@@ -1742,7 +1812,7 @@ function App() {
     return () => button.remove();
   }, [forwardItems.length]);
   const [cryptoState, setCryptoState] = useState({ available: false, backupInfo: null, activeVersion: null, verified: false, localTrusted: false, keyRestored: false, restoring: false, restoreProgress: 0, error: null });
-  const refreshCrypto = async client => { const crypto = client?.getCrypto?.(); if (!crypto) return setCryptoState(s => ({ ...s, available: false, error: s.error || "加密模块尚未就绪，请重新登录或刷新页面" })); try { const backupInfo = await crypto.getKeyBackupInfo?.(); const activeVersion = await crypto.getActiveSessionBackupVersion?.(); const currentStatus = await Promise.resolve(crypto.getDeviceVerificationStatus?.(client.getUserId?.(), client.getDeviceId?.())).catch(() => null); const deviceVerified = Boolean(currentStatus?.crossSigningVerified); const localTrusted = Boolean(currentStatus?.localVerified); setCryptoState(s => ({ ...s, available: true, verified: deviceVerified, localTrusted, backupInfo: backupInfo || null, activeVersion: activeVersion || backupInfo?.version || null, error: null })); } catch (error) { setCryptoState(s => ({ ...s, available: true, error: error?.message || "无法读取密钥备份状态" })); } };
+  const refreshCrypto = async client => { const crypto = client?.getCrypto?.(); if (!crypto) return setCryptoState(s => ({ ...s, available: false, error: s.error || "加密模块尚未就绪，请重新登录或刷新页面" })); try { const backupInfo = await crypto.getKeyBackupInfo?.(); const activeVersion = await crypto.getActiveSessionBackupVersion?.(); const currentStatus = await Promise.resolve(crypto.getDeviceVerificationStatus?.(client.getUserId?.(), client.getDeviceId?.())).catch(() => null); const persistedTrust = localStorage.getItem(localVerificationKey(client)) === "1"; const deviceVerified = Boolean(currentStatus?.crossSigningVerified || persistedTrust); const localTrusted = Boolean(currentStatus?.localVerified || persistedTrust); if (persistedTrust && !currentStatus?.crossSigningVerified) { try { await crypto.setDeviceVerified?.(client.getUserId?.(), client.getDeviceId?.(), true); } catch {} } setCryptoState(s => ({ ...s, available: true, verified: deviceVerified, localTrusted, backupInfo: backupInfo || null, activeVersion: activeVersion || backupInfo?.version || null, error: null })); } catch (error) { setCryptoState(s => ({ ...s, available: true, error: error?.message || "无法读取密钥备份状态" })); } };
   const refresh = async client => {
     const allRooms = client.getRooms();
     const pendingJoinIds = pendingJoinRoomIdsRef.current;
@@ -1804,6 +1874,7 @@ function App() {
       // Element's recovery key is the Secret Storage key. It must first
       // unwrap m.megolm_backup.v1; it is not necessarily the room-backup key.
       window.orbitRecoveryKeyBytes = key;
+      try { localStorage.setItem(recoveryStorageKey(connected.client.getUserId?.()), encodeBase64Url(key)); } catch {}
       if (typeof crypto.loadSessionBackupPrivateKeyFromSecretStorage === "function") {
         try {
           await crypto.loadSessionBackupPrivateKeyFromSecretStorage();
@@ -1821,8 +1892,8 @@ function App() {
     }
     if (type === "secret") { if (typeof crypto.loadSessionBackupPrivateKeyFromSecretStorage === "function") { try { await crypto.loadSessionBackupPrivateKeyFromSecretStorage(); } catch (error) { const stored = await crypto.isKeyBackupKeyStored?.(version); if (!stored) throw error; } } }
     const result = type === "passphrase" ? await crypto.restoreKeyBackupWithPassphrase(passphrase, { progressCallback: p => setCryptoState(s => ({ ...s, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })) }) : await crypto.restoreKeyBackup({ progressCallback: p => setCryptoState(s => ({ ...s, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })) }); try { await crypto.bootstrapCrossSigning?.({ authUploadDeviceSigningKeys: async () => ({}) }); } catch {} const retried = await retryLoadedRoomDecryption(connected.client); await refresh(connected.client); setCryptoState(s => ({ ...s, restoring: false, restoreProgress: 100, keyRestored: true })); Toast.success(`密钥恢复完成，导入 ${result?.imported ?? 0} 个会话，已重试解密 ${retried} 条已加载消息。`); } catch (error) { const raw = error?.message || "密钥恢复失败"; const mismatch = /does not match|mismatch|match.*decryption key/i.test(raw); const message = mismatch ? `恢复密钥与服务器备份版本 ${version} 不匹配。请确认这是该账号当前 Secret Storage 的恢复密钥；如果备份曾重置，请从 Element“设置 → 安全与隐私”获取最新密钥。` : raw; setCryptoState(s => ({ ...s, restoring: false, error: message })); Toast.error(message); } };
-  const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); setSyncing(true); setTimeout(() => setSyncing(false), 15000); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setPresence("offline"); setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const authExpired = /unknown token|M_UNKNOWN_TOKEN|401/i.test(text); const message = authExpired ? "Matrix 登录状态已失效，请重新登录" : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired) { client.stopClient?.(); window.orbitMatrixClient = null; localStorage.removeItem("orbit.matrix.session"); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); } }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const selectedRoom = room?.roomId === selectedIdRef.current; if (selectedRoom && !document.hidden) { Promise.resolve(client.sendReadReceipt?.(event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && eventId && (room?.roomId !== selectedIdRef.current || document.hidden || !document.hasFocus?.()); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { orbitNotifiedEvents.add(eventId); if (orbitNotifiedEvents.size > 500) orbitNotifiedEvents.delete(orbitNotifiedEvents.values().next().value); const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); let desktopShown = false; if (typeof Notification !== "undefined" && Notification.permission === "granted") { try { new Notification(title, { body, tag: `orbit-${room?.roomId || "room"}` }); desktopShown = true; } catch {} } if (!desktopShown || !document.hidden) Toast.info(`${title}：${body}`); } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", () => queueRefresh(client)); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user?.presence === "offline" ? "online" : (user?.presence || "online")); queueRefresh(client); }); client.on("Event.decrypted", () => queueRefresh(client)); queueRefresh(client); setShowLogin(false); };
-  React.useEffect(() => { const saved = localStorage.getItem("orbit.matrix.session"); if (!saved) return; (async () => { try { const session = JSON.parse(saved); const resolved = await resolveHomeserver(session.homeserver); const client = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, userId: session.userId, accessToken: session.accessToken, deviceId: session.deviceId, cryptoCallbacks: orbitCryptoCallbacks }); await initCryptoSafely(client); window.orbitMatrixClient = client; connectedHandler({ client, userId: session.userId, homeserver: resolved.homeserver }); startOrbitSync(client, resolved); } catch { localStorage.removeItem("orbit.matrix.session"); } })(); }, []);
+  const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); setSyncing(true); setTimeout(() => setSyncing(false), 15000); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setPresence("offline"); setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const authExpired = /unknown token|M_UNKNOWN_TOKEN|401/i.test(text); const message = authExpired ? "Matrix 登录状态已失效，请重新登录" : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired) { client.stopClient?.(); window.orbitMatrixClient = null; localStorage.removeItem("orbit.matrix.session"); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); } }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const selectedRoom = room?.roomId === selectedIdRef.current; if (selectedRoom && !document.hidden) { Promise.resolve(markRoomRead(client, room?.roomId, event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && eventId && (room?.roomId !== selectedIdRef.current || document.hidden || !document.hasFocus?.()); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { orbitNotifiedEvents.add(eventId); if (orbitNotifiedEvents.size > 500) orbitNotifiedEvents.delete(orbitNotifiedEvents.values().next().value); const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); let desktopShown = false; if (typeof Notification !== "undefined" && Notification.permission === "granted") { try { new Notification(title, { body, tag: `orbit-${room?.roomId || "room"}` }); desktopShown = true; } catch {} } if (!desktopShown || !document.hidden) Toast.info(`${title}：${body}`); } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", () => queueRefresh(client)); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user?.presence === "offline" ? "online" : (user?.presence || "online")); queueRefresh(client); }); client.on("Event.decrypted", () => queueRefresh(client)); queueRefresh(client); setShowLogin(false); };
+  React.useEffect(() => { const saved = localStorage.getItem("orbit.matrix.session"); if (!saved) return; (async () => { try { const session = JSON.parse(saved); loadPersistedRecoveryKey(session.userId); const resolved = await resolveHomeserver(session.homeserver); const client = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, userId: session.userId, accessToken: session.accessToken, deviceId: session.deviceId, cryptoCallbacks: orbitCryptoCallbacks }); await initCryptoSafely(client); try { await client.getCrypto?.()?.loadSessionBackupPrivateKeyFromSecretStorage?.(); } catch {} window.orbitMatrixClient = client; connectedHandler({ client, userId: session.userId, homeserver: resolved.homeserver }); startOrbitSync(client, resolved); } catch { localStorage.removeItem("orbit.matrix.session"); } })(); }, []);
   React.useEffect(() => {
     const url = new URL(window.location.href);
     const loginToken = url.searchParams.get("loginToken");
@@ -1902,12 +1973,12 @@ function App() {
     await connected.client.sendMessage(room.id, content);
     Toast.success("贴纸已发送"); refresh(connected.client); } catch (error) { Toast.error(`贴纸发送失败：${error?.message || "网络错误"}`); } };
   const typing = value => { if (connected && room) connected.client.sendTyping(room.id, value, 5000).catch(() => {}); };
-  const markRead = id => { const targetRoom = connected?.client.getRoom(id); const target = targetRoom?.getLiveTimeline?.().getEvents?.().slice(-1)[0]; if (target) Promise.resolve(markRoomRead(connected.client, id, target)).then(() => queueRefresh(connected.client)).catch(() => {}); else if (connected?.client) queueRefresh(connected.client); };
+  const markRead = id => { setRooms(current => current.map(entry => entry.id === id ? { ...entry, unread: 0, hasUnread: false } : entry)); const targetRoom = connected?.client.getRoom(id); const target = targetRoom?.getLiveTimeline?.().getEvents?.().slice(-1)[0]; if (target) Promise.resolve(markRoomRead(connected.client, id, target)).then(() => queueRefresh(connected.client)).catch(() => {}); else if (connected?.client) queueRefresh(connected.client); };
   const togglePinMessage = async item => { if (!room || !item?.id) return; try { const state = room.matrixRoom.currentState?.getStateEvents?.("m.room.pinned_events", ""); const current = Array.isArray(state) ? state[0]?.getContent?.()?.pinned : state?.getContent?.()?.pinned; const pinnedIds = Array.isArray(current) ? current : []; const next = pinnedIds.includes(item.id) ? pinnedIds.filter(id => id !== item.id) : [...pinnedIds, item.id].slice(-50); await connected.client.sendStateEvent(room.id, "m.room.pinned_events", { pinned: next }, ""); await refresh(connected.client); Toast.success(next.includes(item.id) ? "消息已置顶" : "已取消消息置顶"); } catch (error) { Toast.error(`消息置顶失败：${error?.message || "当前 homeserver 不支持置顶消息"}`); } };
   const startCall = async kind => { if (!room || !connected?.client) return; try { const call = connected.client.createCall?.(room.id); if (!call) throw new Error("当前 Matrix SDK 未提供通话能力"); const method = kind === "video" ? (call.placeVideoCall || call.placeCall) : (call.placeVoiceCall || call.placeCall); if (typeof method !== "function") throw new Error("当前 homeserver 未启用 Matrix 通话"); await method.call(call, kind === "video"); Toast.success(kind === "video" ? "视频通话请求已发出" : "语音通话请求已发出"); } catch (error) { Toast.error(`通话发起失败：${error?.message || "请确认 TURN 与 VoIP 配置"}`); } };
   const jumpTo = async eventId => { if (!eventId) return; const safe = String(eventId).replace(/[^a-zA-Z0-9_-]/g, "_"); let node = document.getElementById(`event-${safe}`); if (!node && room) { try { await connected.client.scrollback(room.matrixRoom, 100); await refresh(connected.client); await new Promise(resolve => setTimeout(resolve, 80)); node = document.getElementById(`event-${safe}`); } catch {} } if (node) { node.scrollIntoView({ behavior: "smooth", block: "center" }); node.classList.add("message-highlight"); setTimeout(() => node.classList.remove("message-highlight"), 1600); } else Toast.info("原消息不在当前服务器返回的历史范围内"); };
   const leaveRoom = async () => { if (!room || !confirm(`确定离开「${room.name}」吗？`)) return; try { await connected.client.leave(room.id); setSelectedId(null); refresh(connected.client); Toast.success("已离开房间"); } catch (error) { Toast.error(`离开房间失败：${error?.message || "未知错误"}`); } };
-  const logout = async () => { try { await connected.client.logout(); } catch {} connected.client.stopClient(); pendingJoinRoomIdsRef.current.clear(); optimisticJoinedRoomsRef.current.clear(); window.orbitMatrixClient = null; localStorage.removeItem("orbit.matrix.session"); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); Toast.success("已退出 Matrix"); };
+  const logout = async () => { try { await connected.client.logout(); } catch {} connected.client.stopClient(); pendingJoinRoomIdsRef.current.clear(); optimisticJoinedRoomsRef.current.clear(); window.orbitMatrixClient = null; localStorage.removeItem("orbit.matrix.session"); try { localStorage.removeItem(recoveryStorageKey(connected.userId)); localStorage.removeItem(localVerificationKey(connected.client)); } catch {} setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); Toast.success("已退出 Matrix"); };
   if (!connected) return h("div", { className: "app-shell" }, h("div", { className: "sidebar landing-sidebar" }, h("div", { className: "brand-row" }, h("div", { className: "brand" }, h("div", { className: "brand-mark" }, "O"), h("div", null, "Orbit", h("div", { className: "workspace-pill" }, "Matrix 工作台")))), h("div", { className: "sidebar-footer" }, h("div", { className: "connection-state" }, h("span", { className: "offline-dot" }), "未连接"))), h("main", { className: "main-panel" }, h("div", { className: "login-landing" }, h("div", { className: "landing-mark" }, "O"), h("div", { className: "landing-title" }, "连接你的 Matrix 世界"), h("div", { className: "landing-copy" }, "登录后同步真实房间、消息和成员。"), h("button", { className: "primary-btn landing-button", onClick: () => setShowLogin(true) }, "连接 Matrix 账户"))), showLogin && h(LoginDialog, { onConnected: connectedHandler, onClose: () => setShowLogin(false) }));
   const setSelectingState = active => {
     if (active === false) {
