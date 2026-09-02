@@ -24,6 +24,26 @@ const TextArea = AntInput.TextArea;
 const Input = props => h(AntInput, { ...props, allowClear: props.showClear, onChange: event => props.onChange?.(event?.target?.value ?? event) });
 const Avatar = props => h(AntAvatar, { ...props, size: props.size === "small" ? 32 : props.size, shape: props.shape === "square" ? "square" : props.shape });
 const Toast = { success: value => antMessage?.success(value), error: value => antMessage?.error(value), warning: value => antMessage?.warning(value), info: value => antMessage?.info(value) };
+
+// Desktop notifications keep enough routing information in their tag to
+// bring Orbit back to the originating room and newest event when clicked.
+try {
+  if (typeof window.Notification === "function" && !window.Notification.__orbitWrapped) {
+    const NativeNotification = window.Notification;
+    const WrappedNotification = new Proxy(NativeNotification, { construct(Target, args) {
+      const notice = new Target(...args);
+      notice.addEventListener?.("click", () => {
+        const tag = args?.[1]?.tag || "";
+        const roomId = tag.startsWith("orbit-") ? tag.slice(6) : null;
+        const eventId = roomId ? window.orbitMatrixClient?.getRoom?.(roomId)?.getLastLiveEvent?.()?.getId?.() : null;
+        window.focus?.(); window.orbitNavigateToMessage?.(roomId, eventId); notice.close?.();
+      });
+      return notice;
+    } });
+    WrappedNotification.__orbitWrapped = true;
+    window.Notification = WrappedNotification;
+  }
+} catch {}
 const UiButton = ({ variant = "default", danger = false, ...props }) => h(AntButton, { type: variant === "primary" ? "primary" : "default", danger, ...props });
 const h = React.createElement;
 function Icon({ name, size = 17 }) {
@@ -277,6 +297,23 @@ function ensureEmojiCatalog() {
   if (window.orbitEmojiItems?.length) return Promise.resolve(window.orbitEmojiItems);
   if (!orbitEmojiCatalogPromise) orbitEmojiCatalogPromise = fetch(assetRequestUrl("https://image.527012.xyz/index.json")).then(response => response.ok ? response.json() : null).then(data => { window.orbitEmojiItems = data?.items || []; window.orbitEmojiPacks = data?.packs || []; return window.orbitEmojiItems; }).catch(() => []);
   return orbitEmojiCatalogPromise;
+}
+
+function fuzzyScore(value, query) {
+  const text = String(value || "").toLowerCase();
+  const needle = String(query || "").trim().toLowerCase();
+  if (!needle) return 0;
+  if (text === needle) return 10000;
+  if (text.startsWith(needle)) return 7000 - Math.min(text.length, 300);
+  const at = text.indexOf(needle);
+  if (at >= 0) return 5000 - at * 4 - Math.min(text.length, 300);
+  let cursor = 0; let gaps = 0;
+  for (const char of needle) {
+    const found = text.indexOf(char, cursor);
+    if (found < 0) return 0;
+    gaps += found - cursor; cursor = found + 1;
+  }
+  return Math.max(1, 1800 - gaps * 12 - (text.length - needle.length));
 }
 
 function useMatrixAsset(client, rawUrl, width = null, height = null, resizeMethod = null, encryptedInfo = null) {
@@ -545,7 +582,7 @@ async function startOrbitSync(client, { clientBaseUrl, slidingSync = false } = {
   if (!slidingSync || typeof SlidingSync !== "function") return fallback();
   try {
     const lists = new Map([
-      ["all", { ranges: [[0, 50]], sort: ["by_recency"], filters: { is_invite: false }, required_state: [["m.room.create", ""], ["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["m.room.topic", ""], ["m.space.child", "*"], ["m.space.parent", "*"]], timeline_limit: 30 }],
+      ["all", { ranges: [[0, 500]], sort: ["by_recency"], filters: { is_invite: false }, required_state: [["m.room.create", ""], ["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["m.room.topic", ""], ["m.space.child", "*"], ["m.space.parent", "*"]], timeline_limit: 30 }],
       ["invites", { ranges: [[0, 20]], sort: ["by_recency"], filters: { is_invite: true }, required_state: [["m.room.create", ""], ["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["m.room.topic", ""], ["m.space.child", "*"], ["m.space.parent", "*"]], timeline_limit: 30 }]
     ]);
     const roomSubscriptionInfo = { required_state: [["m.room.create", ""], ["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["m.room.topic", ""], ["m.space.child", "*"], ["m.space.parent", "*"]], timeline_limit: 30 };
@@ -781,6 +818,13 @@ async function retryLoadedRoomDecryption(client) {
 
 async function roomMessages(room, userId, client) {
   const events = room?.getLiveTimeline?.().getEvents?.() || [];
+  // Ask Rust Crypto to retry every encrypted event whenever a room is rebuilt.
+  // This is important after restoring Secret Storage: the SDK may receive the
+  // event before the backup key finishes loading and otherwise leave a stale
+  // "missing key" placeholder rendered forever.
+  if (client?.decryptEventIfNeeded) {
+    await Promise.all(events.filter(event => event?.getType?.() === "m.room.encrypted" || event?.isEncrypted?.()).map(event => Promise.resolve(client.decryptEventIfNeeded(event)).catch(() => {})));
+  }
   const redacted = new Set(); const reactions = new Map(); const edits = new Map(); const replacements = new Map(); const updates = new Map(); const byId = new Map();
   events.forEach(event => {
     if (event.getType?.() === "m.room.redaction") { const id = event.getRedacts?.() || event.getContent?.()?.redacts; if (id) redacted.add(id); return; }
@@ -963,8 +1007,9 @@ function ForwardDialog({ client, rooms, items, onClose }) {
   return h("div", { className: "modal-backdrop", onMouseDown: event => event.target === event.currentTarget && onClose() }, h("div", { className: "modal-card forward-card" }, h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "转发消息"), h("div", { className: "modal-copy" }, `已选择 ${items.length} 条消息，可发送到多个房间`)), h(UiButton, { className: "icon-button", type: "text", onClick: onClose }, "×")), h(Input, { className: "forward-search", value: query, onChange: setQuery, placeholder: "搜索房间名称或 Matrix ID", prefix: "⌕", allowClear: true }), h("div", { className: "forward-room-list" }, filtered.length ? filtered.map(room => h("label", { className: "forward-room", key: room.id }, h(AntCheckbox, { checked: targets.includes(room.id), onChange: () => toggle(room.id) }), h(MatrixAvatar, { client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 30, style: { background: room.color }, fallback: room.initials, alt: room.name }), h("span", null, room.name))) : h("div", { className: "dialog-empty" }, "没有匹配的房间")), h("div", { className: "modal-actions" }, h(UiButton, { className: "ghost-btn", onClick: onClose }, "取消"), h(UiButton, { variant: "primary", className: "primary-btn", disabled: !targets.length || loading, onClick: forward }, loading ? "转发中…" : `转发到 ${targets.length || 0} 个房间`))));
 }
 
-function SearchDialog({ client, room, onClose }) {
+function SearchDialog({ client, room, onClose, onJumpTo }) {
   const [query, setQuery] = useState(""); const [results, setResults] = useState([]); const [loading, setLoading] = useState(false);
+  onJumpTo ||= (eventId => window.orbitNavigateToMessage?.(room?.id, eventId));
   const scoreResult = (entry, term) => {
     const result = entry?.result || entry || {}; const content = result.content || {}; const haystack = `${content.body || ""} ${content.formatted_body || ""}`.toLowerCase(); const needle = term.toLowerCase();
     let cursor = 0; for (const char of needle) { const found = haystack.indexOf(char, cursor); if (found < 0) return 0; cursor = found + 1; }
@@ -1000,7 +1045,7 @@ function SearchDialog({ client, room, onClose }) {
     setResults(local);
     if (!local.length) Toast.warning("服务器搜索不可用，仅搜索当前已加载的消息");
   } finally { setLoading(false); } };
-  return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card search-card" }, h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "搜索房间消息"), h("div", { className: "modal-copy" }, room.name)), h("button", { className: "icon-button", onClick: onClose }, "×")), h("form", { className: "search-form", onSubmit: search }, h("input", { value: query, onChange: e => setQuery(e.target.value), placeholder: "输入关键词", autoFocus: true }), h("button", { className: "primary-btn", disabled: loading }, loading ? "搜索中…" : "搜索")), h("div", { className: "search-results" }, !results.length && query && !loading && h("div", { className: "dialog-empty" }, "没有找到匹配的消息"), results.map((item, i) => h("div", { className: "search-result", key: item.result?.event_id || item.rank || i }, h("div", { className: "search-result-author" }, item.result?.senderName || item.result?.sender || "未知用户", h("span", { className: "message-time" }, item.result?.origin_server_ts ? new Date(item.result.origin_server_ts).toLocaleString("zh-CN") : "")), h("div", { className: "search-result-body" }, item.result?.content?.body || ""))))));
+  return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card search-card" }, h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "搜索房间消息"), h("div", { className: "modal-copy" }, room.name)), h("button", { className: "icon-button", onClick: onClose }, "×")), h("form", { className: "search-form", onSubmit: search }, h("input", { value: query, onChange: e => setQuery(e.target.value), placeholder: "输入关键词", autoFocus: true }), h("button", { className: "primary-btn", disabled: loading }, loading ? "搜索中…" : "搜索")), h("div", { className: "search-results" }, !results.length && query && !loading && h("div", { className: "dialog-empty" }, "没有找到匹配的消息"), results.map((item, i) => h("button", { type: "button", className: "search-result", key: item.result?.event_id || item.rank || i, onClick: () => { onClose(); onJumpTo?.(item.result?.event_id); } }, h("div", { className: "search-result-author" }, item.result?.senderName || item.result?.sender || "未知用户", h("span", { className: "message-time" }, item.result?.origin_server_ts ? new Date(item.result.origin_server_ts).toLocaleString("zh-CN") : "")), h("div", { className: "search-result-body" }, item.result?.content?.body || ""))))));
 }
 
 function Sidebar({ rooms, allRooms: roomUniverse = rooms, invites = [], spaces, selectedId, connected, presence, viewMode, activeSpaceId, onViewMode, onSpaceSelect, onSelect, onCreate, onCreateSpace, onManageSpace, onLeaveSpace = window.orbitLeaveSpace, onAcceptInvite, onDeclineInvite, onAccount, onLogout }) {
@@ -1627,7 +1672,7 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
     if (!match || !match[1]) { setEmojiSuggestions([]); return; }
     const q = match[1].toLowerCase();
     const requestId = ++emojiQueryRef.current;
-    ensureEmojiCatalog().then(items => { if (requestId !== emojiQueryRef.current) return; setEmojiSuggestions((items || []).filter(item => `${item.name} ${(item.keywords || []).join(" ")}`.toLowerCase().includes(q)).slice(0, 8)); });
+    ensureEmojiCatalog().then(items => { if (requestId !== emojiQueryRef.current) return; const ranked = (items || []).map(item => ({ item, score: Math.max(fuzzyScore(item.name, q), ...(item.keywords || []).map(keyword => fuzzyScore(keyword, q)), 0) })).filter(entry => entry.score > 0).sort((a, b) => b.score - a.score || String(a.item.name).localeCompare(String(b.item.name), "zh-CN")); setEmojiSuggestions(ranked.slice(0, 80).map(entry => entry.item)); });
   };
   React.useEffect(() => { if (!draft) setEmojiSuggestions([]); }, [draft]);
   React.useEffect(() => {
@@ -1977,6 +2022,7 @@ function App() {
   const togglePinMessage = async item => { if (!room || !item?.id) return; try { const state = room.matrixRoom.currentState?.getStateEvents?.("m.room.pinned_events", ""); const current = Array.isArray(state) ? state[0]?.getContent?.()?.pinned : state?.getContent?.()?.pinned; const pinnedIds = Array.isArray(current) ? current : []; const next = pinnedIds.includes(item.id) ? pinnedIds.filter(id => id !== item.id) : [...pinnedIds, item.id].slice(-50); await connected.client.sendStateEvent(room.id, "m.room.pinned_events", { pinned: next }, ""); await refresh(connected.client); Toast.success(next.includes(item.id) ? "消息已置顶" : "已取消消息置顶"); } catch (error) { Toast.error(`消息置顶失败：${error?.message || "当前 homeserver 不支持置顶消息"}`); } };
   const startCall = async kind => { if (!room || !connected?.client) return; try { const call = connected.client.createCall?.(room.id); if (!call) throw new Error("当前 Matrix SDK 未提供通话能力"); const method = kind === "video" ? (call.placeVideoCall || call.placeCall) : (call.placeVoiceCall || call.placeCall); if (typeof method !== "function") throw new Error("当前 homeserver 未启用 Matrix 通话"); await method.call(call, kind === "video"); Toast.success(kind === "video" ? "视频通话请求已发出" : "语音通话请求已发出"); } catch (error) { Toast.error(`通话发起失败：${error?.message || "请确认 TURN 与 VoIP 配置"}`); } };
   const jumpTo = async eventId => { if (!eventId) return; const safe = String(eventId).replace(/[^a-zA-Z0-9_-]/g, "_"); let node = document.getElementById(`event-${safe}`); if (!node && room) { try { await connected.client.scrollback(room.matrixRoom, 100); await refresh(connected.client); await new Promise(resolve => setTimeout(resolve, 80)); node = document.getElementById(`event-${safe}`); } catch {} } if (node) { node.scrollIntoView({ behavior: "smooth", block: "center" }); node.classList.add("message-highlight"); setTimeout(() => node.classList.remove("message-highlight"), 1600); } else Toast.info("原消息不在当前服务器返回的历史范围内"); };
+  window.orbitNavigateToMessage = (roomId, eventId) => { if (!roomId) return; const target = rooms.find(entry => entry.id === roomId); setViewMode(target?.isGroup ? "groups" : "messages"); setSelectedId(roomId); markRead(roomId); setTimeout(() => { const safe = String(eventId || "").replace(/[^a-zA-Z0-9_-]/g, "_"); const node = eventId && document.getElementById(`event-${safe}`); if (node) { node.scrollIntoView({ behavior: "smooth", block: "center" }); node.classList.add("message-highlight"); setTimeout(() => node.classList.remove("message-highlight"), 1600); } }, 180); };
   const leaveRoom = async () => { if (!room || !confirm(`确定离开「${room.name}」吗？`)) return; try { await connected.client.leave(room.id); setSelectedId(null); refresh(connected.client); Toast.success("已离开房间"); } catch (error) { Toast.error(`离开房间失败：${error?.message || "未知错误"}`); } };
   const logout = async () => { try { await connected.client.logout(); } catch {} connected.client.stopClient(); pendingJoinRoomIdsRef.current.clear(); optimisticJoinedRoomsRef.current.clear(); window.orbitMatrixClient = null; localStorage.removeItem("orbit.matrix.session"); try { localStorage.removeItem(recoveryStorageKey(connected.userId)); localStorage.removeItem(localVerificationKey(connected.client)); } catch {} setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); Toast.success("已退出 Matrix"); };
   if (!connected) return h("div", { className: "app-shell" }, h("div", { className: "sidebar landing-sidebar" }, h("div", { className: "brand-row" }, h("div", { className: "brand" }, h("div", { className: "brand-mark" }, "O"), h("div", null, "Orbit", h("div", { className: "workspace-pill" }, "Matrix 工作台")))), h("div", { className: "sidebar-footer" }, h("div", { className: "connection-state" }, h("span", { className: "offline-dot" }), "未连接"))), h("main", { className: "main-panel" }, h("div", { className: "login-landing" }, h("div", { className: "landing-mark" }, "O"), h("div", { className: "landing-title" }, "连接你的 Matrix 世界"), h("div", { className: "landing-copy" }, "登录后同步真实房间、消息和成员。"), h("button", { className: "primary-btn landing-button", onClick: () => setShowLogin(true) }, "连接 Matrix 账户"))), showLogin && h(LoginDialog, { onConnected: connectedHandler, onClose: () => setShowLogin(false) }));
