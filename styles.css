@@ -1532,8 +1532,18 @@ button { cursor: pointer; }
 .emoji-suggestion-mode { display: inline-flex; align-items: center; gap: 3px; flex: 0 0 auto; margin-right: 4px; padding-right: 7px; border-right: 1px solid #e5eaf2; }
 .emoji-suggestion-mode button { min-width: 42px !important; height: 30px; padding: 0 9px !important; border: 0 !important; border-radius: 8px !important; color: #667085 !important; background: #f3f5f9 !important; font-size: 12px; }
 .emoji-suggestion-mode button.active { color: #fff !important; background: #356df3 !important; box-shadow: 0 2px 6px rgba(53,109,243,.24); }
+
+/* Match the compact reference layout for the full picker. */
+.emoji-popover { width: min(520px, calc(100vw - 28px)) !important; padding: 4px 2px 2px; }
+.emoji-browser { grid-template-columns: 122px minmax(0, 1fr); gap: 12px; min-height: 390px; }
+.emoji-category-nav { max-height: 390px; }
+.emoji-category-content .emoji-grid { grid-template-columns: repeat(7, minmax(42px, 1fr)); gap: 7px; max-height: 355px; padding-right: 4px; }
+.emoji-item-wrap, .emoji-item-wrap .emoji-item { width: 44px; height: 44px; }
+.emoji-hover-preview { width: 148px; min-height: 148px; }
+.emoji-hover-preview img { width: 118px; height: 118px; }
 .search-result { width: 100%; border: 0; border-bottom: 1px solid #edf1f7; background: transparent; text-align: left; cursor: pointer; }
 .search-result:hover { background: #f5f8ff; }
+.toast-notification-link { display: block; width: 100%; padding: 0; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; }
 .message-image.message-sticker {
   width: auto;
   max-width: min(280px, 72vw);

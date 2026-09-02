@@ -23,7 +23,16 @@ const { Input: AntInput, Avatar: AntAvatar, Button: AntButton, Popover: AntPopov
 const TextArea = AntInput.TextArea;
 const Input = props => h(AntInput, { ...props, allowClear: props.showClear, onChange: event => props.onChange?.(event?.target?.value ?? event) });
 const Avatar = props => h(AntAvatar, { ...props, size: props.size === "small" ? 32 : props.size, shape: props.shape === "square" ? "square" : props.shape });
-const Toast = { success: value => antMessage?.success(value), error: value => antMessage?.error(value), warning: value => antMessage?.warning(value), info: value => antMessage?.info(value) };
+const Toast = { success: value => antMessage?.success(value), error: value => antMessage?.error(value), warning: value => antMessage?.warning(value), info: value => {
+  const text = String(value || "");
+  const split = text.indexOf("：");
+  const roomName = split > 0 ? text.slice(0, split) : "";
+  const room = roomName && (window.orbitAllRooms || []).find(entry => entry.name === roomName);
+  if (!room || !antMessage?.open) return antMessage?.info(value);
+  const bodyText = split > 0 ? text.slice(split + 1) : "";
+  const event = [...(room.matrixRoom?.getLiveTimeline?.().getEvents?.() || [])].reverse().find(entry => !bodyText || notificationBody(entry) === bodyText);
+  return antMessage.open({ type: "info", duration: 5, content: h("button", { type: "button", className: "toast-notification-link", onClick: () => { window.orbitNavigateToMessage?.(room.id, event?.getId?.() || room.matrixRoom?.getLastLiveEvent?.()?.getId?.()); } }, text) });
+} };
 
 // Desktop notifications keep enough routing information in their tag to
 // bring Orbit back to the originating room and newest event when clicked.
@@ -69,7 +78,11 @@ function isNotifiableMessage(event) {
 function notificationBody(event) {
   const content = event?.getClearContent?.() || event?.getContent?.() || {};
   if (event?.getType?.() === "m.sticker") return "发送了一个贴纸";
-  if (event?.getType?.() === "m.room.encrypted" && !event?.getClearContent?.()) return "收到一条加密消息";
+  if (event?.getType?.() === "m.room.encrypted" && !event?.getClearContent?.()) {
+    const sender = event?.getSender?.() || "未知用户";
+    const member = event?.getRoomId?.() && window.orbitMatrixClient?.getRoom?.(event.getRoomId?.())?.getMember?.(sender);
+    return `来自 ${member?.name || sender}：加密消息（当前设备未恢复密钥）`;
+  }
   if (content.msgtype === "m.image") return "发送了一张图片";
   if (content.msgtype === "m.video") return "发送了一段视频";
   if (content.msgtype === "m.audio") return "发送了一段音频";
@@ -1703,19 +1716,23 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
     return () => bar.removeEventListener("mousedown", onChoose, true);
   }, [emojiSuggestions.length, emojiSuggestionMode, draft, onEmojiSelect]);
   React.useEffect(() => { if (!draft) setEmojiSuggestions([]); }, [draft]);
-  React.useEffect(() => {
-    const el = scrollRef.current;
-    if (!el || !room?.id || !messages.length) return;
-    const events = room.matrixRoom?.getLiveTimeline?.().getEvents?.() || [];
-    const readUpTo = room.matrixRoom?.getEventReadUpTo?.(client?.getUserId?.(), true);
-    const readIndex = readUpTo ? events.findIndex(event => event.getId?.() === readUpTo) : -1;
-    const unreadId = readIndex >= 0 ? [...events.slice(readIndex + 1)].reverse().find(event => event.getId?.())?.getId?.() : null;
-    if (!unreadId) return;
-    setTimeout(() => { const target = document.getElementById(`event-${String(unreadId).replace(/[^a-zA-Z0-9_-]/g, "_")}`); if (target) { el.scrollTop = Math.max(0, target.offsetTop - 54); setShowJump(true); } }, 40);
-  }, [room?.id, messages.length]);
   const [mentionTargets, setMentionTargets] = useState([]);
   React.useEffect(() => { setDraft(editing?.text || ""); setDraftHtml(""); setMentionTargets([]); setHistoryExhausted(false); if (room?.id) pendingRoomScrollRef.current = room.id; }, [room?.id, editing?.id]);
-  React.useEffect(() => { const el = scrollRef.current; if (!el || !room?.id || pendingRoomScrollRef.current !== room.id) return; requestAnimationFrame(() => { if (!scrollRef.current || pendingRoomScrollRef.current !== room.id) return; scrollRef.current.scrollTop = scrollRef.current.scrollHeight; pendingRoomScrollRef.current = null; setShowJump(false); }); }, [room?.id, messages.length]);
+  React.useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !room?.id || pendingRoomScrollRef.current !== room.id || !messages.length) return;
+    const readUpTo = room.matrixRoom?.getEventReadUpTo?.(client?.getUserId?.(), true);
+    const readIndex = readUpTo ? messages.findIndex(item => item.id === readUpTo) : -1;
+    const firstUnread = readIndex >= 0 ? messages.slice(readIndex + 1).find(item => item.type !== "empty" && item.id) : null;
+    const targetId = firstUnread?.id;
+    requestAnimationFrame(() => {
+      if (!scrollRef.current || pendingRoomScrollRef.current !== room.id) return;
+      const target = targetId && document.getElementById(`event-${String(targetId).replace(/[^a-zA-Z0-9_-]/g, "_")}`);
+      if (target) { el.scrollTop = Math.max(0, target.offsetTop - 54); setShowJump(true); }
+      else { el.scrollTop = el.scrollHeight; setShowJump(false); }
+      pendingRoomScrollRef.current = null;
+    });
+  }, [room?.id, messages.length, client]);
   React.useEffect(() => { const el = scrollRef.current; if (!el || !forceScrollRef.current) return; requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; forceScrollRef.current = false; }); }, [messages.length]);
   const send = async () => { const text = draft.trim(); if (!text) return; const pending = (window.orbitPendingMentions || {})[room?.id] || []; const mentions = [...mentionTargets, ...pending].filter((entry, index, list) => entry?.userId && text.includes(`@${String(entry.name || "").replace(/^@/, "")}`) && list.findIndex(other => other.userId === entry.userId) === index); setDraft(""); setDraftHtml(""); setMentionTargets([]); forceScrollRef.current = true; await onSend(text, draftHtml, mentions); setTimeout(() => { const el = scrollRef.current; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); setShowJump(false); }, 350); };
   React.useEffect(() => { window.orbitActiveRoomId = room?.id || null; }, [room?.id]);
@@ -2047,7 +2064,7 @@ function App() {
     await connected.client.sendMessage(room.id, content);
     Toast.success("贴纸已发送"); refresh(connected.client); } catch (error) { Toast.error(`贴纸发送失败：${error?.message || "网络错误"}`); } };
   const typing = value => { if (connected && room) connected.client.sendTyping(room.id, value, 5000).catch(() => {}); };
-  const markRead = id => { setRooms(current => current.map(entry => entry.id === id ? { ...entry, unread: 0, hasUnread: false } : entry)); const targetRoom = connected?.client.getRoom(id); const target = targetRoom?.getLiveTimeline?.().getEvents?.().slice(-1)[0]; if (target) Promise.resolve(markRoomRead(connected.client, id, target)).then(() => queueRefresh(connected.client)).catch(() => {}); else if (connected?.client) queueRefresh(connected.client); };
+  const markRead = id => { setRooms(current => current.map(entry => entry.id === id ? { ...entry, unread: 0, hasUnread: false } : entry)); const targetRoom = connected?.client.getRoom(id); const target = targetRoom?.getLiveTimeline?.().getEvents?.().slice(-1)[0]; if (target) setTimeout(() => Promise.resolve(markRoomRead(connected.client, id, target)).then(() => queueRefresh(connected.client)).catch(() => {}), 1200); else if (connected?.client) queueRefresh(connected.client); };
   const togglePinMessage = async item => { if (!room || !item?.id) return; try { const state = room.matrixRoom.currentState?.getStateEvents?.("m.room.pinned_events", ""); const current = Array.isArray(state) ? state[0]?.getContent?.()?.pinned : state?.getContent?.()?.pinned; const pinnedIds = Array.isArray(current) ? current : []; const next = pinnedIds.includes(item.id) ? pinnedIds.filter(id => id !== item.id) : [...pinnedIds, item.id].slice(-50); await connected.client.sendStateEvent(room.id, "m.room.pinned_events", { pinned: next }, ""); await refresh(connected.client); Toast.success(next.includes(item.id) ? "消息已置顶" : "已取消消息置顶"); } catch (error) { Toast.error(`消息置顶失败：${error?.message || "当前 homeserver 不支持置顶消息"}`); } };
   const startCall = async kind => { if (!room || !connected?.client) return; try { const call = connected.client.createCall?.(room.id); if (!call) throw new Error("当前 Matrix SDK 未提供通话能力"); const method = kind === "video" ? (call.placeVideoCall || call.placeCall) : (call.placeVoiceCall || call.placeCall); if (typeof method !== "function") throw new Error("当前 homeserver 未启用 Matrix 通话"); await method.call(call, kind === "video"); Toast.success(kind === "video" ? "视频通话请求已发出" : "语音通话请求已发出"); } catch (error) { Toast.error(`通话发起失败：${error?.message || "请确认 TURN 与 VoIP 配置"}`); } };
   const jumpTo = async eventId => { if (!eventId) return; const safe = String(eventId).replace(/[^a-zA-Z0-9_-]/g, "_"); let node = document.getElementById(`event-${safe}`); if (!node && room) { try { await connected.client.scrollback(room.matrixRoom, 100); await refresh(connected.client); await new Promise(resolve => setTimeout(resolve, 80)); node = document.getElementById(`event-${safe}`); } catch {} } if (node) { node.scrollIntoView({ behavior: "smooth", block: "center" }); node.classList.add("message-highlight"); setTimeout(() => node.classList.remove("message-highlight"), 1600); } else Toast.info("原消息不在当前服务器返回的历史范围内"); };
