@@ -1,0 +1,37 @@
+import React from "https://esm.sh/react@18.3.1";
+
+const h = React.createElement;
+
+export default function Icon({ name, size = 17 }) {
+  const paths = {
+    search: "M11 19a8 8 0 1 1 5.66-2.34L21 21",
+    phone: "M22 16.92v3a2 2 0 0 1-2.18 2 19.8 19.8 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.12.9.33 1.78.62 2.63a2 2 0 0 1-.45 2.11L8 9.73a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.85.29 1.73.5 2.63.62A2 2 0 0 1 22 16.92Z",
+    video: "M15 10l4.55-2.28A1 1 0 0 1 21 8.62v6.76a1 1 0 0 1-1.45.9L15 14M3 6h12v12H3z",
+    play: "M8 5.5a1 1 0 0 1 1.52-.86l9.22 6.5a1 1 0 0 1 0 1.72l-9.22 6.5A1 1 0 0 1 8 18.5z",
+    pause: "M8 5v14M16 5v14",
+    fullscreen: "M8 3H3v5M3 3l6 6M16 3h5v5M21 3l-6 6M8 21H3v-5M3 21l6-6M16 21h5v-5M21 21l-6-6",
+    list: "M5 6h.01M9 6h10M5 12h.01M9 12h10M5 18h.01M9 18h10",
+    pin: "M9 3h6l-1 6 4 3v2h-5v7h-2v-7H6v-2l4-3z",
+    room: "M3 11.5 12 4l9 7.5M5 10v10h14V10M9 20v-6h6v6",
+    mic: "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3zM5 11a7 7 0 0 0 14 0M12 18v4M8 22h8",
+    attachment: "M21.4 11.6 12 21a6 6 0 0 1-8.5-8.5l9.9-9.9a4 4 0 0 1 5.7 5.7l-9.9 9.9a2 2 0 0 1-2.8-2.8l9.2-9.2",
+    smile: "M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0",
+    bold: "M6 12h7a4 4 0 0 0 0-8H6zm0 0h8a4 4 0 0 1 0 8H6z",
+    italic: "M10 4h6m-3 0-2 16m-3 0h6",
+    underline: "M6 20h12M7 4v7a5 5 0 0 0 10 0V4",
+    strike: "M19 12a1 1 0 1 1 0 2h-2.113c.217.328.395.684.521 1.063c.974 2.921-1.2 5.937-4.278 5.937h-1.702a5.74 5.74 0 0 1-5.132-3.17l-.19-.383a1 1 0 0 1 1.789-.894l.19.382A3.74 3.74 0 0 0 11.428 19h1.702a2.51 2.51 0 0 0 1.122-4.756L13.764 14H5a1 1 0 1 1 0-2zm-6.428-9a5.74 5.74 0 0 1 5.132 3.17l.19.383a1 1 0 0 1-1.788.894l-.191-.382A3.74 3.74 0 0 0 12.572 5H10.87a2.51 2.51 0 0 0-1.122 4.756L12.236 11h-4.22a4.5 4.5 0 0 1-1.424-2.063C5.618 6.017 7.792 3 10.87 3z",
+    code: "M8 4H7a2 2 0 0 0-2 2v3.99a2 2 0 0 1-2 2M3 12c1.1.005 2 .9 2 2v4a2 2 0 0 0 2 2h1m8 0h1a2 2 0 0 0 2-2v-4c0-1.1.9-1.995 2-2m-5-8h1a2 2 0 0 1 2 2v3.99a2 2 0 0 1 2 2",
+    quoteMark: "M10.5 10H7.8a2.8 2.8 0 0 0-2.8 2.8v1.4A2.8 2.8 0 0 0 7.8 17h.4a2.8 2.8 0 0 0 2.8-2.8V10Zm8.5 0h-2.7a2.8 2.8 0 0 0-2.8 2.8v1.4a2.8 2.8 0 0 0 2.8 2.8h.4a2.8 2.8 0 0 0 2.8-2.8V10ZM5 10c0-2.2 1.2-3.8 3.6-4.8M13.5 10c0-2.2 1.2-3.8 3.6-4.8",
+    codeBlock: "M9 4 4 12l5 8M15 4l5 8-5 8",
+    clearFormat: "M5 5l14 14M19 5 5 19",
+    textColor: "M7 20l5-16 5 16M8.5 15h7",
+    fontSize: "M5 19 11 5h2l6 14M7.5 14h9",
+    orderedList: "M4 6v4M4 10h2M4 6h2M8 7h12M8 12h12M8 17h12",
+    bulletList: "M4 7h.01M4 12h.01M4 17h.01M8 7h12M8 12h12M8 17h12",
+    heading1: "M5 5v14M19 5v14M5 12h14",
+    heading2: "M5 5v14M19 5v14M5 12h14",
+    heading3: "M5 5v14M19 5v14M5 12h14",
+  };
+  const filledIcon = name === "strike";
+  return h("svg", { className: "ui-icon", width: size, height: size, viewBox: "0 0 24 24", fill: filledIcon ? "currentColor" : "none", stroke: filledIcon ? "none" : "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" }, h("path", { d: paths[name] || paths.room }));
+}
