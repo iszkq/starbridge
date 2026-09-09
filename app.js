@@ -7,7 +7,7 @@ import * as MatrixSDK from "https://esm.sh/matrix-js-sdk@42.3.0?bundle&external=
 import { decodeRecoveryKey } from "https://esm.sh/matrix-js-sdk@42.3.0/lib/crypto-api/recovery-key?bundle";
 import { SlidingSync } from "https://esm.sh/matrix-js-sdk@42.3.0/lib/sliding-sync.js?bundle&external=@matrix-org/matrix-sdk-crypto-wasm";
 import Icon from "./src/ui/Icon.js?v=239";
-import { HaloComposer } from "./src/editor/Composer.js?v=238";
+import { HaloComposer } from "./src/editor/Composer.js?v=262";
 
 // esm.sh's bundled SDK points the Rust WASM request at a non-existent path.
 // Redirect that one asset to the published crypto-wasm package while leaving
@@ -34,7 +34,8 @@ const Toast = { success: value => antMessage?.success(value), error: value => an
   if (!room || !antMessage?.open) return antMessage?.info(value);
   const bodyText = split > 0 ? text.slice(split + 1) : "";
   const event = [...(room.matrixRoom?.getLiveTimeline?.().getEvents?.() || [])].reverse().find(entry => !bodyText || notificationBody(entry) === bodyText);
-  return antMessage.open({ type: "info", duration: 5, content: h("button", { type: "button", className: "toast-notification-link", onClick: () => { window.orbitNavigateToMessage?.(room.id, event?.getId?.() || room.matrixRoom?.getLastLiveEvent?.()?.getId?.()); } }, text) });
+  const displayText = compactNotificationText(text, 64);
+  return antMessage.open({ type: "info", duration: 5, content: h("button", { type: "button", className: "toast-notification-link", title: text, onClick: () => { window.orbitNavigateToMessage?.(room.id, event?.getId?.() || room.matrixRoom?.getLastLiveEvent?.()?.getId?.()); } }, displayText) });
 } };
 
 // Desktop notifications keep enough routing information in their tag to
@@ -70,6 +71,9 @@ const colors = ["#6264dc", "#2e9d78", "#e58a45", "#b66ad0", "#db6872", "#4d91c6"
 const initials = (name = "?") => [...name.replace(/^[@#]/, "")].slice(0, 2).join("") || "?";
 const colorFor = (id = "") => colors[[...id].reduce((n, c) => n + c.charCodeAt(0), 0) % colors.length];
 const orbitNotifiedEvents = new Set();
+const orbitPendingEncryptedNotifications = new Map();
+const orbitNotificationBuckets = new Map();
+const ORBIT_NOTIFICATION_WINDOW = 2200;
 const orbitEmojiUploadCache = new Map();
 const orbitStickerUploadCache = new Map();
 const orbitEmojiPackPublishCache = new Map();
@@ -90,22 +94,80 @@ function isNotifiableMessage(event) {
 function notificationBody(event) {
   const content = event?.getClearContent?.() || event?.getContent?.() || {};
   if (event?.getType?.() === "m.sticker") return "发送了一个贴纸";
-  if (event?.getType?.() === "m.room.encrypted" && !event?.getClearContent?.()) {
-    const sender = event?.getSender?.() || "未知用户";
-    const member = event?.getRoomId?.() && window.orbitMatrixClient?.getRoom?.(event.getRoomId?.())?.getMember?.(sender);
-    // Encrypted events do not expose a readable body here. Keep the
-    // notification compact and show only the sender prefix; the old suffix
-    // (“收到加密消息，请打开房间查看”) duplicated a large red prompt in the
-    // toast and was not useful until the room was opened.
-    return `来自 ${member?.name || sender}`;
-  }
+  if (event?.getType?.() === "m.room.encrypted" && (event?.getClearType?.() === "m.room.encrypted" || !event?.getClearContent?.()?.body)) return "收到一条加密消息，打开房间查看";
   if (content.msgtype === "m.image") return "发送了一张图片";
   if (content.msgtype === "m.video") return "发送了一段视频";
   if (content.msgtype === "m.audio") return "发送了一段音频";
   if (content.msgtype === "m.sticker") return "发送了一个贴纸";
   if (content.msgtype === "m.file") return content.body ? `发送了文件：${content.body}` : "发送了一个文件";
   const plain = String(content.body || "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
-  return plain || "收到一条新消息";
+  return compactNotificationText(plain || "收到一条新消息");
+}
+
+function compactNotificationText(value, max = 96) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function hasDecryptedNotificationContent(event) {
+  if (event?.getType?.() !== "m.room.encrypted") return true;
+  const clear = event?.getClearContent?.();
+  return Boolean(clear?.body && event?.getClearType?.() !== "m.room.encrypted");
+}
+
+function notificationSenderName(event, room) {
+  const sender = event?.getSender?.() || "用户";
+  const member = room?.getMember?.(sender) || (event?.getRoomId?.() && window.orbitMatrixClient?.getRoom?.(event.getRoomId?.())?.getMember?.(sender));
+  return member?.name || member?.rawDisplayName || sender;
+}
+
+function markOrbitNotifiedEvent(eventId) {
+  orbitNotifiedEvents.add(eventId);
+  if (orbitNotifiedEvents.size > 500) orbitNotifiedEvents.delete(orbitNotifiedEvents.values().next().value);
+}
+
+function enqueueMessageNotification({ room, roomId, eventId, title, body, compact = false }) {
+  if (!roomId || !eventId) return;
+  const existing = orbitNotificationBuckets.get(roomId) || { title, count: 0, latestBody: body, latestEventId: eventId, timer: null };
+  existing.title = title || existing.title;
+  existing.count += 1;
+  existing.latestBody = compactNotificationText(body || existing.latestBody);
+  existing.compact = existing.compact || compact;
+  existing.latestEventId = eventId;
+  if (!existing.timer) {
+    existing.timer = setTimeout(() => {
+      orbitNotificationBuckets.delete(roomId);
+      const countLabel = existing.count > 1 ? `收到 ${existing.count} 条新消息，最后一条：` : "";
+      // Keep room routing metadata intact while constraining what is rendered
+      // in the toast/desktop notification. Long room names and message bodies
+      // should never make the notification span the entire viewport.
+      const displayTitle = compactNotificationText(existing.title || "Matrix 新消息", 32);
+      const text = existing.compact
+        ? `${displayTitle}：${existing.count} 条消息`
+        : `${displayTitle}：${countLabel}${compactNotificationText(existing.latestBody, 56)}`;
+      let desktopShown = false;
+      if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+        try {
+          new Notification(displayTitle, { body: existing.compact ? `${existing.count} 条消息` : (countLabel ? `${countLabel}${compactNotificationText(existing.latestBody, 56)}` : compactNotificationText(existing.latestBody, 56)), tag: `orbit-${roomId}`, renotify: true, data: { roomId, eventId: existing.latestEventId } });
+          desktopShown = true;
+        } catch {}
+      }
+      if (!desktopShown || !document.hidden) {
+        const key = `orbit-notification-${roomId}`;
+        if (antMessage?.open) antMessage.open({
+          key,
+          type: "info",
+          duration: existing.count > 1 ? 6 : 5,
+          content: h("button", { type: "button", className: "toast-notification-link", onClick: () => {
+            window.orbitNavigateToMessage?.(roomId, existing.latestEventId);
+            antMessage.destroy?.(key);
+          } }, text)
+        });
+        else Toast.info(text);
+      }
+    }, ORBIT_NOTIFICATION_WINDOW);
+    orbitNotificationBuckets.set(roomId, existing);
+  }
 }
 
 async function markRoomRead(client, roomId, event) {
@@ -319,14 +381,26 @@ async function publishRoomEmojiPack(client, room, item, mxc) {
 // nodes; it never re-identifies an emoji later by its display name.
 function createEmojiTextContent(text, resolvedEmoji, mentions = []) {
   let formattedBody = mentionHtml(text, mentions);
+  let fallbackBody = String(text || "");
   (resolvedEmoji || []).forEach(({ shortcode, mxc }) => {
     if (!mxc?.startsWith?.("mxc://")) return;
-    const token = `:${String(shortcode || "表情").replace(/^:+|:+$/g, "")}:`;
-    const pattern = new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
-    const safeShortcode = escapeEditorText(String(shortcode || "表情").replace(/^:+|:+$/g, ""));
-    formattedBody = formattedBody.replace(pattern, `<img data-mx-emoticon src="${escapeEditorText(mxc)}" alt="${safeShortcode}" title="${safeShortcode}" height="32" />`);
+    const bareName = String(shortcode || "表情").replace(/^:+|:+$/g, "");
+    const token = `:${bareName}:`;
+    const pattern = new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    const safeShortcode = escapeEditorText(bareName);
+    const imageHtml = `<img data-mx-emoticon src="${escapeEditorText(mxc)}" alt="${safeShortcode}" title="${safeShortcode}" height="32" />`;
+    const trailingBare = new RegExp(bareName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*$", "i");
+    formattedBody = pattern.test(formattedBody)
+      ? formattedBody.replace(pattern, imageHtml)
+      : (trailingBare.test(formattedBody) ? formattedBody.replace(trailingBare, imageHtml) : (formattedBody.trim() === bareName ? imageHtml : formattedBody));
+    // The HTML body carries the real image. Remove its trigger token from the
+    // plain fallback so clients do not show keyword plus emoji together.
+    fallbackBody = pattern.test(fallbackBody)
+      ? fallbackBody.replace(pattern, "")
+      : (trailingBare.test(fallbackBody) ? fallbackBody.replace(trailingBare, "") : (fallbackBody.trim() === bareName ? "" : fallbackBody));
   });
-  return { msgtype: "m.text", body: text, format: "org.matrix.custom.html", formatted_body: formattedBody };
+  fallbackBody = fallbackBody.replace(/[ \t]{2,}/g, " ").replace(/[ \t]+\n/g, "\n").replace(/\n[ \t]+/g, "\n").trim();
+  return { msgtype: "m.text", body: fallbackBody, format: "org.matrix.custom.html", formatted_body: formattedBody };
 }
 
 async function createStickerEventContent(client, room, item) {
@@ -423,7 +497,7 @@ function matrixHomeserverUrl(client) {
 }
 
 function mediaRequestCandidates(client, rawUrl, requestUrl) {
-  const candidates = [requestUrl];
+  const candidates = requestUrl ? [requestUrl] : [];
   if (rawUrl?.startsWith("mxc://")) {
     const [, server, mediaId] = rawUrl.match(/^mxc:\/\/([^/]+)\/(.+)$/) || [];
     const home = matrixHomeserverUrl(client);
@@ -438,6 +512,19 @@ function mediaRequestCandidates(client, rawUrl, requestUrl) {
     }
   }
   return candidates;
+}
+
+// matrix-js-sdk normally supplies mxcUrlToHttp(), but some homeserver/client
+// combinations return an empty or relative URL for the authenticated media
+// API. Build the current Matrix media endpoint ourselves as a last resort.
+// This is also useful for MSC3916 media where the legacy /_matrix/media/r0
+// route has been disabled by Synapse.
+function matrixDownloadFallbackUrl(client, rawUrl) {
+  const match = String(rawUrl || "").match(/^mxc:\/\/([^/]+)\/(.+)$/i);
+  if (!match) return "";
+  const home = matrixHomeserverUrl(client);
+  if (!/^https?:\/\//i.test(home)) return "";
+  return `${home.replace(/\/+$/, "")}/_matrix/client/v1/media/download/${encodeURIComponent(match[1])}/${encodeURIComponent(match[2])}`;
 }
 
 function assetRequestUrl(url) {
@@ -521,7 +608,11 @@ function useMatrixAsset(client, rawUrl, width = null, height = null, resizeMetho
     setAssetState({ key: cacheKey, src: null, url: null, failed: false });
     if (!rawUrl || !cacheKey) return () => {};
     const encrypted = Boolean(encryptedInfo?.key?.k && encryptedInfo?.iv);
-    const httpUrl = rawUrl.startsWith("mxc://") ? client?.mxcUrlToHttp?.(rawUrl, encrypted ? undefined : width, encrypted ? undefined : height, encrypted ? undefined : resizeMethod, false, true, true) : rawUrl;
+    let httpUrl = rawUrl.startsWith("mxc://") ? client?.mxcUrlToHttp?.(rawUrl, encrypted ? undefined : width, encrypted ? undefined : height, encrypted ? undefined : resizeMethod, false, true, true) : rawUrl;
+    // Older SDKs can return a relative URL. Relative media URLs point at the
+    // Orbit app rather than the homeserver and manifest as a generic 404.
+    // Prefer an explicit authenticated download URL in that case.
+    if (rawUrl.startsWith("mxc://") && !/^https?:\/\//i.test(String(httpUrl || ""))) httpUrl = matrixDownloadFallbackUrl(client, rawUrl);
     if (!httpUrl) {
       setAssetState({ key: cacheKey, src: null, url: null, failed: true });
       return () => {};
@@ -655,6 +746,34 @@ function InlineMatrixImage({ client, mxcUrl, alt, encryptedFile, onOpen }) {
   return h("img", { className: "inline-message-image", src: asset.src, alt, onClick: () => onOpen?.(asset.src, alt), onError: () => {} });
 }
 
+// Keep the timeline light: show the server thumbnail first and promote it to
+// the original only after the browser has decoded the full image.  This is
+// also used when the original is fetched through the authenticated proxy.
+function ProgressiveImage({ thumbSrc, src, alt, className = "", onClick, onRequestOriginal }) {
+  const [originalReady, setOriginalReady] = useState(false);
+  const [thumbFailed, setThumbFailed] = useState(false);
+  useEffect(() => {
+    setOriginalReady(false);
+    setThumbFailed(false);
+    if (!src || src === thumbSrc) return undefined;
+    const image = new Image();
+    image.onload = () => setOriginalReady(true);
+    image.onerror = () => setOriginalReady(false);
+    image.src = src;
+    return () => { image.onload = null; image.onerror = null; };
+  }, [src, thumbSrc]);
+  const displaySrc = originalReady && src ? src : (!thumbFailed && thumbSrc ? thumbSrc : src);
+  if (!displaySrc) return h("div", { className: `${className} media-image-placeholder`, role: "status" }, "正在加载图片…");
+  return h("img", {
+    className: `${className} ${originalReady ? "is-original" : "is-thumbnail"}`,
+    src: displaySrc,
+    alt,
+    loading: "lazy",
+    onError: () => { if (displaySrc === thumbSrc && src && src !== thumbSrc) { setThumbFailed(true); onRequestOriginal?.(); } },
+    onClick: () => { onRequestOriginal?.(); onClick?.(displaySrc); }
+  });
+}
+
 function MediaLightbox({ viewer, onClose }) {
   const [rotation, setRotation] = useState(0); const [scale, setScale] = useState(1); const [offset, setOffset] = useState({ x: 0, y: 0 }); const [dragging, setDragging] = useState(false); const dragRef = useRef(null);
   useEffect(() => { setRotation(0); setScale(1); setOffset({ x: 0, y: 0 }); }, [viewer?.src]);
@@ -700,10 +819,10 @@ function EmojiPicker({ onSelect, onInsert }) {
     h("button", { type: "button", className: `emoji-category ${pack === "all" ? "active" : ""}`, onClick: () => setPack("all") }, "全部", h("small", null, items.length)),
     packs.map(item => h("button", { type: "button", className: `emoji-category ${pack === item.id ? "active" : ""}`, key: item.id, title: item.description || item.name, onClick: () => setPack(item.id) }, h("span", null, item.name), h("small", null, item.itemCount || items.filter(entry => entry.packId === item.id).length)))
   );
-  const emojiGrid = loading ? h("div", { className: "emoji-loading" }, "正在加载表情…") : h("div", { className: "emoji-grid" }, shown.map(item => h("div", { className: "emoji-item-wrap", key: item.id, onMouseEnter: event => { const rect = event.currentTarget.getBoundingClientRect(); const previewWidth = 148; const previewHeight = 174; const gap = 10; const x = window.innerWidth - rect.right >= previewWidth + gap ? rect.right + gap : Math.max(8, rect.left - previewWidth - gap); const y = rect.top >= previewHeight + gap ? rect.top - previewHeight - gap : Math.min(window.innerHeight - previewHeight - 8, rect.bottom + gap); document.documentElement.style.setProperty("--orbit-picker-preview-x", `${x}px`); document.documentElement.style.setProperty("--orbit-picker-preview-y", `${y}px`); setHovered(item); }, onMouseLeave: () => setHovered(null) }, h("button", { type: "button", className: "emoji-item", title: mode === "emoji" ? `${item.name}：插入表情` : `${item.name}：发送贴纸`, onClick: () => mode === "emoji" ? onInsert?.(item) : onSelect?.(item) }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" })) )));
+  const emojiGrid = loading ? h("div", { className: "emoji-loading" }, "正在加载表情…") : h("div", { className: "emoji-grid" }, shown.map(item => h("div", { className: "emoji-item-wrap", key: item.id, onMouseEnter: event => { const rect = event.currentTarget.getBoundingClientRect(); const previewWidth = 148; const previewHeight = 174; const gap = 10; const x = window.innerWidth - rect.right >= previewWidth + gap ? rect.right + gap : Math.max(8, rect.left - previewWidth - gap); const y = rect.top >= previewHeight + gap ? rect.top - previewHeight - gap : Math.min(window.innerHeight - previewHeight - 8, rect.bottom + gap); document.documentElement.style.setProperty("--orbit-picker-preview-x", `${x}px`); document.documentElement.style.setProperty("--orbit-picker-preview-y", `${y}px`); setHovered(item); }, onMouseLeave: () => setHovered(null) }, h("button", { type: "button", className: "emoji-item", title: mode === "emoji" ? `${item.name}：插入表情` : `${item.name}：发送贴纸`, onClick: () => { setHovered(null); if (mode === "sticker") setQuery(""); (mode === "emoji" ? onInsert : onSelect)?.(item); } }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" })) )));
   const modeTabs = h("div", { className: "emoji-mode-tabs", role: "tablist" }, h("button", { type: "button", className: mode === "emoji" ? "active" : "", role: "tab", onClick: () => setMode("emoji") }, "表情", h("small", null, "插入文本")), h("button", { type: "button", className: mode === "sticker" ? "active" : "", role: "tab", onClick: () => setMode("sticker") }, "贴纸", h("small", null, "发送大图")));
   const hoverPreview = hovered ? createPortal(h("div", { className: "emoji-hover-preview", role: "tooltip" }, h("img", { src: assetRequestUrl(hovered.url || hovered.thumbUrl), alt: hovered.name }), h("strong", null, hovered.name)), document.body) : null;
-  const content = h(React.Fragment, null, h("div", { className: "emoji-popover" }, modeTabs, h(Input, { size: "small", value: query, onChange: setQuery, placeholder: mode === "emoji" ? "搜索表情名称" : "搜索贴纸名称" }), h("div", { className: "emoji-browser" }, categoryNav, h("section", { className: "emoji-category-content" }, h("div", { className: "emoji-category-title" }, pack === "all" ? (mode === "emoji" ? "全部表情" : "全部贴纸") : packs.find(item => item.id === pack)?.name || "表情"), emojiGrid))), hoverPreview);
+  const content = h(React.Fragment, null, h("div", { className: "emoji-popover", onMouseDown: event => event.stopPropagation() }, modeTabs, h(Input, { size: "small", autoFocus: true, value: query, onChange: setQuery, onMouseDown: event => event.stopPropagation(), placeholder: mode === "emoji" ? "搜索表情名称" : "搜索贴纸名称" }), h("div", { className: "emoji-browser" }, categoryNav, h("section", { className: "emoji-category-content" }, h("div", { className: "emoji-category-title" }, pack === "all" ? (mode === "emoji" ? "全部表情" : "全部贴纸") : packs.find(item => item.id === pack)?.name || "表情"), emojiGrid))), hoverPreview);
   return h(AntPopover, { trigger: "click", placement: "top", arrow: false, autoAdjustOverflow: true, getPopupContainer: node => node.closest?.(".composer-wrap") || document.body, content }, h("button", { type: "button", className: "tool-button composer-emoji-button", title: "表情包", "aria-label": "表情包" }, h(Icon, { name: "smile", size: 17 })));
 }
 
@@ -736,7 +855,8 @@ function readRichEditor(node) {
     // Browsers commonly represent pasted/newly-entered lines as DIV/P blocks
     // instead of BR elements. Preserve those block boundaries when sending.
     const block = ["DIV", "P", "LI"].includes(child.tagName);
-    return walk(child) + (block ? "\n" : "");
+    const nested = walk(child);
+    return nested + (block && !nested.endsWith("\n") ? "\n" : "");
   }).join("");
   return walk(node).replace(/\n+$/, "");
 }
@@ -1178,16 +1298,67 @@ function sanitizeFormattedBody(html) {
   // Cinny and other clients. Convert editor-only block wrappers to breaks,
   // then strip everything outside the interoperable tag set.
   return String(html || "")
+    // Older editor builds leaked a standalone K歌 shortcode next to the real
+    // image node. It was never user-authored and must not re-enter editing.
+    .replace(/:K歌:/gi, "")
+    .replace(/<br\b[^>]*class\s*=\s*(["'])[^"']*ProseMirror-trailingBreak[^"']*\1[^>]*>/gi, "")
     .replace(/<span\b[^>]*style\s*=\s*(["'])[^"']*\b(color|font-size)\s*:\s*([^;"']+)[^"']*\1[^>]*>/gi, (_match, quote, property, value) => `<span style="${property.toLowerCase()}:${String(value).trim()}">`)
     .replace(/<span\b(?![^>]*style\s*=)[^>]*>/gi, "<span>")
-    .replace(/<\s*\/\s*(p|div|tr)\s*>/gi, "<br>")
+    // Block wrappers from Tiptap and other Matrix clients become exactly one
+    // line break. Remove source indentation around the generated break so a
+    // harmless newline between HTML tags cannot turn into a blank chat line.
+    .replace(/<br\s*\/?>\s*<\s*\/\s*(p|div|tr)\s*>/gi, "</$1>")
+    .replace(/<\s*\/\s*(p|div|tr)\s*>\s*<\s*(p|div|tr)(?:\s[^>]*)?>/gi, "<br>")
+    .replace(/<\s*\/\s*(p|div|tr)\s*>/gi, "")
     .replace(/<\s*(p|div|tr)(?:\s[^>]*)?>/gi, "")
     .replace(/javascript:/gi, "")
     .replace(/\son\w+\s*=\s*(['"]).*?\1/gi, "")
     .replace(/<(?!\/?(?:strong|b|em|i|u|del|s|code|pre|blockquote|ul|ol|li|h[1-3]|span|img|br|a|font|small|big)\b)[^>]*>/gi, "")
     .replace(/\r\n?/g, "\n")
+    .replace(/\s*<br\s*\/?>\s*/gi, "<br>")
     .replace(/(?:<br>\s*)+$/i, "")
     .trim();
+}
+
+function hasMarkdownSyntax(text) {
+  const value = String(text || "");
+  return /(^|\n)\s{0,3}(?:#{1,3}\s|>\s|[-*+]\s|\d+\.\s|```)/.test(value)
+    || /(?:\*\*[^*]+\*\*|__[^_]+__|~~[^~]+~~|`[^`\n]+`|\[[^\]]+\]\(https?:\/\/[^)]+\))/.test(value);
+}
+
+function markdownInline(value) {
+  let html = escapeEditorText(String(value || ""));
+  html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2">$1</a>');
+  html = html.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  html = html.replace(/\*\*([^*\n]+)\*\*|__([^_\n]+)__/g, (_m, strongA, strongB) => `<strong>${strongA || strongB}</strong>`);
+  html = html.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+  html = html.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, (_m, prefix, content) => `${prefix}<em>${content}</em>`);
+  return html;
+}
+
+function markdownToHtml(text) {
+  const source = String(text || "").replace(/\r\n?/g, "\n");
+  if (!hasMarkdownSyntax(source)) return "";
+  const lines = source.split("\n");
+  const output = []; let inFence = false; let fenceLines = [];
+  const closeFence = () => { if (!inFence) return; output.push(`<pre><code>${escapeEditorText(fenceLines.join("\n"))}</code></pre>`); inFence = false; fenceLines = []; };
+  for (const line of lines) {
+    if (/^\s*```/.test(line)) { if (inFence) closeFence(); else inFence = true; continue; }
+    if (inFence) { fenceLines.push(line); continue; }
+    if (!line.trim()) { output.push("<br>"); continue; }
+    const heading = line.match(/^\s{0,3}(#{1,3})\s+(.+)$/);
+    if (heading) { output.push(`<h${heading[1].length}>${markdownInline(heading[2])}</h${heading[1].length}>`); continue; }
+    const quote = line.match(/^\s{0,3}>\s?(.*)$/);
+    if (quote) { output.push(`<blockquote>${markdownInline(quote[1])}</blockquote>`); continue; }
+    const bullet = line.match(/^\s{0,3}[-*+]\s+(.+)$/);
+    if (bullet) { output.push(`<ul><li>${markdownInline(bullet[1])}</li></ul>`); continue; }
+    const ordered = line.match(/^\s{0,3}\d+\.\s+(.+)$/);
+    if (ordered) { output.push(`<ol><li>${markdownInline(ordered[1])}</li></ol>`); continue; }
+    output.push(markdownInline(line));
+    output.push("<br>");
+  }
+  closeFence();
+  return sanitizeFormattedBody(output.join("").replace(/(?:<br>)+$/i, ""));
 }
 
 function mentionHtml(text, mentions = []) {
@@ -1238,11 +1409,17 @@ function eventToMessage(event, room, userId) {
   const emojiNames = [...String(cleanBody || "").matchAll(/:([^:\s]+):/g)].map(match => match[1]);
   const emojiFiles = content["org.orbit.emoji_files"] || (content.file && emojiNames.length ? Object.fromEntries(emojiNames.map(name => [name, content.file])) : null);
   if (emojiFiles && typeof emojiFiles === "object") window.orbitEncryptedEmojiFiles = { ...(window.orbitEncryptedEmojiFiles || {}), ...emojiFiles };
-  const formatted = content.format === "org.matrix.custom.html" && content.formatted_body ? sanitizeFormattedBody(reply ? stripReplyHtml(content.formatted_body) : content.formatted_body) : null;
+  const wireFormatted = content.format === "org.matrix.custom.html" && content.formatted_body ? sanitizeFormattedBody(reply ? stripReplyHtml(content.formatted_body) : content.formatted_body) : "";
+  // Matrix has no native Markdown field. For plain messages that contain
+  // common Markdown markers, render a safe local preview while keeping body
+  // as the interoperable source of truth for clients that ignore HTML.
+  const formatted = wireFormatted || (!content.formatted_body && hasMarkdownSyntax(cleanBody) ? markdownToHtml(cleanBody) : null);
   // A few clients send a formatted body without any block markers while the
   // plain Matrix body still contains the authoritative line breaks.  Prefer
   // that plain body in this case so copied multi-line messages stay readable.
-  const formattedHasBreaks = /<br\b/i.test(String(content.formatted_body || "")) || /<\/(?:p|div|li|h[1-6]|blockquote|pre)>/i.test(String(content.formatted_body || ""));
+  const formattedHasBreaks = /<br\b/i.test(String(formatted || content.formatted_body || "")) || /<\/(?:p|div|li|h[1-6]|blockquote|pre)>/i.test(String(formatted || content.formatted_body || ""));
+  const editorText = editorTextFromFormattedBody(formatted);
+  const emojiRefs = emojiRefsFromFormattedBody(formatted);
   const updatedMeta = content["org.orbit.updated"] || null;
   const updatedMember = updatedMeta?.user_id ? room.getMember?.(updatedMeta.user_id) : null;
   return {
@@ -1255,6 +1432,8 @@ function eventToMessage(event, room, userId) {
     color: colorFor(sender),
     time: event.getTs?.() ? new Date(event.getTs()).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) : "",
     text: formatMentions(cleanBody, room),
+    editorText,
+    emojiRefs,
     formattedBody: formatted && (!String(cleanBody || "").includes("\n") || formattedHasBreaks) ? formatted : null,
     emojiFiles: content["org.orbit.emoji_files"] || null,
     emojiItems: Array.isArray(content["org.orbit.emoji_items"]) ? content["org.orbit.emoji_items"] : null,
@@ -1301,7 +1480,29 @@ async function roomMessages(room, userId, client) {
     const message = eventToMessage(event, room, userId); if (message) byId.set(message.id, message);
   });
   const members = room?.getJoinedMembers?.() || [];
-  byId.forEach((message, id) => { if (redacted.has(id)) { byId.delete(id); return; } if (edits.has(id)) { message.text = edits.get(id); message.edited = true; } const reactionCounts = {}; (reactions.get(id) || []).forEach(reaction => { if (!reaction.id || redacted.has(reaction.id)) return; reactionCounts[reaction.key] = (reactionCounts[reaction.key] || 0) + 1; }); message.reactions = reactionCounts; const reply = message.replyTo ? byId.get(message.replyTo) : null; if (reply) { message.replyPreview = reply.text; message.replyAuthor = reply.author; message.replyAvatarMxc = reply.avatarMxc; message.replyIsMe = reply.handle === userId; } const thread = message.threadRoot ? byId.get(message.threadRoot) : null; if (thread) { message.threadPreview = thread.text || thread.attachment?.name || "消息"; message.threadAuthor = thread.author; message.threadAvatarMxc = thread.avatarMxc; } });
+  byId.forEach((message, id) => {
+    if (redacted.has(id)) { byId.delete(id); return; }
+    const replacement = replacements.get(id);
+    if (replacement) {
+      // Replace every rendered field, not only `text`. Otherwise an older
+      // formatted_body can continue to win in the renderer after an edit.
+      const nextBody = replacement.body || edits.get(id) || "";
+      message.text = formatMentions(nextBody, room);
+      message.edited = true;
+      message.formattedBody = replacement.format === "org.matrix.custom.html" && replacement.formatted_body
+        ? sanitizeFormattedBody(replacement.formatted_body)
+        : null;
+      message.editorText = editorTextFromFormattedBody(message.formattedBody);
+      message.emojiRefs = emojiRefsFromFormattedBody(message.formattedBody);
+    }
+    const reactionCounts = {};
+    (reactions.get(id) || []).forEach(reaction => { if (!reaction.id || redacted.has(reaction.id)) return; reactionCounts[reaction.key] = (reactionCounts[reaction.key] || 0) + 1; });
+    message.reactions = reactionCounts;
+    const reply = message.replyTo ? byId.get(message.replyTo) : null;
+    if (reply) { message.replyPreview = reply.text; message.replyAuthor = reply.author; message.replyAvatarMxc = reply.avatarMxc; message.replyIsMe = reply.handle === userId; }
+    const thread = message.threadRoot ? byId.get(message.threadRoot) : null;
+    if (thread) { message.threadPreview = thread.text || thread.attachment?.name || "消息"; message.threadAuthor = thread.author; message.threadAvatarMxc = thread.avatarMxc; }
+  });
   replacements.forEach((replacement, id) => { const message = byId.get(id); if (!message || !replacement) return; if (message.attachment && ["m.image", "m.file", "m.video", "m.audio"].includes(replacement.msgtype)) { message.attachment = { ...message.attachment, name: replacement.body || message.attachment.name, url: replacement.url || replacement.file?.url || message.attachment.url, file: replacement.file || message.attachment.file, info: replacement.info || message.attachment.info, type: replacement.msgtype }; } });
   updates.forEach((updated, id) => { const message = byId.get(id); if (!message) return; message.updatedAt = Number(updated.ts) || 0; const member = room.getMember?.(updated.user_id); message.updatedBy = member?.name || updated.user_id || null; });
   // A receipt is a moving marker, not a badge that belongs on every message.
@@ -1454,7 +1655,7 @@ function LegacyAccountDialog({ client, onClose, onBack, cryptoState, onRestore }
         h("div", { className: "security-status-card" }, h("span", null, "密钥状态"), h("strong", { className: cryptoState?.keyRestored || backup ? "status-ok" : "status-pending" }, cryptoState?.keyRestored ? "已恢复" : backup ? "服务器备份可用" : "未发现备份"))
       ),
       h("label", { className: "form-label" }, "恢复密钥", h(TextArea, { value: recoveryKey, onChange: e => setRecoveryKey(e.target.value), autoSize: { minRows: 2, maxRows: 4 }, placeholder: "粘贴 Matrix 恢复密钥（推荐）" })),
-      h(UiButton, { variant: "primary", className: "primary-btn full-btn", disabled: !cryptoState.available || cryptoState.restoring || !recoveryKey.trim() || !backup?.version, onClick: () => { try { const key = decodeRecoveryKey(recoveryKey.trim()); onRestore({ type: "key", key, version: backup.version }); setRecoveryKey(""); } catch { Toast.error("恢复密钥格式无效，请粘贴完整的 Matrix 恢复密钥"); } } }, cryptoState.restoring ? `恢复中 ${cryptoState.restoreProgress || 0}%…` : "使用恢复密钥解密历史"),
+      h(UiButton, { variant: "primary", className: "primary-btn full-btn", disabled: !cryptoState.available || cryptoState.restoring || !recoveryKey.trim() || !backup?.version, onClick: () => { try { const key = decodeRecoveryKey(recoveryKey.trim()); onRestore({ type: "key", key, version: backup.version }); setRecoveryKey(""); } catch { Toast.error("恢复密钥格式无效，请粘贴完整的 Matrix 恢复密钥"); } } }, cryptoState.restoring ? (cryptoState.restoreStage === "fetch" ? `正在下载服务器备份（${backup?.count || "大量"} 个会话）…` : cryptoState.restoreStage === "prepare" ? "正在准备解密…" : `恢复中 ${cryptoState.restoreProgress || 0}%…`) : "使用恢复密钥解密历史"),
       h("label", { className: "form-label" }, "备份密码短语（兼容方式）", h(Input, { type: "password", value: passphrase, onChange: setPassphrase, placeholder: "如果你的备份使用密码短语" })),
       h(UiButton, { className: "ghost-btn full-btn", disabled: !cryptoState.available || cryptoState.restoring || !backup?.version, onClick: () => onRestore({ type: "secret", version: backup.version }) }, cryptoState?.keyRestored ? "再次解密历史消息" : "从密钥存储恢复"),
       h(UiButton, { className: "ghost-btn full-btn", disabled: !cryptoState.available || cryptoState.restoring || !passphrase.trim() || !backup?.version, onClick: () => { onRestore({ type: "passphrase", passphrase: passphrase.trim(), version: backup.version }); setPassphrase(""); } }, "使用密码短语恢复"),
@@ -1601,12 +1802,136 @@ function SpaceRoomsDialog({ client, space, rooms, onClose, onChanged }) {
 }
 
 function ReactionPicker({ client, onSelect }) {
-  const [items, setItems] = useState([]); const [packs, setPacks] = useState([]); const [pack, setPack] = useState("all"); const [open, setOpen] = useState(false); const [custom, setCustom] = useState("");
+  const [items, setItems] = useState([]); const [packs, setPacks] = useState([]); const [pack, setPack] = useState("all"); const [open, setOpen] = useState(false); const [custom, setCustom] = useState(""); const [popupStyle, setPopupStyle] = useState(null);
   useEffect(() => { if (!open || items.length) return; ensureEmojiCatalog().then(next => { setItems(next); setPacks(window.orbitEmojiPacks || []); }).catch(() => {}); }, [open]);
+  useEffect(() => {
+    if (!open) return undefined;
+    const close = event => { if (!event.target?.closest?.(".reaction-picker, .message-action-reaction")) setOpen(false); };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [open]);
   const shown = items.filter(item => pack === "all" || item.packId === pack).slice(0, 240);
   const submitCustom = () => { const value = custom.trim(); if (!value) return; onSelect(value); setCustom(""); setOpen(false); };
   const content = h("div", { className: "reaction-picker" }, h("div", { className: "reaction-picker-title" }, "选择回应"), h("div", { className: "reaction-custom" }, h(Input, { size: "small", value: custom, onChange: setCustom, placeholder: "输入文字回应" }), h(UiButton, { size: "small", variant: "primary", disabled: !custom.trim(), onClick: submitCustom }, "回应")), h("div", { className: "emoji-packs reaction-packs" }, h("button", { type: "button", className: `emoji-pack ${pack === "all" ? "active" : ""}`, onClick: () => setPack("all") }, "全部"), packs.map(item => h("button", { type: "button", className: `emoji-pack ${pack === item.id ? "active" : ""}`, key: item.id, onClick: () => setPack(item.id) }, item.name))), items.length > 0 && h("div", { className: "reaction-sticker-grid" }, shown.map(item => h("button", { type: "button", key: item.id, title: `回应：${item.name}`, onClick: () => { onSelect(`:${item.name}:`); setOpen(false); } }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" })))));
-  return h(AntPopover, { trigger: "click", open, onOpenChange: setOpen, placement: "topLeft", content }, h("button", { type: "button", className: "message-action-reaction", title: "选择回应" }, "😊"));
+   const faceIcon = h("svg", { viewBox: "0 0 24 24", "aria-hidden": "true", focusable: "false" },
+     h("circle", { cx: "12", cy: "12", r: "8.5" }),
+     h("circle", { cx: "9", cy: "10", r: "0.8", fill: "currentColor", stroke: "none" }),
+     h("circle", { cx: "15", cy: "10", r: "0.8", fill: "currentColor", stroke: "none" }),
+     h("path", { d: "M8.5 14c.9 1.2 2.1 1.8 3.5 1.8s2.6-.6 3.5-1.8" })
+   );
+   const toggle = event => {
+     event.stopPropagation();
+     const rect = event.currentTarget.getBoundingClientRect();
+     const width = 300;
+     const height = 350;
+     const gap = 8;
+     const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+     const below = rect.bottom + gap;
+     const top = below + height <= window.innerHeight - 8
+       ? below
+       : Math.max(8, rect.top - height - gap);
+     setPopupStyle({ left: `${left}px`, top: `${top}px` });
+     setOpen(value => !value);
+   };
+   return h(React.Fragment, null,
+     h("button", { type: "button", className: "message-action-reaction", title: "选择回应", "aria-label": "选择回应", onClick: toggle }, faceIcon),
+     open && createPortal(h("div", { className: "reaction-picker reaction-picker-floating", style: popupStyle, onMouseDown: event => event.stopPropagation() }, content), document.body)
+   );
+}
+
+function normalizeComposerText(value, html) {
+  const text = String(value || "");
+  if (!html || typeof DOMParser === "undefined") return text;
+  // The editor's plain text is authoritative for line boundaries. In
+  // particular, do not reconstruct breaks from <p> wrappers: TipTap can
+  // leave adjacent paragraph nodes after an in-line deletion even though the
+  // user never pressed Enter. Explicit user line breaks are already present
+  // in `text` and are preserved unchanged.
+  if (!text.includes("\n")) return text;
+  return text;
+  // Some contenteditable engines expose adjacent paragraphs as one plain
+  // string while the HTML still contains the real line boundaries. Recover
+  // those boundaries before the Matrix event is created.
+  if (!/<\/(?:p|div|li|h[1-6]|blockquote|pre)>/i.test(String(html))) return text;
+  try {
+    const doc = new DOMParser().parseFromString(String(html), "text/html");
+    const blockTags = new Set(["P", "DIV", "LI", "H1", "H2", "H3", "H4", "H5", "H6", "BLOCKQUOTE", "PRE"]);
+    const walk = node => [...node.childNodes].map(child => {
+      if (child.nodeType === Node.TEXT_NODE) return child.nodeValue || "";
+      if (child.nodeType !== Node.ELEMENT_NODE) return "";
+      if (child.tagName === "BR") return "\n";
+      const nested = walk(child);
+      return nested + (blockTags.has(child.tagName) && !nested.endsWith("\n") ? "\n" : "");
+    }).join("");
+    const recovered = walk(doc.body).replace(/\n+$/, "");
+    return recovered || text;
+  } catch {
+    return text;
+  }
+}
+
+// Rebuild the editor's token representation from Matrix HTML. Matrix clients
+// intentionally omit custom emoji from the plain `body` fallback, so editing
+// an emoji message must read the emoticon image back from `formatted_body`.
+function editorTextFromFormattedBody(html) {
+  if (!html || typeof DOMParser === "undefined" || !/<img\b/i.test(String(html))) return null;
+  try {
+    const doc = new DOMParser().parseFromString(String(html), "text/html");
+    let foundEmoji = false;
+    const blockTags = new Set(["P", "DIV", "LI", "H1", "H2", "H3", "H4", "H5", "H6", "BLOCKQUOTE", "PRE"]);
+    const walk = node => [...node.childNodes].map(child => {
+      if (child.nodeType === Node.TEXT_NODE) return child.nodeValue || "";
+      if (child.nodeType !== Node.ELEMENT_NODE) return "";
+      const element = child;
+      if (element.tagName === "BR") return "\n";
+      if (element.tagName === "IMG" && (element.hasAttribute("data-mx-emoticon") || element.hasAttribute("data-emoji-token"))) {
+        const alt = String(element.getAttribute("alt") || element.getAttribute("title") || "表情").replace(/^:+|:+$/g, "").trim() || "表情";
+        foundEmoji = true;
+        return `:${alt}:`;
+      }
+      // Some clients wrap the image with a span and repeat its label as text.
+      // Treat the image as the authoritative editor token and skip that label.
+      const nestedImage = element.querySelector?.("img[data-mx-emoticon], img[data-emoji-token]");
+      if (nestedImage) {
+        const alt = String(nestedImage.getAttribute("alt") || nestedImage.getAttribute("title") || "表情").replace(/^:+|:+$/g, "").trim() || "表情";
+        foundEmoji = true;
+        return `:${alt}:` + (blockTags.has(element.tagName) ? "\n" : "");
+      }
+      const nested = walk(element);
+      return nested + (blockTags.has(element.tagName) && !nested.endsWith("\n") ? "\n" : "");
+    }).join("");
+    const result = walk(doc.body).replace(/\n+$/, "");
+    return foundEmoji ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+function emojiRefsFromFormattedBody(html) {
+  if (!html || typeof DOMParser === "undefined") return [];
+  try {
+    const doc = new DOMParser().parseFromString(String(html), "text/html");
+    return [...doc.querySelectorAll("img[data-mx-emoticon], img[data-emoji-token]")].map(image => {
+      const shortcode = String(image.getAttribute("alt") || image.getAttribute("title") || "表情").replace(/^:+|:+$/g, "").trim();
+      const mxc = String(image.getAttribute("src") || "");
+      return shortcode && mxc.startsWith("mxc://") ? { shortcode, mxc } : null;
+    }).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function emojiRefsFromEditorHtml(html) {
+  if (!html || typeof DOMParser === "undefined") return [];
+  try {
+    const doc = new DOMParser().parseFromString(String(html), "text/html");
+    return [...doc.querySelectorAll("[data-emoji-token]")].map(node => {
+      const token = String(node.getAttribute("data-emoji-token") || "");
+      const shortcode = token.replace(/^:+|:+$/g, "").trim();
+      const mxc = String(node.getAttribute("data-mxc") || "");
+      return shortcode && mxc.startsWith("mxc://") ? { shortcode, mxc } : null;
+    }).filter(Boolean);
+  } catch { return []; }
 }
 
 function ReadReceipt({ readBy = [], client }) {
@@ -1743,7 +2068,7 @@ function EmojiRowMedia({ items = [], client, onOpen, fallback }) {
   }));
 }
 
-function VideoMessagePlayer({ src, className = "", label = "视频文件", size = 0 }) {
+function VideoMessagePlayer({ src, poster, className = "", label = "视频文件", size = 0 }) {
   const ref = useRef(null);
   const [playing, setPlaying] = useState(false);
   const [duration, setDuration] = useState(0);
@@ -1767,18 +2092,18 @@ function VideoMessagePlayer({ src, className = "", label = "视频文件", size 
   const changeRate = event => { const next = Number(event.target.value) || 1; setRate(next); if (ref.current) ref.current.playbackRate = next; };
   const toggleFullscreen = async event => { event.stopPropagation(); const host = ref.current?.closest?.(".media-player-video"); try { if (document.fullscreenElement) await document.exitFullscreen?.(); else if (host?.requestFullscreen) await host.requestFullscreen(); else await ref.current?.webkitEnterFullscreen?.(); } catch {} };
   return h("div", { className: `media-player media-player-video ${className} ${playing ? "is-playing" : ""} ${error ? "has-error" : ""}` },
-    h("video", { ref, className: "media-native", src, preload: "metadata", playsInline: true, onClick: toggle, "aria-label": label }),
+    h("video", { ref, className: "media-native", src, poster: poster || undefined, preload: "none", playsInline: true, onClick: toggle, "aria-label": label }),
     h("input", { className: "video-progress", type: "range", min: 0, max: duration || 0, step: 0.1, value: Math.min(currentTime, duration || 0), onChange: seek, onClick: event => event.stopPropagation(), style: { "--video-progress": `${progress}%` }, "aria-label": "视频进度" }),
     h("button", { type: "button", className: "video-center-play", onClick: toggle, disabled: error, "aria-label": playing ? "暂停视频" : "播放视频" }, h(Icon, { name: playing ? "pause" : "play", size: 25 })),
     h("div", { className: "video-top-controls" }, h("select", { className: "video-rate", value: rate, onChange: event => { event.stopPropagation(); changeRate(event); }, onClick: event => event.stopPropagation(), "aria-label": "播放速度" }, [0.75, 1, 1.25, 1.5, 2].map(value => h("option", { key: value, value }, `${value}×`))), h("button", { type: "button", className: "video-fullscreen", onClick: toggleFullscreen, "aria-label": fullscreen ? "退出全屏" : "全屏", title: fullscreen ? "退出全屏" : "全屏" }, h(Icon, { name: fullscreen ? "fullscreen" : "fullscreen", size: 16 }))),
     h("div", { className: "media-video-meta", "aria-hidden": "true" }, h("span", { className: "media-file-label", title: label }, label), size > 0 && h("span", { className: "media-file-size" }, formatFileSize(size))),
-    error && h("div", { className: "media-player-error", role: "status" }, "媒体加载失败，请重试或下载原文件")
+    error && h("div", { className: "media-player-error", role: "status" }, "媒体加载失败", h("button", { type: "button", className: "media-retry-button", onClick: event => { event.stopPropagation(); setError(false); try { ref.current?.load?.(); } catch {} } }, "重试"))
   );
 }
 
-function MediaPlayer({ src, type = "video", className = "", label = "媒体文件", size = 0 }) {
+function MediaPlayer({ src, poster, type = "video", className = "", label = "媒体文件", size = 0 }) {
   if (type === "audio") return h(AudioMessagePlayer, { src, className, label });
-  if (type === "video") return h(VideoMessagePlayer, { src, className, label, size });
+  if (type === "video") return h(VideoMessagePlayer, { src, poster, className, label, size });
   const ref = useRef(null);
   const playerRef = useRef(null);
   const [playing, setPlaying] = useState(false);
@@ -1996,11 +2321,28 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
     const edit = find("编辑"); const redact = find("撤回");
     buttons.find(button => String(button.textContent || "").includes("查看回应详情"))?.remove();
     const rename = (button, text, action) => { if (!button) return; button.textContent = text; button.dataset.action = action; };
-    rename(copy, "复制", "copy"); rename(edit, "编辑", "edit"); rename(forward, "转发", "forward"); rename(thread, "子消息", "thread"); rename(quote, "引用", "quote"); rename(pin, /取消/.test(pin?.textContent || "") ? "取消置顶" : "置顶", "pin"); rename(redact, "撤回", "redact");
+    rename(copy, "复制", "copy"); rename(edit, "编辑", "edit"); rename(forward, "转发", "forward"); rename(thread, "子消息", "thread"); rename(quote, "回复", "quote"); rename(pin, /取消/.test(pin?.textContent || "") ? "取消置顶" : "置顶", "pin"); rename(redact, "撤回", "redact");
     const multi = document.createElement("button"); multi.type = "button"; multi.textContent = "多选"; multi.dataset.action = "select";
       multi.addEventListener("click", event => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("orbit:start-message-selecting")); setContextMenu(null); });
-    menu.append(...[copy, edit, forward, thread, multi, quote, pin, redact].filter(Boolean));
-    const paths = { copy: "M9 9h11v11H9zM5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1", edit: "M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z", forward: "M14 5l7 7-7 7M21 12H3", thread: "M4 6h16M4 12h11M4 18h7", select: "M12 3a9 9 0 1 0 9 9M8 12l2.5 2.5L16 9", quote: "M7 17H4a2 2 0 0 1-2-2v-3a4 4 0 0 1 4-4h1v4H5M19 17h-3a2 2 0 0 1-2-2v-3a4 4 0 0 1 4-4h1v4h-2", pin: "M9 3h6l-1 6 4 3v2h-5v7h-2v-7H6v-2l4-3z", redact: "M6 7h12M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v6m4-6v6" };
+    // Keep the context actions in the same order as the product menu:
+    // copy, edit, forward, reply, multi-select, child messages, pin, redact.
+    menu.append(...[copy, edit, forward, quote, multi, thread, pin, redact].filter(Boolean));
+    // Use the light, single-stroke glyphs from the reference menu.  These are
+    // deliberately inline SVGs so they stay crisp at every display scale and
+    // do not depend on an icon font being installed on the host machine.
+    const paths = {
+      copy: "M8 8h11v11H8zM5 16H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v1",
+      edit: "M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z",
+      // Curved send/forward arrow (the same silhouette used by the reference).
+      forward: "M4 17c0-5 3-8 8-8h5m-4-4 4 4-4 4",
+      // Speech bubble with two text strokes for a reply action.
+      quote: "M12 3a9 9 0 1 0 9 9 9 9 0 0 0-9-9ZM7 10h10M7 14h6",
+      thread: "M4 6h16M4 12h11M4 18h7",
+      // A compact list/check glyph reads as multi-select at 16–18 px.
+      select: "M4 6h2M4 12h2M4 18h2M9 6h11M9 12h8M9 18h6",
+      pin: "M9 3h6l-1 6 4 3v2h-5v7h-2v-7H6v-2l4-3z",
+      redact: "M6 7h12M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v6m4-6v6"
+    };
     [...menu.querySelectorAll(":scope > button[data-action]")].forEach(button => { const d = paths[button.dataset.action]; if (!d) return; const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg"); svg.classList.add("context-menu-icon"); svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("aria-hidden", "true"); const path = document.createElementNS("http://www.w3.org/2000/svg", "path"); path.setAttribute("d", d); svg.append(path); button.prepend(svg); });
     if (!row.querySelector(".message-context-reactions")) {
       const bar = document.createElement("div"); bar.className = "message-context-reactions"; ["👍", "😂", "❤️", "😮", "😢", "👏"].forEach(key => { const button = document.createElement("button"); button.type = "button"; button.textContent = key; button.title = `回应：${key}`; button.addEventListener("click", event => { event.stopPropagation(); onReact?.(item, key); setContextMenu(null); }); bar.append(button); });
@@ -2040,20 +2382,22 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
     const row = document.getElementById(`event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`);
     const actions = row?.querySelector(".message-actions");
     if (!actions) return;
-    actions.style.setProperty("display", "none", "important");
-    let forward = actions.querySelector(".message-forward-action");
-    if (!forward && onForward) {
-      forward = document.createElement("button"); forward.type = "button"; forward.className = "message-forward-action"; forward.title = "转发"; forward.setAttribute("aria-label", "转发");
-      forward.addEventListener("click", event => { event.stopPropagation(); onForward(item, false); });
-    }
+    // Keep the toolbar in the DOM and let the stylesheet reveal it on hover
+    // or keyboard focus.  An inline `display:none !important` here prevents
+    // the hover toolbar from ever becoming visible (and also makes the
+    // controls inaccessible to keyboard users).
+    actions.style.removeProperty("display");
     const allButtons = [...actions.querySelectorAll("button")];
     const byText = value => allButtons.find(button => String(button.textContent || "").trim() === value);
-    const reaction = actions.querySelector(".message-action-reaction") || allButtons.find(button => /😊|☺/.test(button.textContent || ""));
+    const reactionButton = actions.querySelector(".message-action-reaction") || allButtons.find(button => /😊|☺/.test(button.textContent || ""));
+    // ReactionPicker now owns a plain button. Keep that button as a direct
+    // child of the toolbar; wrapper based selectors can make the face escape
+    // the pill when React reconciles the action list.
     const reply = actions.querySelector(".message-reply-action") || byText("回复");
     const thread = actions.querySelector(".message-thread-action") || byText("线程");
     const edit = actions.querySelector(".message-edit-action") || byText("编辑");
     const redact = actions.querySelector(".message-redact-action") || byText("撤回");
-    reaction?.classList.add("message-reaction-action"); reaction && (reaction.title = "选择回应");
+    reactionButton?.classList.add("message-reaction-action"); reactionButton && (reactionButton.title = "选择回应");
     reply?.classList.add("message-reply-action"); reply && (reply.title = "回复");
     thread?.classList.add("message-thread-action"); thread && (thread.title = "在线程中回复");
     edit?.classList.add("message-edit-action"); edit && (edit.title = "编辑");
@@ -2061,11 +2405,11 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
     const iconPaths = {
       // Forward: clean right-pointing arrow.
       forward: "M4 12h16M14 7l5 5-5 5",
-      // Reply: line turns downward before the arrowhead.
-      reply: "M4 7v6a5 5 0 0 0 5 5h7m-4-4 4 4-4 4",
+       // Reply: compact outlined chat bubble, matching the hover affordance.
+       reply: "M6 5h12a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H11l-5 4v-4H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2ZM8 9h8M8 12h5",
       thread: "M5 4.5h14A1.5 1.5 0 0 1 20.5 6v10A1.5 1.5 0 0 1 19 17.5H12l-4 3v-3H5A1.5 1.5 0 0 1 3.5 16V6A1.5 1.5 0 0 1 5 4.5ZM12 8v6M9 11h6",
       edit: "M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z",
-      more: "M12 5v.01M12 12v.01M12 19v.01",
+       more: "M5 12h.01M12 12h.01M19 12h.01",
     };
     const applyIcon = (button, name) => {
       if (!button || !iconPaths[name]) return;
@@ -2076,8 +2420,12 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
       const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
       path.setAttribute("d", iconPaths[name]); svg.appendChild(path); button.appendChild(svg);
     };
-    applyIcon(forward, "forward"); applyIcon(reply, "reply"); applyIcon(thread, "thread"); applyIcon(edit, "edit");
-    [reaction, forward, reply, thread].filter(Boolean).forEach(button => actions.appendChild(button));
+    applyIcon(reply, "reply"); applyIcon(thread, "thread"); applyIcon(edit, "edit");
+    // DingTalk-style order: reaction, reply, more. Forwarding remains in the
+    // context menu opened by the more button, matching the requested flow.
+    // The reaction button is already the first JSX child. Only append the
+    // secondary controls so React keeps one stable three-button toolbar.
+    [reply, thread].filter(Boolean).forEach(button => actions.appendChild(button));
     if (redact) redact.style.display = "none";
     let more = actions.querySelector(".message-more-action");
     if (!more) {
@@ -2096,27 +2444,42 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
     return () => { more?.remove(); if (redact) redact.style.display = ""; };
   }, [item.id, item.isMe, onForward]);
   const rawUrl = item.attachment?.url || item.attachment?.file?.url;
-  // Use the original download endpoint for message media. Thumbnail endpoints
-  // can crop large images and make videos appear truncated.
-  const asset = useMatrixAsset(client, rawUrl, undefined, undefined, undefined, item.attachment?.file || null);
+  const attachmentInfo = item.attachment?.info || {};
+  const thumbnailFile = attachmentInfo.thumbnail_file || item.attachment?.file?.thumbnail_file || null;
+  const thumbnailRawUrl = attachmentInfo.thumbnail_url || thumbnailFile?.url || (item.attachment?.type === "m.image" && rawUrl?.startsWith("mxc://") && !item.attachment?.file?.key ? client?.mxcUrlToHttp?.(rawUrl, 800, 600, "scale", false, true, true) : null);
+  const [imageOriginalRequested, setImageOriginalRequested] = useState(false);
+  useEffect(() => setImageOriginalRequested(false), [rawUrl, item.attachment?.type]);
+  const deferImageOriginal = item.attachment?.type === "m.image" && Boolean(thumbnailRawUrl) && !imageOriginalRequested;
+  const deferVideoOriginal = item.attachment?.type === "m.video" && Boolean(rawUrl) && !item.attachment?.file?.key;
+  const asset = useMatrixAsset(client, (deferImageOriginal || deferVideoOriginal) ? null : rawUrl, undefined, undefined, undefined, item.attachment?.file || null);
+  const thumbnailAsset = useMatrixAsset(client, thumbnailRawUrl, 800, 600, "scale", thumbnailFile || null);
+  useEffect(() => {
+    if (item.attachment?.type !== "m.image" || !thumbnailAsset.src || imageOriginalRequested) return undefined;
+    const timer = setTimeout(() => setImageOriginalRequested(true), 80);
+    return () => clearTimeout(timer);
+  }, [item.attachment?.type, thumbnailAsset.src, imageOriginalRequested]);
   if (item.type === "empty") return h("div", { className: "empty-messages" }, "☁", h("div", null, item.label));
-  const fileUrl = asset.src;
-  const openImageViewer = () => {
+  const directVideoUrl = deferVideoOriginal ? mediaRequestUrl(client, client?.mxcUrlToHttp?.(rawUrl, undefined, undefined, undefined, false, true, true) || matrixDownloadFallbackUrl(client, rawUrl)) : null;
+  const fileUrl = directVideoUrl || asset.src;
+  const thumbUrl = thumbnailAsset.src;
+  const resolvedAssetUrl = asset.url || (rawUrl ? mediaRequestUrl(client, rawUrl) : null);
+  const openImageViewer = clickedSrc => {
     const gallery = [...document.querySelectorAll(".message-scroll .message-image")].map(image => ({ src: image.currentSrc || image.src, alt: image.alt || "图片" })).filter(image => image.src);
-    const index = Math.max(0, gallery.findIndex(image => image.src === fileUrl));
-    setViewer({ src: fileUrl, alt: item.attachment?.name || "图片", gallery, index, onNavigate: (next, nextIndex) => setViewer(current => ({ ...current, src: next.src, alt: next.alt, index: nextIndex })) });
+    const target = fileUrl || clickedSrc || thumbUrl;
+    const index = Math.max(0, gallery.findIndex(image => image.src === target));
+    setViewer({ src: target, alt: item.attachment?.name || "图片", gallery, index, onNavigate: (next, nextIndex) => setViewer(current => ({ ...current, src: next.src, alt: next.alt, index: nextIndex })) });
   };
   const emojiRow = item.emojiItems?.length && fileUrl ? h(EmojiRowMedia, { items: item.emojiItems, client, fallback: fileUrl, onOpen: (src, alt) => setViewer({ src, alt }) }) : null;
   const reactions = Object.entries(item.reactions || {});
-  const imageMedia = item.attachment?.type === "m.image" && fileUrl ? h("div", { className: "message-image-card" },
-    h("img", { className: `message-image ${item.attachment.emoji ? "message-emoji-image" : ""} ${item.attachment.sticker ? "message-sticker" : ""}`, src: fileUrl, alt: item.attachment.name || "图片", loading: "lazy", onClick: openImageViewer }),
+  const imageMedia = item.attachment?.type === "m.image" && (fileUrl || thumbUrl) ? h("div", { className: "message-image-card" },
+    h(ProgressiveImage, { className: `message-image ${item.attachment.emoji ? "message-emoji-image" : ""} ${item.attachment.sticker ? "message-sticker" : ""}`, thumbSrc: thumbUrl, src: fileUrl, alt: item.attachment.name || "图片", onRequestOriginal: () => setImageOriginalRequested(true), onClick: openImageViewer }),
     !item.attachment.emoji && !item.attachment.sticker && h("div", { className: "message-image-overlay", "aria-hidden": "true" },
       h("span", { className: "message-image-name", title: item.attachment.name || "图片" }, shortenAttachmentName(item.attachment.name || "图片", 26)),
       h("span", { className: "message-image-meta" }, formatAttachmentSize(item.attachment.info?.size || item.attachment.file?.size) || "图片", h("i", null, item.isMe ? "已发送" : "已接收"))
     )
   ) : null;
-  const media = item.attachment && fileUrl && (imageMedia || item.attachment.type === "m.video" ? imageMedia || h(MediaPlayer, { type: "video", className: "message-video", src: fileUrl, label: item.attachment.name || "视频", size: item.attachment.info?.size || item.attachment.file?.size || 0 }) : item.attachment.type === "m.audio" ? h(MediaPlayer, { type: "audio", className: "message-audio", src: fileUrl, label: item.attachment.name || "音频" }) : null);
-  const fetchAttachmentBlob = async () => { if (!asset.url) throw new Error("附件地址不可用"); const token = client?.getAccessToken?.(); const candidates = mediaRequestCandidates(client, rawUrl, asset.url); let lastError = null; for (const candidate of candidates) { try { const response = await fetch(candidate, { cache: "no-store", headers: token ? { Authorization: `Bearer ${token}` } : undefined }); if (response.ok) { const encryptedBuffer = await response.arrayBuffer(); const plainBuffer = await decryptMatrixBuffer(encryptedBuffer, item.attachment?.file); const blob = new Blob([plainBuffer], { type: item.attachment?.file?.mimetype || item.attachment?.info?.mimetype || response.headers.get("content-type") || "application/octet-stream" }); if (blob.size > 0) return blob; } lastError = new Error(`媒体请求失败（${response.status}）`); } catch (error) { lastError = error; } } throw lastError || new Error("媒体请求失败"); };
+  const media = item.attachment && (imageMedia || fileUrl) && (imageMedia || item.attachment.type === "m.video" ? imageMedia || h(MediaPlayer, { type: "video", className: "message-video", src: fileUrl, poster: thumbUrl, label: item.attachment.name || "视频", size: item.attachment.info?.size || item.attachment.file?.size || 0 }) : item.attachment.type === "m.audio" ? h(MediaPlayer, { type: "audio", className: "message-audio", src: fileUrl, label: item.attachment.name || "音频" }) : null);
+  const fetchAttachmentBlob = async () => { if (!resolvedAssetUrl && !rawUrl) throw new Error("附件地址不可用"); const token = client?.getAccessToken?.(); const candidates = mediaRequestCandidates(client, rawUrl, resolvedAssetUrl); let lastError = null; for (const candidate of candidates) { try { const response = await fetch(candidate, { cache: "no-store", headers: token ? { Authorization: `Bearer ${token}` } : undefined }); if (response.ok) { const encryptedBuffer = await response.arrayBuffer(); const plainBuffer = await decryptMatrixBuffer(encryptedBuffer, item.attachment?.file); const blob = new Blob([plainBuffer], { type: item.attachment?.file?.mimetype || item.attachment?.info?.mimetype || response.headers.get("content-type") || "application/octet-stream" }); if (blob.size > 0) return blob; } lastError = new Error(`媒体请求失败（${response.status}）`); } catch (error) { lastError = error; } } throw lastError || new Error("媒体请求失败"); };
   const openOriginal = async e => { e?.preventDefault?.(); if (documentAttachment) return setDocumentModal("preview"); try { const blob = await fetchAttachmentBlob(); const opened = URL.createObjectURL(blob); window.open(opened, "_blank", "noopener,noreferrer"); setTimeout(() => URL.revokeObjectURL(opened), 60000); } catch { Toast.error("原文件打开失败，请稍后重试"); } };
   const downloadAttachment = async e => { e?.preventDefault?.(); try { const blob = await fetchAttachmentBlob(); const href = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = href; link.download = item.attachment?.name || "附件"; document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(href), 60000); } catch { Toast.error("文件下载失败，请稍后重试"); } };
   const openOfficeEditor = async e => { e?.preventDefault?.(); setDocumentModal("edit"); };
@@ -2331,13 +2694,56 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
   } : null;
   const updatedHint = item.updatedAt ? h("div", { className: "document-update-hint" }, `由 ${item.updatedBy || "用户"} 更新于 ${new Date(item.updatedAt).toLocaleString("zh-CN")}`) : null;
   const documentCard = documentAttachment ? h("div", { className: "document-card" }, h("div", { className: `document-icon document-icon-${docKind.className}` }, docKind.icon), h("div", { className: "document-main" }, h("div", { className: "document-name", title: item.attachment.name }, displayName), h("div", { className: "document-meta" }, formatAttachmentSize(item.attachment.info?.size || item.attachment.file?.size) || "文档", " · ", docKind.label), updatedHint), h("div", { className: `document-actions document-actions-${isOfficeEditableAttachment ? "editable" : "compact"}` }, isTextAttachment ? h("button", { type: "button", disabled: !asset.url, onClick: openOriginal }, "打开") : h("button", { type: "button", disabled: !asset.url, onClick: openOriginal }, "在线预览"), isOfficeEditableAttachment && h("button", { type: "button", disabled: !asset.url, onClick: openOfficeEditor }, "在线编辑"), h("button", { type: "button", disabled: !asset.url, onClick: downloadAttachment }, "下载"))) : null;
-  const attachmentFallback = item.attachment && !media && !documentCard ? h("div", { className: "attachment-unavailable" }, asset.failed ? "媒体加载失败" : "正在加载媒体…", asset.url && h("a", { href: asset.url, onClick: openOriginal }, "打开原文件")) : null;
+  const retryMedia = () => { setImageOriginalRequested(false); setTimeout(() => setImageOriginalRequested(true), 0); };
+  const attachmentFallback = item.attachment && !media && !documentCard ? h("div", { className: "attachment-unavailable" }, asset.failed ? "媒体加载失败" : "正在加载媒体…", asset.url && h("a", { href: asset.url, onClick: openOriginal }, "打开原文件"), asset.failed && h("button", { type: "button", className: "media-retry-button", onClick: retryMedia }, "重试")) : null;
   const relation = (item.replyTo || item.threadRoot) && h(RelationContext, { item, client, onJumpTo, onThread });
   const payload = item.attachment ? h("div", { className: "attachment-wrap" }, documentCard || emojiRow || media || attachmentFallback || h("div", { className: "attachment-unavailable" }, "附件地址不可用")) : item.formattedBody ? h("div", { className: "message-bubble formatted-message" }, h(FormattedMessage, { html: item.formattedBody, client, emojiFiles: item.emojiFiles, onImage: (src, alt) => setViewer({ src, alt }) })) : h("div", { className: "message-bubble" }, item.decryptFailed ? `🔒 ${item.text}` : h(MessageText, { text: item.text }));
   const documentContent = isOfficeAttachment
     ? h("div", { className: "document-modal-loading" }, documentPreview.error || "正在连接 Office 编辑器…")
     : documentPreview.status === "loading" ? h("div", { className: "document-modal-loading" }, "正在解析文档…") : documentPreview.status === "error" ? h("div", { className: "document-modal-loading" }, documentPreview.error) : isTextAttachment && documentPreview.status === "ready" ? h("pre", { className: "document-modal-text" }, documentPreview.text) : documentPreview.status === "ready" && documentPreview.html ? h("div", { className: `document-modal-html ${documentModal === "edit" ? "is-editable" : ""}`, contentEditable: documentModal === "edit", suppressContentEditableWarning: true, dangerouslySetInnerHTML: { __html: documentPreview.html } }) : h("div", { className: "document-modal-loading" }, documentPreview.error || "此格式暂不支持浏览器内排版，请使用下载后的 Office 应用打开");
-  return h(React.Fragment, null, h("div", { className: `message-row ${item.isMe ? "me" : ""} ${item.attachment?.emoji ? "emoji-message-row" : ""} ${grouped ? "message-grouped" : ""} ${item.decryptFailed ? "encrypted-message" : ""} ${selecting ? "message-selecting" : ""} ${selected ? "message-selected" : ""}`, id: item.id ? `event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}` : undefined, onClick: selecting ? () => onSelect?.(item) : undefined, onContextMenu: event => { event.preventDefault(); setContextMenu({ x: event.clientX, y: event.clientY }); } }, h(MatrixAvatar, { client, mxcUrl: item.avatarMxc, size: 34, className: "message-avatar", style: { background: item.color }, fallback: item.avatar, alt: item.author }), h("div", { className: "message-body" }, !grouped && h("div", { className: "message-author" }, h("button", { type: "button", className: "message-author-name", onClick: event => { event.stopPropagation(); onMention?.({ userId: item.handle, name: item.author }); } }, item.author), h("span", { className: "message-time" }, item.time), item.edited && h("span", { className: "message-time" }, "已编辑")), h("div", { className: `message-content-stack ${relation ? "has-relation" : ""}` }, relation, payload, item.decryptFailed && h("div", { className: "decrypt-hint" }, "请在“我的设置 → 设备与安全”中恢复密钥"), reactions.length > 0 && h("div", { className: "reaction-row" }, reactions.map(([key, count]) => h("button", { className: "reaction", key, onClick: event => { event.stopPropagation(); onReact(item, key); } }, reactionLabel(key), h("span", { className: "reaction-count" }, count))))), item.readBy?.length > 0 && h("div", { className: "message-read-receipt" }, h(ReadReceipt, { readBy: item.readBy || [], client })), h("div", { className: "message-actions" }, h("button", { onClick: event => { event.stopPropagation(); onReply(item); } }, "回复"), h(ReactionPicker, { client, onSelect: key => onReact(item, key) }), h("button", { onClick: event => { event.stopPropagation(); onThread(item); } }, "线程"), item.isMe && h("button", { onClick: event => { event.stopPropagation(); onEdit(item); } }, "编辑"), item.isMe && h("button", { onClick: event => { event.stopPropagation(); onRedact(item); } }, "撤回")), contextMenu && h("div", { className: "message-context-menu", style: contextMenuStyle, onClick: event => event.stopPropagation() }, h("button", { onClick: () => { setContextMenu(null); onReply(item); } }, "回复"), h("button", { onClick: () => { setContextMenu(null); onThread(item); } }, "在线程中回复"), h("button", { onClick: () => { navigator.clipboard?.writeText(item.text || ""); setContextMenu(null); } }, "复制消息"), h("button", { onClick: () => { setContextMenu(null); onForward?.(item, false); } }, "转发"), h("button", { onClick: () => { setContextMenu(null); onTogglePinMessage?.(item); } }, pinnedEventIds.includes(item.id) ? "取消置顶消息" : "置顶消息"), reactions.length > 0 && h("button", { onClick: () => { setContextMenu(null); Toast.info(`该消息有 ${reactions.reduce((sum, entry) => sum + entry[1], 0)} 个回应`); } }, "查看回应详情"), item.isMe && h("button", { onClick: () => { setContextMenu(null); onEdit(item); } }, "编辑"), item.isMe && h("button", { className: "danger", onClick: () => { setContextMenu(null); onRedact(item); } }, "撤回")))), documentModal && h("div", { className: "document-modal-backdrop", onMouseDown: event => event.target === event.currentTarget && setDocumentModal(null) }, h("div", { className: "document-modal" }, h("div", { className: "document-modal-head" }, h("div", null, h("strong", null, documentModal === "edit" ? "在线编辑文档" : "在线预览文档"), h("span", null, item.attachment?.name)), h("div", { className: "document-modal-head-actions" }, isTextAttachment && documentPreview.status === "ready" && h(UiButton, { size: "small", onClick: () => navigator.clipboard?.writeText(documentPreview.text).then(() => Toast.success("文本已复制")) }, "一键复制"), h("button", { type: "button", onClick: () => setDocumentModal(null), "aria-label": "关闭" }, "×"))), documentContent, documentModal === "edit" && h("div", { className: "document-modal-hint" }, docKind?.ext === "docx" || docKind?.ext === "doc" ? "当前为可编辑文本预览，修改内容后请复制保存；如需保留原始 DOCX 排版，请下载后使用 Office。" : "此格式暂不支持浏览器内编辑，建议下载后使用 Office。"), h("div", { className: "document-modal-actions" }, h(UiButton, { className: "ghost-btn", onClick: downloadAttachment }, "下载文件"), h(UiButton, { variant: "primary", onClick: () => setDocumentModal(null) }, "完成")))), h(MediaLightbox, { viewer, onClose: () => setViewer(null) }));
+  return h(React.Fragment, null,
+    h("div", { className: `message-row ${item.isMe ? "me" : ""} ${item.attachment?.emoji ? "emoji-message-row" : ""} ${grouped ? "message-grouped" : ""} ${item.decryptFailed ? "encrypted-message" : ""} ${selecting ? "message-selecting" : ""} ${selected ? "message-selected" : ""}`, id: item.id ? `event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}` : undefined, onClick: selecting ? () => onSelect?.(item) : undefined, onContextMenu: event => { event.preventDefault(); setContextMenu({ x: event.clientX, y: event.clientY }); } },
+      h(MatrixAvatar, { client, mxcUrl: item.avatarMxc, size: 34, className: "message-avatar", style: { background: item.color }, fallback: item.avatar, alt: item.author }),
+      h("div", { className: "message-body" },
+        !grouped && h("div", { className: "message-author" }, h("button", { type: "button", className: "message-author-name", onClick: event => { event.stopPropagation(); onMention?.({ userId: item.handle, name: item.author }); } }, item.author), h("span", { className: "message-time" }, item.time), item.edited && h("span", { className: "message-time" }, "已编辑")),
+         h("div", { className: `message-content-stack ${relation ? "has-relation" : ""}` },
+           relation,
+           payload,
+           item.decryptFailed && h("div", { className: "decrypt-hint" }, "请在“我的设置 → 设备与安全”中恢复密钥"),
+           reactions.length > 0 && h("div", { className: "reaction-row" }, reactions.map(([key, count]) => h("button", { className: "reaction", key, onClick: event => { event.stopPropagation(); onReact(item, key); } }, reactionLabel(key), h("span", { className: "reaction-count" }, count)))),
+           h("div", { className: "message-actions" },
+             h(ReactionPicker, { client, onSelect: key => onReact(item, key) }),
+             h("button", { onClick: event => { event.stopPropagation(); onReply(item); } }, "回复"),
+             h("button", { onClick: event => { event.stopPropagation(); onThread(item); } }, "线程"),
+             item.isMe && h("button", { onClick: event => { event.stopPropagation(); onEdit(item); } }, "编辑"),
+             item.isMe && h("button", { onClick: event => { event.stopPropagation(); onRedact(item); } }, "撤回")
+           )
+         ),
+         item.readBy?.length > 0 && h("div", { className: "message-read-receipt" }, h(ReadReceipt, { readBy: item.readBy || [], client })),
+        contextMenu && h("div", { className: "message-context-menu", style: contextMenuStyle, onClick: event => event.stopPropagation() },
+          // Keep the initial DOM order aligned with the final polished menu.
+          // The effect above adds the multi-select action and SVG glyphs.
+          h("button", { onClick: () => { navigator.clipboard?.writeText(item.text || ""); setContextMenu(null); } }, "复制消息"),
+          item.isMe && h("button", { onClick: () => { setContextMenu(null); onEdit(item); } }, "编辑"),
+          h("button", { onClick: () => { setContextMenu(null); onForward?.(item, false); } }, "转发"),
+          h("button", { onClick: () => { setContextMenu(null); onReply(item); } }, "回复"),
+          h("button", { onClick: () => { setContextMenu(null); onThread(item); } }, "在线程中回复"),
+          h("button", { onClick: () => { setContextMenu(null); onTogglePinMessage?.(item); } }, pinnedEventIds.includes(item.id) ? "取消置顶消息" : "置顶消息"),
+          reactions.length > 0 && h("button", { onClick: () => { setContextMenu(null); Toast.info(`该消息有 ${reactions.reduce((sum, entry) => sum + entry[1], 0)} 个回应`); } }, "查看回应详情"),
+          item.isMe && h("button", { className: "danger", onClick: () => { setContextMenu(null); onRedact(item); } }, "撤回")
+        )
+      )
+    ),
+    documentModal && h("div", { className: "document-modal-backdrop", onMouseDown: event => event.target === event.currentTarget && setDocumentModal(null) },
+      h("div", { className: "document-modal" },
+        h("div", { className: "document-modal-head" }, h("div", null, h("strong", null, documentModal === "edit" ? "在线编辑文档" : "在线预览文档"), h("span", null, item.attachment?.name)), h("div", { className: "document-modal-head-actions" }, isTextAttachment && documentPreview.status === "ready" && h(UiButton, { size: "small", onClick: () => navigator.clipboard?.writeText(documentPreview.text).then(() => Toast.success("文本已复制")) }, "一键复制"), h("button", { type: "button", onClick: () => setDocumentModal(null), "aria-label": "关闭" }, "×"))),
+        documentContent,
+        documentModal === "edit" && h("div", { className: "document-modal-hint" }, docKind?.ext === "docx" || docKind?.ext === "doc" ? "当前为可编辑文本预览，修改内容后请复制保存；如需保留原始 DOCX 排版，请下载后使用 Office。" : "此格式暂不支持浏览器内编辑，建议下载后使用 Office。"),
+        h("div", { className: "document-modal-actions" }, h(UiButton, { className: "ghost-btn", onClick: downloadAttachment }, "下载文件"), h(UiButton, { variant: "primary", onClick: () => setDocumentModal(null) }, "完成"))
+      )
+    ),
+    h(MediaLightbox, { viewer, onClose: () => setViewer(null) })
+  );
 }
 
 function ThreadPanel({ root, replies = [], client, onClose, onJumpTo }) {
@@ -2354,7 +2760,12 @@ function ThreadPanel({ root, replies = [], client, onClose, onJumpTo }) {
 }
 
 function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, onSend, onTyping, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onEmojiSelect, replyTo, threadRoot, editing, onCancelReply, onCancelThread, onCancelEdit, onUpload, detailsCollapsed, onToggleDetails, selecting, forwardItems, onSelectForward, onStartSelecting, pinnedEventIds, onTogglePinMessage, onOpenDetails, onStartCall }) {
-  const [draft, setDraft] = useState(""); const [draftHtml, setDraftHtml] = useState(""); const [remoteTyping, setRemoteTyping] = useState([]); const inputRef = useRef(null); const fileRef = useRef(null); const scrollRef = useRef(null); const forceScrollRef = useRef(false); const stickToBottomRef = useRef(true); const previousTailRef = useRef({ roomId: null, eventId: null }); const pendingRoomScrollRef = useRef(null); const loadingEarlierRef = useRef(false); const preparedEmojiRef = useRef(new Map()); const pendingEmojiRef = useRef(new Map()); const emojiInsertGenerationRef = useRef(0); const pendingAttachmentsRef = useRef([]); const dragDepthRef = useRef(0); const sendingRef = useRef(false); const scrollMemoryRef = useRef(new Map()); const restoredRoomRef = useRef(null); const restoreInteractionRef = useRef(false); const restoreTimersRef = useRef([]); const [preparingEmoji, setPreparingEmoji] = useState(""); const [showJump, setShowJump] = useState(false); const [loadingEarlier, setLoadingEarlier] = useState(false); const [historyExhausted, setHistoryExhausted] = useState(false); const [pendingAttachments, setPendingAttachments] = useState([]); const [draggingFiles, setDraggingFiles] = useState(false); const [sending, setSending] = useState(false); const [recording, setRecording] = useState(false); const recorderRef = useRef(null); const recorderStreamRef = useRef(null); const recorderChunksRef = useRef([]);
+  const [draft, setDraft] = useState(""); const [draftHtml, setDraftHtml] = useState(""); const [remoteTyping, setRemoteTyping] = useState([]); const inputRef = useRef(null); const fileRef = useRef(null); const scrollRef = useRef(null); const forceScrollRef = useRef(false); const stickToBottomRef = useRef(true); const previousTailRef = useRef({ roomId: null, eventId: null }); const pendingRoomScrollRef = useRef(null); const loadingEarlierRef = useRef(false); const preparedEmojiRef = useRef(new Map()); const pendingEmojiRef = useRef(new Map()); const emojiInsertGenerationRef = useRef(0); const emojiSearchTextRef = useRef(""); const pendingAttachmentsRef = useRef([]); const dragDepthRef = useRef(0); const sendingRef = useRef(false); const scrollMemoryRef = useRef(new Map()); const restoredRoomRef = useRef(null); const restoreInteractionRef = useRef(false); const restoreTimersRef = useRef([]); const [preparingEmoji, setPreparingEmoji] = useState(""); const [showJump, setShowJump] = useState(false); const [loadingEarlier, setLoadingEarlier] = useState(false); const [historyExhausted, setHistoryExhausted] = useState(false); const [pendingAttachments, setPendingAttachments] = useState([]); const [draggingFiles, setDraggingFiles] = useState(false); const [sending, setSending] = useState(false); const [recording, setRecording] = useState(false); const recorderRef = useRef(null); const recorderStreamRef = useRef(null); const recorderChunksRef = useRef([]);
+  React.useEffect(() => {
+    if (!replyTo && !threadRoot && !editing) return;
+    const timer = requestAnimationFrame(() => inputRef.current?.focus?.());
+    return () => cancelAnimationFrame(timer);
+  }, [replyTo, threadRoot, editing]);
   useEffect(() => {
     const enterSelecting = () => onStartSelecting?.(true);
     window.addEventListener("orbit:start-message-selecting", enterSelecting);
@@ -2405,13 +2816,34 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
     const raw = String(value || "").trim();
     const match = raw.match(/(?:^|\s):([^:\s]*)$/);
     const query = match?.[1] || raw.match(/[\p{L}\p{N}_-]{1,12}$/u)?.[0] || "";
+    emojiSearchTextRef.current = query;
     if (!query) { emojiQueryRef.current += 1; setEmojiSuggestions([]); return; }
     emojiActionRef.current = "typing";
     const q = query.toLowerCase();
     const requestId = ++emojiQueryRef.current;
-    ensureEmojiCatalog().then(items => { if (requestId !== emojiQueryRef.current) return; const ranked = (items || []).map(item => ({ item, score: Math.max(fuzzyScore(item.name, q), ...(item.keywords || []).map(keyword => fuzzyScore(keyword, q)), 0) })).filter(entry => entry.score > 0).sort((a, b) => b.score - a.score || String(a.item.name).localeCompare(String(b.item.name), "zh-CN")); setEmojiSuggestions(ranked.slice(0, 80).map(entry => entry.item)); });
+    ensureEmojiCatalog().then(items => { if (requestId !== emojiQueryRef.current) return; const ranked = (items || []).map(item => ({ item, score: Math.max(fuzzyScore(item.name, q), fuzzyScore(item.shortcode, q), ...(item.keywords || []).map(keyword => fuzzyScore(keyword, q)), 0) })).filter(entry => entry.score > 0).sort((a, b) => b.score - a.score || String(a.item.name).localeCompare(String(b.item.name), "zh-CN")); setEmojiSuggestions(ranked.slice(0, 80).map(entry => entry.item)); });
   };
   const [emojiSuggestionMode, setEmojiSuggestionMode] = useState("emoji");
+  const clearComposerAfterSticker = React.useCallback(() => {
+    // A sticker is a standalone message. Remove the keyword that produced
+    // the inline candidates and clear the editor so the suggestion strip
+    // cannot reappear from the stale contenteditable selection.
+    emojiQueryRef.current += 1;
+    emojiInsertGenerationRef.current += 1;
+    pendingEmojiRef.current.clear();
+    setDraft("");
+    setDraftHtml("");
+    setMentionTargets([]);
+    setEmojiSuggestions([]);
+    setHoveredSuggestion(null);
+    emojiActionRef.current = "select";
+    inputRef.current?.clear?.();
+  }, []);
+  const selectSticker = React.useCallback(item => {
+    if (!item) return;
+    clearComposerAfterSticker();
+    onEmojiSelect?.(item);
+  }, [clearComposerAfterSticker, onEmojiSelect]);
   React.useEffect(() => {
     const move = event => {
       const button = event.target?.closest?.(".emoji-suggestion-items > button");
@@ -2423,6 +2855,21 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
     return () => document.removeEventListener("mousemove", move);
   }, []);
   React.useEffect(() => { emojiQueryRef.current += 1; setEmojiSuggestions([]); setHoveredSuggestion(null); }, [room?.id, editing?.id]);
+  // A browser can restore the previous contenteditable subtree after a reload
+  // even though React's draft is empty. Clear that stale visual on a fresh
+  // room composer, while leaving an active edit draft untouched.
+  React.useEffect(() => {
+    if (!room?.id || editing) return;
+    const frame = requestAnimationFrame(() => inputRef.current?.clear?.());
+    return () => cancelAnimationFrame(frame);
+  }, [room?.id, editing?.id]);
+  React.useEffect(() => {
+    const text = editing?.editorText || editorTextFromFormattedBody(editing?.formattedBody || "") || editing?.text || "";
+    const sync = () => inputRef.current?.setContent?.(text);
+    const frame = requestAnimationFrame(sync);
+    const timer = setTimeout(sync, 120);
+    return () => { cancelAnimationFrame(frame); clearTimeout(timer); };
+  }, [editing?.id]);
   const [mentionTargets, setMentionTargets] = useState([]);
   const scrollStorageKey = roomId => `orbit.scroll-position:${client?.getUserId?.() || "anonymous"}:${roomId}`;
   const readScrollMemory = roomId => {
@@ -2475,7 +2922,45 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
     if (!saved?.anchorId || anchorFound) rememberScrollPosition(roomId);
     return true;
   };
-  React.useEffect(() => { emojiInsertGenerationRef.current += 1; setDraft(editing?.text || ""); setMentionTargets([]); setHistoryExhausted(false); preparedEmojiRef.current.clear(); pendingEmojiRef.current.clear(); setPreparingEmoji(""); setEmojiSuggestions?.([]); restoreInteractionRef.current = false; restoredRoomRef.current = null; restoreTimersRef.current.forEach(clearTimeout); restoreTimersRef.current = []; stickToBottomRef.current = false; previousTailRef.current = { roomId: room?.id || null, eventId: null }; if (room?.id) pendingRoomScrollRef.current = room.id; }, [room?.id, editing?.id]);
+  React.useEffect(() => {
+    emojiInsertGenerationRef.current += 1;
+    const editHtml = editing?.formattedBody || "";
+    const editText = editing?.editorText || editorTextFromFormattedBody(editHtml) || editing?.text || "";
+    // Replace the live ProseMirror document immediately. Waiting for the
+    // draft state render allows Chromium's restored contenteditable subtree
+    // to survive for one frame and leak old emoji chips into this edit.
+    inputRef.current?.setContent?.(editText);
+    setDraft(editText);
+    setDraftHtml(editHtml);
+    setMentionTargets([]);
+    setHistoryExhausted(false);
+    preparedEmojiRef.current.clear();
+    (editing?.emojiRefs || emojiRefsFromFormattedBody(editHtml)).forEach(entry => {
+      const shortcode = String(entry.shortcode || "").replace(/^:+|:+$/g, "");
+      if (shortcode && entry.mxc?.startsWith?.("mxc://") && room?.id) {
+        preparedEmojiRef.current.set(`${room.id}|:${shortcode}:`, { ...entry, shortcode });
+      }
+    });
+    pendingEmojiRef.current.clear();
+    setPreparingEmoji("");
+    setEmojiSuggestions?.([]);
+    emojiSearchTextRef.current = "";
+    restoreInteractionRef.current = false;
+    restoredRoomRef.current = null;
+    restoreTimersRef.current.forEach(clearTimeout);
+    restoreTimersRef.current = [];
+    stickToBottomRef.current = false;
+    previousTailRef.current = { roomId: room?.id || null, eventId: null };
+    if (room?.id) pendingRoomScrollRef.current = room.id;
+  }, [room?.id, editing?.id]);
+  const cancelEditing = React.useCallback(() => {
+    inputRef.current?.clear?.();
+    setDraft("");
+    setDraftHtml("");
+    setEmojiSuggestions([]);
+    emojiSearchTextRef.current = "";
+    onCancelEdit?.();
+  }, [onCancelEdit]);
   React.useEffect(() => {
     const el = scrollRef.current;
     if (!el || !room?.id || pendingRoomScrollRef.current !== room.id || !messages.length) return;
@@ -2509,16 +2994,22 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
     return () => { cancelAnimationFrame(frame); timers.forEach(clearTimeout); };
   }, [room?.id, tailEventId]);
   const send = async () => {
-    const text = draft.trim();
+    const text = normalizeComposerText(draft, draftHtml).trim();
     if ((!text && !pendingAttachments.length) || !room?.id || sendingRef.current) return;
+    const roomPrefix = `${room.id}|`;
+    // Snapshot emoji uploads before invalidating callbacks. The previous
+    // order cleared this map first, so an emoji inserted immediately before
+    // Send lost its MXC mapping and was sent as duplicate keyword text.
+    const preparing = [...pendingEmojiRef.current.entries()]
+      .filter(([key]) => key.startsWith(roomPrefix))
+      .map(([, promise]) => promise);
     // Clear optimistically before any network/upload work starts so the
     // just-submitted text never lingers in the editor while Matrix responds.
     setDraft(""); setDraftHtml(""); setMentionTargets([]); setEmojiSuggestions([]); emojiActionRef.current = "select";
     inputRef.current?.clear?.();
-    // Invalidate any emoji upload callbacks that were started by an earlier
-    // picker click. Once sending begins, no late promise may write another
-    // chip into the next draft.
-    const sendGeneration = ++emojiInsertGenerationRef.current;
+    // Invalidate visual insertion callbacks while preserving the promises
+    // captured above so their prepared MXC records remain available below.
+    emojiInsertGenerationRef.current += 1;
     pendingEmojiRef.current.clear();
     sendingRef.current = true; setSending(true);
     try {
@@ -2546,17 +3037,29 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
         setPendingAttachments([]);
       }
       if (!text) return;
-    const roomPrefix = `${room.id}|`;
-    const preparing = [...pendingEmojiRef.current.entries()].filter(([key]) => key.startsWith(roomPrefix)).map(([, promise]) => promise);
     if (preparing.length) await Promise.all(preparing);
+    const emojiSource = `${text}\n${draftHtml || ""}`;
+    const editorEmojiRefs = emojiRefsFromEditorHtml(draftHtml);
+    const copiedEmojiEntries = editorEmojiRefs.map(entry => ({ ...entry, item: { name: entry.shortcode, shortcode: entry.shortcode } }));
     const resolvedEmoji = [...preparedEmojiRef.current.entries()]
-      .filter(([key, entry]) => key.startsWith(roomPrefix) && text.includes(`:${entry.shortcode}:`))
+      .filter(([key, entry]) => {
+        if (!key.startsWith(roomPrefix)) return false;
+        const shortcode = String(entry.shortcode || "").replace(/^:+|:+$/g, "").toLowerCase();
+        const plain = text.trim().toLowerCase();
+        const token = ":" + shortcode + ":";
+        const attr = 'data-emoji-token=":' + shortcode + ':"';
+        const bareAtEnd = new RegExp(shortcode.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*$", "i");
+        return emojiSource.toLowerCase().includes(token) || emojiSource.toLowerCase().includes(attr) || plain === shortcode || bareAtEnd.test(plain) || plain === String(entry.item?.name || "").trim().toLowerCase();
+      })
       .map(([, entry]) => entry);
+    for (const entry of copiedEmojiEntries) {
+      if (!resolvedEmoji.some(item => item.mxc === entry.mxc)) resolvedEmoji.push(entry);
+    }
     const pending = (window.orbitPendingMentions || {})[room.id] || [];
     const mentions = [...mentionTargets, ...pending].filter((entry, index, list) => entry?.userId && text.includes(`@${String(entry.name || "").replace(/^@/, "")}`) && list.findIndex(other => other.userId === entry.userId) === index);
     await onSend(text, draftHtml, mentions, resolvedEmoji);
     [...preparedEmojiRef.current.keys()].filter(key => key.startsWith(roomPrefix)).forEach(key => preparedEmojiRef.current.delete(key));
-    forceScrollRef.current = true;
+    forceScrollRef.current = stickToBottomRef.current;
     setTimeout(() => { const el = scrollRef.current; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); setShowJump(false); }, 350);
     } catch (error) { Toast.error(`发送失败：${error?.message || "未知错误"}`); }
     finally { sendingRef.current = false; setSending(false); }
@@ -2579,24 +3082,24 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
   const jumpBottom = () => { const el = scrollRef.current; stickToBottomRef.current = true; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); setShowJump(false); };
   React.useEffect(() => () => { recorderRef.current?.stop?.(); recorderStreamRef.current?.getTracks?.().forEach(track => track.stop()); }, []);
   if (!room) return h("main", { className: "main-panel" }, h("div", { className: "empty-messages" }, "登录后选择一个房间开始聊天"));
-  const insertEmoji = item => {
+  const insertEmoji = (item, options = {}) => {
     const generation = emojiInsertGenerationRef.current;
     prepareEmojiSelection(item).then(result => {
       if (generation !== emojiInsertGenerationRef.current || !room?.id) return;
       const token = `:${result.shortcode}:`;
-      // Keep React's draft as the sole source of truth. The editor effect
-      // renders the shortcode as a chip after this functional update, so a
-      // browser-restored contenteditable DOM can never be read back and
-      // duplicated into the new selection.
-      // Replace the unfinished shortcode (including its leading colon) when
-      // the user selects an inline suggestion; picker insertions simply append
-      // to the current text.
-      setDraft(value => {
+      // Insert an inline emoji node so the composer shows its image while
+      // TipTap still serializes the shortcode for Matrix. The node command
+      // replaces only the unfinished :query at the caret; if the editor is
+      // unavailable, retain the plain-text fallback.
+      const replaceQuery = options.replaceQuery === true;
+      const query = String(options.query || emojiSearchTextRef.current || "").trim();
+      const inserted = inputRef.current?.insertEmoji?.(result.item || item, { replaceQuery, query, mxc: result.mxc || "" });
+      if (!inserted) setDraft(value => {
         const current = String(value || "");
-        const replaced = /(?:^|\s):[^:\s]*$/.test(current)
-          ? current.replace(/:[^:\s]*$/, `${token} `)
+        const queryPattern = query ? new RegExp(`${query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "iu") : /(?:^|\s)(?::[^:\s]*|[\p{L}\p{N}_-]{1,32})$/u;
+        return replaceQuery && queryPattern.test(current)
+          ? current.replace(queryPattern, match => `${match.startsWith(" ") ? " " : ""}${token} `)
           : `${current}${token} `;
-        return replaced;
       });
       setEmojiSuggestions([]);
       emojiActionRef.current = "select";
@@ -2640,7 +3143,7 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
   return h("main", { className: `main-panel ${threadRoot ? "thread-open" : ""} ${draggingFiles ? "is-dragging-files" : ""}`, onPaste: event => { if (event.defaultPrevented) return; const files = clipboardFiles(event.clipboardData); if (files.length) { event.preventDefault(); handleFiles(files); } }, onDragOver: onMessageDragOver, onDragEnter: onMessageDragEnter, onDragLeave: onMessageDragLeave, onDrop: onMessageDrop },
     h("header", { className: "chat-header" }, h("div", { className: "chat-heading" }, h(MatrixAvatar, { client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 40, style: { background: room.color, width: 40, height: 40 }, fallback: room.initials, alt: room.name }), h("div", null, h("div", { className: "chat-title" }, room.name), h("div", { className: room.directUserId ? (client?.getUser?.(room.directUserId)?.presence === "online" ? "chat-subtitle direct-presence" : "chat-subtitle direct-offline") : "chat-subtitle" }, room.directUserId ? `${client?.getUser?.(room.directUserId)?.presence === "online" ? "在线" : "离线"} · ${client?.getUser?.(room.directUserId)?.displayName || room.directUserId}` : `${room.members} 位成员 · ${room.desc}`))), h("div", { className: "header-actions" }, h("button", { className: "icon-button", title: "搜索消息", onClick: onSearch }, h(Icon, { name: "search" })), h("button", { className: "icon-button", title: "发起语音通话", onClick: () => onStartCall?.("voice") }, h(Icon, { name: "phone" })), h("button", { className: "icon-button", title: "发起视频通话", onClick: () => onStartCall?.("video") }, h(Icon, { name: "video" })), h("button", { className: `icon-button header-selection-toggle ${selecting ? "is-active" : ""}`, title: selecting ? "退出多选" : "多选消息", onClick: () => selecting ? onStartSelecting?.(false) : onStartSelecting?.(true) }, h(Icon, { name: "list" })), h("button", { className: "icon-button", title: "查看置顶消息", onClick: () => Toast.info(pinnedEventIds?.length ? `本房间有 ${pinnedEventIds.length} 条置顶消息，请从消息菜单管理` : "暂无置顶消息") }, h(Icon, { name: "pin" })), h("button", { className: "icon-button room-details-toggle", title: "房间详情（点击展开/收起）", onClick: onOpenDetails }, h(Icon, { name: "room", size: 18 })))),
     h("div", { className: "message-scroll", ref: scrollRef, onScroll: e => { const current = e.currentTarget; if (restoredRoomRef.current !== room?.id) return; const distanceFromBottom = current.scrollHeight - current.scrollTop - current.clientHeight; stickToBottomRef.current = distanceFromBottom <= 120; setShowJump(distanceFromBottom > 260); rememberScrollPosition(room?.id); if (current.scrollTop <= 72 && !loadingEarlierRef.current && !historyExhausted) loadEarlier(); } }, h(UiButton, { className: "load-more", disabled: loadingEarlier || historyExhausted, onClick: loadEarlier }, loadingEarlier ? "正在加载更早的消息…" : historyExhausted ? "没有更早的消息了" : "加载更早的消息"), messages.map((item, i) => h(Message, { key: item.id || `empty-${i}`, item, client, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onMention: mention => { const user = mention?.userId ? client?.getUser?.(mention.userId) : null; const raw = mention?.name === "你" ? (user?.displayName || mention?.userId || "") : (mention?.name || mention?.userId || ""); const name = String(raw).replace(/^@/, "").trim(); if (!name) return; const current = String(draft || ""); const prefix = current && !/[\\s\\n]$/.test(current) ? " " : ""; inputRef.current?.insertText?.(`${prefix}@${name} `); } , onTogglePinMessage, pinnedEventIds, selecting, selected: forwardItems?.some?.(entry => entry.id === item.id), onSelect: onSelectForward })), showJump && h(UiButton, { className: "jump-bottom", onClick: jumpBottom }, "↓ 回到最新消息")),
-    h("div", { className: "composer-wrap" }, pendingPreview, typingUsers.length > 0 && h("div", { className: "typing-indicator", role: "status" }, h("span", { className: "typing-dots", "aria-hidden": "true" }, h("i"), h("i"), h("i")), h("span", null, typingUsers.length === 1 ? `${typingUsers[0]} 正在输入…` : `${typingUsers.slice(0, 2).join("、")} 正在输入…`)), (replyTo || threadRoot || editing) && h("div", { className: "reply-bar" }, h("span", null, editing ? "✎ 正在编辑消息" : threadRoot ? `⌁ 正在线程中回复：${String(threadRoot.text || threadRoot.attachment?.name || "消息").slice(0, 60)}` : `↩ 正在回复：${String(replyTo.text || replyTo.attachment?.name || "消息").slice(0, 60)}`), h("button", { onClick: editing ? onCancelEdit : threadRoot ? onCancelThread : onCancelReply }, "×")), emojiSuggestions.length > 0 && h("div", { className: "emoji-inline-suggestions", role: "listbox", "aria-label": "表情联想" }, h("div", { className: "emoji-suggestion-mode" }, h("button", { type: "button", className: emojiSuggestionMode === "emoji" ? "active" : "", onClick: () => setEmojiSuggestionMode("emoji") }, "表情"), h("button", { type: "button", className: emojiSuggestionMode === "sticker" ? "active" : "", onClick: () => setEmojiSuggestionMode("sticker") }, "贴纸")), h("div", { className: "emoji-suggestion-items" }, emojiSuggestions.map(item => h("button", { type: "button", key: item.id, role: "option", title: item.name, onMouseEnter: () => setHoveredSuggestion(item), onMouseLeave: () => setHoveredSuggestion(null), onClick: () => emojiSuggestionMode === "sticker" ? onEmojiSelect?.(item) : insertEmoji(item) }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" }), h("span", null, item.name)))), hoveredSuggestion && createPortal(h("div", { className: "emoji-inline-preview", role: "tooltip" }, h("img", { src: assetRequestUrl(hoveredSuggestion.url || hoveredSuggestion.thumbUrl), alt: hoveredSuggestion.name }), h("strong", null, hoveredSuggestion.name)), document.body)), h("div", { className: "composer" }, h(HaloComposer, { key: `${room.id}:${room.name}`, ref: inputRef, value: draft, onChange: (value, html) => { setDraft(value); setDraftHtml(html || ""); updateEmojiSuggestions(value); onTyping(true); }, onKeyDown: keyDown, onFiles: handleFiles, placeholder: `发送消息到 ${room.name}`, toolbarExtra: h(React.Fragment, null, h(EmojiPicker, { onSelect: onEmojiSelect, onInsert: insertEmoji }), h("button", { type: "button", className: `tool-button voice-record-button ${recording ? "is-recording" : ""}`, title: recording ? "停止录音并发送" : "录制语音", onClick: toggleRecording }, recording ? h(Icon, { name: "mic", size: 17 }) : h(Icon, { name: "mic", size: 17 })), h("button", { type: "button", className: "tool-button", title: "上传文件", onClick: () => fileRef.current?.click() }, h(Icon, { name: "attachment", size: 17 })), h("input", { ref: fileRef, type: "file", hidden: true, multiple: true, onChange: e => { handleFiles(e.target.files); e.target.value = ""; } }), h(UiButton, { variant: "primary", className: "send-button", disabled: sending, onClick: send }, editing ? "保存　↵" : "发送　↵")) })) , h("div", { className: "composer-hint" }, "Enter 发送 · Shift + Enter 换行")),
+    h("div", { className: "composer-wrap" }, pendingPreview, typingUsers.length > 0 && h("div", { className: "typing-indicator", role: "status" }, h("span", { className: "typing-dots", "aria-hidden": "true" }, h("i"), h("i"), h("i")), h("span", null, typingUsers.length === 1 ? `${typingUsers[0]} 正在输入…` : `${typingUsers.slice(0, 2).join("、")} 正在输入…`)), (replyTo || threadRoot || editing) && h("div", { className: "reply-bar" }, h("span", null, editing ? "✎ 正在编辑消息" : threadRoot ? `⌁ 正在线程中回复：${String(threadRoot.text || threadRoot.attachment?.name || "消息").slice(0, 60)}` : `↩ 正在回复：${String(replyTo.text || replyTo.attachment?.name || "消息").slice(0, 60)}`), h("button", { onClick: editing ? cancelEditing : threadRoot ? onCancelThread : onCancelReply }, "×")), emojiSuggestions.length > 0 && h("div", { className: "emoji-inline-suggestions", role: "listbox", "aria-label": "表情联想" }, h("div", { className: "emoji-suggestion-mode" }, h("button", { type: "button", className: emojiSuggestionMode === "emoji" ? "active" : "", onClick: () => setEmojiSuggestionMode("emoji") }, "表情"), h("button", { type: "button", className: emojiSuggestionMode === "sticker" ? "active" : "", onClick: () => setEmojiSuggestionMode("sticker") }, "贴纸")), h("div", { className: "emoji-suggestion-items" }, emojiSuggestions.map(item => h("button", { type: "button", key: item.id, role: "option", title: item.name, onMouseDown: event => event.preventDefault(), onMouseEnter: () => setHoveredSuggestion(item), onMouseLeave: () => setHoveredSuggestion(null), onClick: () => emojiSuggestionMode === "sticker" ? selectSticker(item) : insertEmoji(item, { replaceQuery: true }) }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" }), h("span", null, item.name)))), hoveredSuggestion && createPortal(h("div", { className: "emoji-inline-preview", role: "tooltip" }, h("img", { src: assetRequestUrl(hoveredSuggestion.url || hoveredSuggestion.thumbUrl), alt: hoveredSuggestion.name }), h("strong", null, hoveredSuggestion.name)), document.body)), h("div", { className: "composer" }, h(HaloComposer, { key: `${room.id}:${room.name}`, ref: inputRef, value: draft, onChange: (value, html) => { setDraft(value); setDraftHtml(html || ""); updateEmojiSuggestions(value); onTyping(true); }, onKeyDown: keyDown, onFiles: handleFiles, placeholder: `发送消息到 ${room.name}`, emojiFallbackItems: (editing?.emojiRefs || []).map(entry => { const http = client?.mxcUrlToHttp?.(entry.mxc, 32, 32, "scale", false, true, true) || matrixDownloadFallbackUrl(client, entry.mxc); const src = mediaRequestUrl(client, http); return { name: entry.shortcode, shortcode: entry.shortcode, url: src, thumbUrl: src, mxc: entry.mxc }; }), toolbarExtra: h(React.Fragment, null, h(EmojiPicker, { onSelect: selectSticker, onInsert: insertEmoji }), h("button", { type: "button", className: `tool-button voice-record-button ${recording ? "is-recording" : ""}`, title: recording ? "停止录音并发送" : "录制语音", onClick: toggleRecording }, recording ? h(Icon, { name: "mic", size: 17 }) : h(Icon, { name: "mic", size: 17 })), h("button", { type: "button", className: "tool-button", title: "上传文件", onClick: () => fileRef.current?.click() }, h(Icon, { name: "attachment", size: 17 })), h("input", { ref: fileRef, type: "file", hidden: true, multiple: true, onChange: e => { handleFiles(e.target.files); e.target.value = ""; } }), h(UiButton, { variant: "primary", className: "send-button", disabled: sending, onClick: send }, editing ? "保存　↵" : "发送　↵")) })) , h("div", { className: "composer-hint" }, "Enter 发送 · Shift + Enter 换行")),
     h(ThreadPanel, { root: threadRoot, replies: threadReplies, client, onClose: onCancelThread, onJumpTo })
   );
 }
@@ -2749,12 +3252,16 @@ function App() {
     const client = connected?.client;
     const room = selectedId ? client?.getRoom?.(selectedId) : null;
     if (!client || !room || document.hidden) return;
+    const scrollNode = document.querySelector(".message-scroll");
+    if (!scrollNode || scrollNode.scrollHeight - scrollNode.scrollTop - scrollNode.clientHeight > 140) return;
     const events = room.getLiveTimeline?.().getEvents?.() || [];
     const readUpTo = room.getEventReadUpTo?.(client.getUserId?.(), true); const readIndex = readUpTo ? events.findIndex(event => event.getId?.() === readUpTo) : -1; const target = readIndex >= 0 ? [...events.slice(readIndex + 1)].reverse().find(event => event?.getId?.() && !room.hasPendingEvent?.(event.getId())) : [...events].reverse().find(event => event?.getId?.() && !room.hasPendingEvent?.(event.getId()));
     if (!target) return;
     rememberRoomRead(selectedId, target);
     setRooms(current => current.map(entry => entry.id === selectedId ? { ...entry, unread: 0, hasUnread: false } : entry));
-    markRoomRead(client, selectedId, target).then(() => queueRefresh(client)).catch(() => {});
+    const previous = locallyReadRoomsRef.current.get(selectedId);
+    if (previous?.eventId === target.getId?.()) return;
+    markRoomRead(client, selectedId, target).then(() => { rememberRoomRead(selectedId, target); queueRefresh(client); }).catch(() => {});
   }, [connected?.client, selectedId, messages[selectedId]?.length]);
   useEffect(() => { const client = connected?.client; const crypto = client?.getCrypto?.(); if (!client) return; const eventName = MatrixSDK.CryptoEvent?.VerificationRequestReceived || "crypto.verificationRequestReceived"; const onRequest = request => { if (request && !request.initiatedByMe) Toast.info(`收到设备验证请求：${request.otherDeviceId || "其他设备"}，请打开“我的设置 → 设备与安全”`); }; client.on?.(eventName, onRequest); crypto?.on?.(eventName, onRequest); return () => { client.off?.(eventName, onRequest); crypto?.off?.(eventName, onRequest); }; }, [connected?.client]);
   useEffect(() => { ensureEmojiCatalog().then(() => setEmojiCatalogReady(value => value + 1)); }, []);
@@ -2797,7 +3304,7 @@ function App() {
     bar.insertBefore(button, bar.lastElementChild);
     return () => button.remove();
   }, [forwardItems.length]);
-  const [cryptoState, setCryptoState] = useState({ available: false, backupInfo: null, activeVersion: null, verified: false, localTrusted: false, keyRestored: false, restoring: false, restoreProgress: 0, error: null });
+  const [cryptoState, setCryptoState] = useState({ available: false, backupInfo: null, activeVersion: null, verified: false, localTrusted: false, keyRestored: false, restoring: false, restoreProgress: 0, restoreStage: "idle", error: null });
   React.useEffect(() => { if (!connected?.client) return; const timer = setTimeout(() => retryLoadedRoomDecryption(connected.client).then(() => queueRefresh(connected.client)).catch(() => {}), 8000); return () => clearTimeout(timer); }, [connected?.client]);
   const refreshCrypto = async client => { const crypto = client?.getCrypto?.(); if (!crypto) return setCryptoState(s => ({ ...s, available: false, error: s.error || "加密模块尚未就绪，请重新登录或刷新页面" })); try { const backupInfo = await crypto.getKeyBackupInfo?.(); const activeVersion = await crypto.getActiveSessionBackupVersion?.(); const currentStatus = await Promise.resolve(crypto.getDeviceVerificationStatus?.(client.getUserId?.(), client.getDeviceId?.())).catch(() => null); const persistedTrust = localStorage.getItem(localVerificationKey(client)) === "1"; const deviceVerified = Boolean(currentStatus?.crossSigningVerified || persistedTrust); const localTrusted = Boolean(currentStatus?.localVerified || persistedTrust); if (persistedTrust && !currentStatus?.crossSigningVerified) { try { await crypto.setDeviceVerified?.(client.getUserId?.(), client.getDeviceId?.(), true); } catch {} } setCryptoState(s => ({ ...s, available: true, verified: deviceVerified, localTrusted, backupInfo: backupInfo || null, activeVersion: activeVersion || backupInfo?.version || null, error: null })); } catch (error) { setCryptoState(s => ({ ...s, available: true, error: error?.message || "无法读取密钥备份状态" })); } };
   const refresh = async client => {
@@ -2870,7 +3377,7 @@ function App() {
   } };
   const declineInvite = async invite => { try { await connected.client.leave(invite.id); Toast.success("已忽略房间邀请"); await refresh(connected.client); } catch (error) { Toast.error(`忽略邀请失败：${error?.message || "请稍后重试"}`); } };
   const queueRefresh = client => { if (refreshTimer.current) return; refreshTimer.current = setTimeout(() => { refreshTimer.current = null; refresh(client).catch(error => console.warn("刷新房间失败", error)); }, 250); };
-  const restoreKeys = async ({ type, key, passphrase, version }) => { const crypto = connected?.client?.getCrypto?.(); if (!crypto || !version) return; setCryptoState(s => ({ ...s, restoring: true, restoreProgress: 0, error: null })); try {
+  const restoreKeys = async ({ type, key, passphrase, version }) => { const crypto = connected?.client?.getCrypto?.(); if (!crypto || !version) return; setCryptoState(s => ({ ...s, restoring: true, restoreProgress: 0, restoreStage: "prepare", error: null })); try {
     if (type === "key") {
       // Element's recovery key is the Secret Storage key. It must first
       // unwrap m.megolm_backup.v1; it is not necessarily the room-backup key.
@@ -2892,8 +3399,8 @@ function App() {
       }
     }
     if (type === "secret") { if (typeof crypto.loadSessionBackupPrivateKeyFromSecretStorage === "function") { try { await crypto.loadSessionBackupPrivateKeyFromSecretStorage(); } catch (error) { const stored = await crypto.isKeyBackupKeyStored?.(version); if (!stored) throw error; } } }
-    const result = type === "passphrase" ? await crypto.restoreKeyBackupWithPassphrase(passphrase, { progressCallback: p => setCryptoState(s => ({ ...s, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })) }) : await crypto.restoreKeyBackup({ progressCallback: p => setCryptoState(s => ({ ...s, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })) }); try { await crypto.bootstrapCrossSigning?.({ authUploadDeviceSigningKeys: async () => ({}) }); } catch {} const retried = await retryLoadedRoomDecryption(connected.client); await refresh(connected.client); setCryptoState(s => ({ ...s, restoring: false, restoreProgress: 100, keyRestored: true })); Toast.success(`密钥恢复完成，导入 ${result?.imported ?? 0} 个会话，已重试解密 ${retried} 条已加载消息。`); } catch (error) { const raw = error?.message || "密钥恢复失败"; const mismatch = /does not match|mismatch|match.*decryption key/i.test(raw); const message = mismatch ? `恢复密钥与服务器备份版本 ${version} 不匹配。请确认这是该账号当前 Secret Storage 的恢复密钥；如果备份曾重置，请从 Element“设置 → 安全与隐私”获取最新密钥。` : raw; setCryptoState(s => ({ ...s, restoring: false, error: message })); Toast.error(message); } };
-  const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); setSyncing(true); setTimeout(() => setSyncing(false), 15000); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setPresence("offline"); setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const authExpired = /unknown token|M_UNKNOWN_TOKEN|401/i.test(text); const message = authExpired ? "Matrix 登录状态已失效，请重新登录" : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired) { client.stopClient?.(); window.orbitMatrixClient = null; localStorage.removeItem("orbit.matrix.session"); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); } }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const selectedRoom = room?.roomId === selectedIdRef.current; if (selectedRoom && !document.hidden) { Promise.resolve(markRoomRead(client, room?.roomId, event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && eventId && (room?.roomId !== selectedIdRef.current || document.hidden || !document.hasFocus?.()); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { orbitNotifiedEvents.add(eventId); if (orbitNotifiedEvents.size > 500) orbitNotifiedEvents.delete(orbitNotifiedEvents.values().next().value); const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); let desktopShown = false; if (typeof Notification !== "undefined" && Notification.permission === "granted") { try { new Notification(title, { body, tag: `orbit-${room?.roomId || "room"}`, data: { roomId: room?.roomId || null, eventId } }); desktopShown = true; } catch {} } if (!desktopShown || !document.hidden) Toast.info(`${title}：${body}`); } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", () => queueRefresh(client)); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user?.presence === "offline" ? "online" : (user?.presence || "online")); queueRefresh(client); }); client.on("Event.decrypted", () => queueRefresh(client)); queueRefresh(client); setShowLogin(false); };
+    const progressCallback = p => setCryptoState(s => ({ ...s, restoreStage: p?.stage || s.restoreStage, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })); const result = type === "passphrase" ? await crypto.restoreKeyBackupWithPassphrase(passphrase, { progressCallback }) : await crypto.restoreKeyBackup({ progressCallback }); try { await crypto.bootstrapCrossSigning?.({ authUploadDeviceSigningKeys: async () => ({}) }); } catch {} const retried = await retryLoadedRoomDecryption(connected.client); await refresh(connected.client); setCryptoState(s => ({ ...s, restoring: false, restoreProgress: 100, restoreStage: "done", keyRestored: true })); Toast.success(`密钥恢复完成，导入 ${result?.imported ?? 0} 个会话，已重试解密 ${retried} 条已加载消息。`); } catch (error) { const raw = error?.message || "密钥恢复失败"; const mismatch = /does not match|mismatch|match.*decryption key/i.test(raw); const message = mismatch ? `恢复密钥与服务器备份版本 ${version} 不匹配。请确认这是该账号当前 Secret Storage 的恢复密钥；如果备份曾重置，请从 Element“设置 → 安全与隐私”获取最新密钥。` : raw; setCryptoState(s => ({ ...s, restoring: false, restoreStage: "error", error: message })); Toast.error(message); } };
+  const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); setSyncing(true); setTimeout(() => setSyncing(false), 15000); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setPresence("offline"); setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const authExpired = /unknown token|M_UNKNOWN_TOKEN|401/i.test(text); const message = authExpired ? "Matrix 登录状态已失效，请重新登录" : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired) { client.stopClient?.(); window.orbitMatrixClient = null; localStorage.removeItem("orbit.matrix.session"); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); } }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room, toStartOfTimeline) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const selectedRoom = room?.roomId === selectedIdRef.current; const scrollNode = selectedRoom ? document.querySelector(".message-scroll") : null; const nearBottom = Boolean(scrollNode && scrollNode.scrollHeight - scrollNode.scrollTop - scrollNode.clientHeight <= 140); if (selectedRoom && !document.hidden && nearBottom) { Promise.resolve(markRoomRead(client, room?.roomId, event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && !toStartOfTimeline && eventId && (room?.roomId !== selectedIdRef.current || document.hidden || !document.hasFocus?.() || !nearBottom); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); if (!hasDecryptedNotificationContent(event)) { const fallbackTitle = notificationSenderName(event, room); const timer = setTimeout(() => { orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title: fallbackTitle, body: "几条消息", compact: true }); }, 1400); orbitPendingEncryptedNotifications.set(eventId, { room, eventId, title, timer }); } else { markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body }); } } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", () => queueRefresh(client)); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user?.presence === "offline" ? "online" : (user?.presence || "online")); queueRefresh(client); }); client.on("Event.decrypted", event => { queueRefresh(client); const eventId = event?.getId?.(); const pending = eventId && orbitPendingEncryptedNotifications.get(eventId); if (!pending) return; clearTimeout(pending.timer); orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room: pending.room, roomId: pending.room?.roomId, eventId, title: pending.title, body: notificationBody(event) }); }); queueRefresh(client); setShowLogin(false); };
   React.useEffect(() => { const saved = localStorage.getItem("orbit.matrix.session"); if (!saved) return; (async () => { try { const session = JSON.parse(saved); loadPersistedRecoveryKey(session.userId); const resolved = await resolveHomeserver(session.homeserver); const client = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, userId: session.userId, accessToken: session.accessToken, deviceId: session.deviceId, cryptoCallbacks: orbitCryptoCallbacks }); await initCryptoSafely(client); try { await client.getCrypto?.()?.loadSessionBackupPrivateKeyFromSecretStorage?.(); } catch {} window.orbitMatrixClient = client; connectedHandler({ client, userId: session.userId, homeserver: resolved.homeserver }); startOrbitSync(client, resolved); } catch { localStorage.removeItem("orbit.matrix.session"); } })(); }, []);
   React.useEffect(() => {
     const url = new URL(window.location.href);
@@ -2959,12 +3466,29 @@ function App() {
   const spaces = useMemo(() => rooms.filter(item => item.isSpace), [rooms]);
   const visibleRooms = useMemo(() => { if (viewMode === "spaces") { const space = spaces.find(item => item.id === activeSpaceId); if (!space) return []; const childIds = new Set(spaceChildIds(space.matrixRoom)); return rooms.filter(item => !item.isSpace && (childIds.has(item.id) || roomParentSpaceIds(item.matrixRoom).includes(space.id))); } if (viewMode === "groups") return rooms.filter(item => item.isGroup); return rooms.filter(item => !item.isSpace && item.isDirect); }, [rooms, spaces, viewMode, activeSpaceId]);
   const room = useMemo(() => visibleRooms.find(item => item.id === selectedId) || null, [visibleRooms, selectedId]);
-  const loadMore = async () => { if (!connected || !room) return false; try { const matrixRoom = room.matrixRoom; const before = (messages[room.id] || []).filter(item => item.type !== "empty").length; const beforeToken = matrixRoom?.oldState?.paginationToken; await connected.client.scrollback(matrixRoom, 40); const loaded = await roomMessages(matrixRoom, connected.userId, connected.client); const next = loaded.filter(item => item.type !== "empty"); setMessages(current => ({ ...current, [room.id]: loaded })); const afterToken = matrixRoom?.oldState?.paginationToken; const reachedStart = afterToken === null; return (!next.length && before === 0) || next.length > before || (!reachedStart && beforeToken !== null); } catch (error) { Toast.error(`历史消息加载失败：${error?.message || "未知错误"}`); return false; } };
+  const loadMore = async () => { if (!connected || !room) return false; try { const matrixRoom = room.matrixRoom; const before = (messages[room.id] || []).filter(item => item.type !== "empty").length; const beforeToken = matrixRoom?.oldState?.paginationToken; await connected.client.scrollback(matrixRoom, 40); const loaded = await roomMessages(matrixRoom, connected.userId, connected.client); const next = loaded.filter(item => item.type !== "empty"); setMessages(current => ({ ...current, [room.id]: loaded })); const afterToken = matrixRoom?.oldState?.paginationToken; const reachedStart = afterToken === null; // Continue only when scrollback made observable progress; some homeservers keep returning the same page at the boundary.
+    return (!next.length && before === 0) || next.length > before || (!reachedStart && afterToken !== beforeToken); } catch (error) { Toast.error(`历史消息加载失败：${error?.message || "未知错误"}`); return false; } };
   const send = async (text, _html, mentions = [], resolvedEmoji = []) => {
     if (!connected || !room) return;
     try {
       if (editing) {
-        await connected.client.sendMessage(room.id, { msgtype: "m.text", body: `* ${text}`, "m.new_content": { msgtype: "m.text", body: text }, "m.relates_to": { rel_type: "m.replace", event_id: editing.id } });
+        const validMentions = (mentions || []).filter(entry => entry?.userId && String(text).includes(`@${String(entry.name || "").replace(/^@/, "")}`));
+        const editedContent = resolvedEmoji.length ? createEmojiTextContent(text, resolvedEmoji, validMentions) : { msgtype: "m.text", body: text };
+        if (!resolvedEmoji.length && _html && /<img\b/i.test(String(_html))) {
+          editedContent.format = "org.matrix.custom.html";
+          editedContent.formatted_body = sanitizeFormattedBody(_html);
+        }
+        if (!editedContent.formatted_body && hasMarkdownSyntax(text)) {
+          const markdownHtml = markdownToHtml(text);
+          if (markdownHtml) { editedContent.format = "org.matrix.custom.html"; editedContent.formatted_body = markdownHtml; }
+        }
+        const replacementContent = {
+          msgtype: "m.text",
+          body: `* ${editedContent.body || text}`,
+          "m.new_content": editedContent,
+          "m.relates_to": { rel_type: "m.replace", event_id: editing.id },
+        };
+        await connected.client.sendMessage(room.id, replacementContent);
         setEditing(null);
       } else {
         const validMentions = (mentions || []).filter(entry => entry?.userId && String(text).includes(`@${String(entry.name || "").replace(/^@/, "")}`));
@@ -2974,9 +3498,16 @@ function App() {
         // Preserve interoperable Matrix formatting generated by the editor.
         // Plain messages stay compact; formatted messages carry the standard
         // org.matrix.custom.html fields understood by Element/Cinny.
-        if (!resolvedEmoji.length && _html && /<\/?(?:strong|b|em|i|u|del|s|code|pre|blockquote|ul|ol|li|h[1-3]|span|a|font|small|big)\b/i.test(_html)) {
+        if (!resolvedEmoji.length && _html && /<\/?(?:br|p|div|strong|b|em|i|u|del|s|code|pre|blockquote|ul|ol|li|h[1-3]|span|a|font|small|big)\b/i.test(_html)) {
           content.format = "org.matrix.custom.html";
           content.formatted_body = sanitizeFormattedBody(_html);
+        }
+        if (!content.formatted_body && hasMarkdownSyntax(text)) {
+          const markdownHtml = markdownToHtml(text);
+          if (markdownHtml) {
+            content.format = "org.matrix.custom.html";
+            content.formatted_body = markdownHtml;
+          }
         }
         if (validMentions.length) {
           content["m.mentions"] = { user_ids: [...new Set(validMentions.map(entry => entry.userId))] };
