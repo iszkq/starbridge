@@ -1191,6 +1191,23 @@ function downloadMatrixSession(client) {
   return session;
 }
 
+async function refreshMatrixSession(baseUrl, session) {
+  if (!session?.refreshToken) throw new Error("Session 文件没有 refresh token，无法续期");
+  const response = await fetchWithTimeout(`${baseUrl}/_matrix/client/v3/refresh`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refresh_token: session.refreshToken }),
+  }, 15000);
+  const refreshed = await response.json().catch(() => null);
+  if (!response.ok || !refreshed?.access_token) {
+    throw new Error(refreshed?.error || `Matrix 令牌刷新失败（HTTP ${response.status}）`);
+  }
+  session.accessToken = refreshed.access_token;
+  session.refreshToken = refreshed.refresh_token || session.refreshToken;
+  if (refreshed.expires_in_ms) session.accessTokenExpiresAt = Date.now() + refreshed.expires_in_ms;
+  return session;
+}
+
 async function readMatrixSessionFile(file) {
   if (!file) throw new Error("请选择 Session 文件");
   let parsed;
@@ -1220,27 +1237,17 @@ function createAuthenticatedMatrixClient(baseUrl, session) {
   if (session.refreshToken) {
     options.refreshToken = session.refreshToken;
     options.tokenRefreshFunction = async currentRefreshToken => {
-      const response = await fetchWithTimeout(`${baseUrl}/_matrix/client/v3/refresh`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refresh_token: currentRefreshToken }),
-      }, 15000);
-      const refreshed = await response.json().catch(() => null);
-      if (!response.ok || !refreshed?.access_token) {
-        throw new Error(refreshed?.error || `Matrix 令牌刷新失败（HTTP ${response.status}）`);
-      }
-      const nextRefreshToken = refreshed.refresh_token || currentRefreshToken;
-      session.accessToken = refreshed.access_token;
-      session.refreshToken = nextRefreshToken;
-      if (refreshed.expires_in_ms) session.accessTokenExpiresAt = Date.now() + refreshed.expires_in_ms;
+      const previousRefreshToken = session.refreshToken;
+      session.refreshToken = currentRefreshToken || previousRefreshToken;
+      await refreshMatrixSession(baseUrl, session);
       const stored = readMatrixSession();
       if (stored?.userId === session.userId && stored?.deviceId === session.deviceId) {
         saveMatrixSession({ ...stored, ...session });
       }
       return {
-        accessToken: refreshed.access_token,
-        refreshToken: nextRefreshToken,
-        ...(refreshed.expires_in_ms ? { expiry: new Date(Date.now() + refreshed.expires_in_ms) } : {}),
+        accessToken: session.accessToken,
+        refreshToken: session.refreshToken,
+        ...(session.accessTokenExpiresAt ? { expiry: new Date(session.accessTokenExpiresAt) } : {}),
       };
     };
   }
@@ -1251,9 +1258,19 @@ function createAuthenticatedMatrixClient(baseUrl, session) {
 async function connectWithMatrixSession(rawSession) {
   const session = normalizeMatrixSession(rawSession);
   const resolved = await resolveHomeserver(session.homeserver);
-  const client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, session);
+  let client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, session);
   if (typeof client.whoami === "function") {
-    const identity = await promiseWithTimeout(client.whoami(), 15000);
+    let identity;
+    try {
+      identity = await promiseWithTimeout(client.whoami(), 15000);
+    } catch (error) {
+      const raw = `${error?.message || ""} ${error?.errcode || ""}`;
+      const tokenInactive = error?.httpStatus === 401 || error?.statusCode === 401 || /401|token is not active|M_UNKNOWN_TOKEN/i.test(raw);
+      if (!tokenInactive || !session.refreshToken) throw error;
+      await refreshMatrixSession(resolved.clientBaseUrl, session);
+      client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, session);
+      identity = await promiseWithTimeout(client.whoami(), 15000);
+    }
     if (identity?.user_id && identity.user_id !== session.userId) {
       throw new Error("Session 文件对应的用户与服务器返回的用户不一致");
     }
