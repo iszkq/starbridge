@@ -267,6 +267,9 @@ button { cursor: pointer; }
 .settings-field-label { display: grid; gap: 7px; margin-bottom: 12px; color: #475467; font-size: 11px; font-weight: 600; }
 .settings-account-id { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 18px; padding: 10px 12px; border-radius: 7px; background: #f8fafc; color: #667085; font-size: 11px; }
 .settings-account-id code { max-width: 64%; overflow: hidden; color: #475467; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.session-import-note, .session-security-note { color: #98a2b3; font-size: 11px; line-height: 1.6; }
+.session-import-note { margin-top: -4px; }
+.session-security-note { margin-top: 12px; padding: 10px 12px; border: 1px solid #f1e4c3; border-radius: 7px; background: #fffbeb; color: #8a6d1d; }
 .settings-empty-state { display: grid; place-items: center; min-height: 170px; border: 1px dashed #d0d5dd; border-radius: 8px; color: #98a2b3; font-size: 12px; }
 .settings-about-version { margin-top: 24px; padding: 14px; border-radius: 8px; background: #f8fafc; color: #667085; font-size: 11px; }
 .security-card .settings-overview { display: none; }

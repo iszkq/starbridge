@@ -1106,6 +1106,166 @@ function promiseWithTimeout(promise, timeoutMs = 15000) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+const MATRIX_SESSION_STORAGE_KEY = "orbit.matrix.session";
+const MATRIX_SESSION_FILE_TYPE = "orbit.matrix.session";
+const MATRIX_SESSION_FILE_VERSION = 1;
+
+function readMatrixSession() {
+  try {
+    const raw = localStorage.getItem(MATRIX_SESSION_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveMatrixSession(session) {
+  if (!session?.homeserver || !session?.userId || !session?.accessToken || !session?.deviceId) return;
+  localStorage.setItem(MATRIX_SESSION_STORAGE_KEY, JSON.stringify({
+    homeserver: session.homeserver,
+    userId: session.userId,
+    accessToken: session.accessToken,
+    deviceId: session.deviceId,
+    ...(session.refreshToken ? { refreshToken: session.refreshToken } : {}),
+    ...(session.accessTokenExpiresAt ? { accessTokenExpiresAt: session.accessTokenExpiresAt } : {}),
+  }));
+}
+
+function matrixSessionFromLogin(homeserver, result) {
+  return {
+    homeserver,
+    userId: result.user_id,
+    accessToken: result.access_token,
+    deviceId: result.device_id,
+    ...(result.refresh_token ? { refreshToken: result.refresh_token } : {}),
+    ...(result.expires_in_ms ? { accessTokenExpiresAt: Date.now() + result.expires_in_ms } : {}),
+  };
+}
+
+function normalizeMatrixSession(value) {
+  const source = value?.session && typeof value.session === "object" ? value.session : value;
+  const session = {
+    homeserver: source?.homeserver || source?.homeServer || source?.baseUrl,
+    userId: source?.userId || source?.user_id,
+    accessToken: source?.accessToken || source?.access_token,
+    refreshToken: source?.refreshToken || source?.refresh_token,
+    deviceId: source?.deviceId || source?.device_id,
+  };
+  if (!session.homeserver || !session.userId || !session.accessToken || !session.deviceId) {
+    throw new Error("Session 文件缺少 homeserver、用户 ID、设备 ID 或访问令牌");
+  }
+  session.homeserver = normalizeHomeserverInput(session.homeserver);
+  return session;
+}
+
+function currentMatrixSession(client) {
+  const stored = readMatrixSession() || {};
+  return normalizeMatrixSession({
+    homeserver: stored.homeserver || client?.getHomeserverUrl?.(),
+    userId: client?.getUserId?.() || stored.userId,
+    accessToken: client?.getAccessToken?.() || stored.accessToken,
+    refreshToken: client?.getRefreshToken?.() || stored.refreshToken,
+    deviceId: client?.getDeviceId?.() || stored.deviceId,
+  });
+}
+
+function downloadMatrixSession(client) {
+  const session = currentMatrixSession(client);
+  const payload = {
+    format: MATRIX_SESSION_FILE_TYPE,
+    version: MATRIX_SESSION_FILE_VERSION,
+    exported_at: new Date().toISOString(),
+    warning: "This file contains Matrix login credentials. Keep it private and delete it when no longer needed.",
+    session,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  const safeUser = String(session.userId || "matrix-user").replace(/[^a-zA-Z0-9._-]+/g, "_");
+  anchor.href = url;
+  anchor.download = `orbit-matrix-session-${safeUser}.json`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+  return session;
+}
+
+async function readMatrixSessionFile(file) {
+  if (!file) throw new Error("请选择 Session 文件");
+  let parsed;
+  try {
+    parsed = JSON.parse(await file.text());
+  } catch {
+    throw new Error("Session 文件不是有效的 JSON");
+  }
+  if (parsed?.format && parsed.format !== MATRIX_SESSION_FILE_TYPE) {
+    throw new Error("这不是 Orbit Matrix Session 文件");
+  }
+  if (parsed?.version && Number(parsed.version) > MATRIX_SESSION_FILE_VERSION) {
+    throw new Error("Session 文件版本过新，请先更新 Orbit");
+  }
+  return normalizeMatrixSession(parsed?.session || parsed);
+}
+
+function createAuthenticatedMatrixClient(baseUrl, session) {
+  let client;
+  const options = {
+    baseUrl,
+    userId: session.userId,
+    accessToken: session.accessToken,
+    deviceId: session.deviceId,
+    cryptoCallbacks: orbitCryptoCallbacks,
+  };
+  if (session.refreshToken) {
+    options.refreshToken = session.refreshToken;
+    options.tokenRefreshFunction = async currentRefreshToken => {
+      const response = await fetchWithTimeout(`${baseUrl}/_matrix/client/v3/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: currentRefreshToken }),
+      }, 15000);
+      const refreshed = await response.json().catch(() => null);
+      if (!response.ok || !refreshed?.access_token) {
+        throw new Error(refreshed?.error || `Matrix 令牌刷新失败（HTTP ${response.status}）`);
+      }
+      const nextRefreshToken = refreshed.refresh_token || currentRefreshToken;
+      session.accessToken = refreshed.access_token;
+      session.refreshToken = nextRefreshToken;
+      if (refreshed.expires_in_ms) session.accessTokenExpiresAt = Date.now() + refreshed.expires_in_ms;
+      const stored = readMatrixSession();
+      if (stored?.userId === session.userId && stored?.deviceId === session.deviceId) {
+        saveMatrixSession({ ...stored, ...session });
+      }
+      return {
+        accessToken: refreshed.access_token,
+        refreshToken: nextRefreshToken,
+        ...(refreshed.expires_in_ms ? { expiry: new Date(Date.now() + refreshed.expires_in_ms) } : {}),
+      };
+    };
+  }
+  client = MatrixSDK.createClient(options);
+  return client;
+}
+
+async function connectWithMatrixSession(rawSession) {
+  const session = normalizeMatrixSession(rawSession);
+  const resolved = await resolveHomeserver(session.homeserver);
+  const client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, session);
+  if (typeof client.whoami === "function") {
+    const identity = await promiseWithTimeout(client.whoami(), 15000);
+    if (identity?.user_id && identity.user_id !== session.userId) {
+      throw new Error("Session 文件对应的用户与服务器返回的用户不一致");
+    }
+    if (identity?.device_id && identity.device_id !== session.deviceId) {
+      throw new Error("Session 文件对应的设备与服务器返回的设备不一致");
+    }
+  }
+  await initCryptoSafely(client);
+  saveMatrixSession(session);
+  return { resolved, session, client };
+}
+
 async function getMatrixLoginFlows(baseUrl) {
   const response = await fetchWithTimeout(`${baseUrl}/_matrix/client/v3/login`, {}, 5000);
   const body = await response.json().catch(() => null);
@@ -1116,10 +1276,11 @@ async function getMatrixLoginFlows(baseUrl) {
 async function loginWithMatrixToken(homeserver, token) {
   const resolved = await resolveHomeserver(homeserver);
   const loginClient = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, cryptoCallbacks: orbitCryptoCallbacks });
-  const result = await promiseWithTimeout(loginClient.login("m.login.token", { token }));
-  const client = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, userId: result.user_id, accessToken: result.access_token, deviceId: result.device_id, cryptoCallbacks: orbitCryptoCallbacks });
+  const result = await promiseWithTimeout(loginClient.login("m.login.token", { token, refresh_token: true }));
+  const session = matrixSessionFromLogin(resolved.homeserver, result);
+  const client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, session);
   await initCryptoSafely(client);
-  return { resolved, result, client };
+  return { resolved, result, session, client };
 }
 
 async function resolveHomeserver(input, { detect = true } = {}) {
@@ -1546,6 +1707,7 @@ function LoginDialog({ onConnected, onClose }) {
   const [loading, setLoading] = useState(false);
   const [loginFlows, setLoginFlows] = useState([]);
   const [checkingFlows, setCheckingFlows] = useState(false);
+  const sessionFileRef = useRef(null);
   const checkLoginFlows = async () => {
     if (!homeserver.trim()) return;
     setCheckingFlows(true);
@@ -1566,6 +1728,24 @@ function LoginDialog({ onConnected, onClose }) {
       window.location.assign(`${resolved.clientBaseUrl}/_matrix/client/v3/login/sso/redirect?redirectUrl=${encodeURIComponent(redirectUrl)}`);
     } catch (error) { setLoading(false); Toast.error(`SSO 登录失败：${error?.message || "无法启动单点登录"}`); }
   };
+  const importSession = async event => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    setLoading(true);
+    try {
+      const rawSession = await readMatrixSessionFile(file);
+      const { resolved, session, client } = await connectWithMatrixSession(rawSession);
+      window.orbitMatrixClient = client;
+      onConnected({ client, userId: session.userId, homeserver: resolved.homeserver });
+      startOrbitSync(client, resolved);
+      Toast.success(session.refreshToken ? "Session 导入成功，已复用原 Matrix 设备" : "Session 导入成功；当前文件没有 refresh token");
+    } catch (error) {
+      Toast.error(`Session 导入失败：${error?.message || "请检查文件内容或登录状态"}`);
+    } finally {
+      setLoading(false);
+    }
+  };
   const submit = async e => {
     e.preventDefault(); setLoading(true);
     try {
@@ -1574,10 +1754,11 @@ function LoginDialog({ onConnected, onClose }) {
       let detectedResolved = null;
       const detectionPromise = resolveHomeserver(input).then(value => { detectedResolved = value; return value; }).catch(() => null);
       const loginClient = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, cryptoCallbacks: orbitCryptoCallbacks });
-      const result = await promiseWithTimeout(loginClient.login("m.login.password", { identifier: { type: "m.id.user", user: username.trim() }, password }));
-      const client = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, userId: result.user_id, accessToken: result.access_token, deviceId: result.device_id, cryptoCallbacks: orbitCryptoCallbacks });
+      const result = await promiseWithTimeout(loginClient.login("m.login.password", { identifier: { type: "m.id.user", user: username.trim() }, password, refresh_token: true }));
+      const session = matrixSessionFromLogin(resolved.homeserver, result);
+      const client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, session);
       await initCryptoSafely(client);
-      localStorage.setItem("orbit.matrix.session", JSON.stringify({ homeserver: resolved.homeserver, userId: result.user_id, accessToken: result.access_token, deviceId: result.device_id }));
+      saveMatrixSession(session);
       window.orbitMatrixClient = client;
       const syncResolved = detectedResolved || resolved;
       onConnected({ client, userId: result.user_id, homeserver: syncResolved.homeserver });
@@ -1595,7 +1776,9 @@ function LoginDialog({ onConnected, onClose }) {
       h("label", { className: "form-label" }, "Homeserver 或域名", h(Input, { value: homeserver, onChange: setHomeserver, onBlur: checkLoginFlows, required: true, placeholder: "mtx01.cc、matrix.example.com 或 https://matrix.example.com" })),
       h("label", { className: "form-label" }, "用户名", h(Input, { value: username, onChange: setUsername, required: true, placeholder: "alice 或 @alice:example.com" })),
       h("label", { className: "form-label" }, "密码", h(AntInput.Password, { value: password, onChange: event => setPassword(event.target.value), required: true, placeholder: "请输入 Matrix 密码", visibilityToggle: true })),
-      h("div", { className: "modal-actions" }, h(UiButton, { htmlType: "button", className: "ghost-btn", onClick: onClose }, "取消"), loginFlows.includes("m.login.sso") && h(UiButton, { htmlType: "button", className: "ghost-btn", disabled: loading || checkingFlows, onClick: startSsoLogin }, "使用 SSO 登录"), h(UiButton, { htmlType: "submit", variant: "primary", className: "primary-btn", disabled: loading }, loading ? "登录中…" : "登录并同步"))
+      h("input", { ref: sessionFileRef, type: "file", accept: ".json,application/json", hidden: true, onChange: importSession }),
+      h("div", { className: "session-import-note" }, "已有 Orbit Session 文件？导入后会直接复用文件中的 Matrix 设备，不会再次输入密码。文件只在本浏览器读取。"),
+      h("div", { className: "modal-actions" }, h(UiButton, { htmlType: "button", className: "ghost-btn", onClick: onClose }, "取消"), h(UiButton, { htmlType: "button", className: "ghost-btn", disabled: loading, onClick: () => sessionFileRef.current?.click?.() }, "导入 Session"), loginFlows.includes("m.login.sso") && h(UiButton, { htmlType: "button", className: "ghost-btn", disabled: loading || checkingFlows, onClick: startSsoLogin }, "使用 SSO 登录"), h(UiButton, { htmlType: "submit", variant: "primary", className: "primary-btn", disabled: loading }, loading ? "登录中…" : "登录并同步"))
     )
   ));
 }
@@ -3400,8 +3583,8 @@ function App() {
     }
     if (type === "secret") { if (typeof crypto.loadSessionBackupPrivateKeyFromSecretStorage === "function") { try { await crypto.loadSessionBackupPrivateKeyFromSecretStorage(); } catch (error) { const stored = await crypto.isKeyBackupKeyStored?.(version); if (!stored) throw error; } } }
     const progressCallback = p => setCryptoState(s => ({ ...s, restoreStage: p?.stage || s.restoreStage, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })); const result = type === "passphrase" ? await crypto.restoreKeyBackupWithPassphrase(passphrase, { progressCallback }) : await crypto.restoreKeyBackup({ progressCallback }); try { await crypto.bootstrapCrossSigning?.({ authUploadDeviceSigningKeys: async () => ({}) }); } catch {} const retried = await retryLoadedRoomDecryption(connected.client); await refresh(connected.client); setCryptoState(s => ({ ...s, restoring: false, restoreProgress: 100, restoreStage: "done", keyRestored: true })); Toast.success(`密钥恢复完成，导入 ${result?.imported ?? 0} 个会话，已重试解密 ${retried} 条已加载消息。`); } catch (error) { const raw = error?.message || "密钥恢复失败"; const mismatch = /does not match|mismatch|match.*decryption key/i.test(raw); const message = mismatch ? `恢复密钥与服务器备份版本 ${version} 不匹配。请确认这是该账号当前 Secret Storage 的恢复密钥；如果备份曾重置，请从 Element“设置 → 安全与隐私”获取最新密钥。` : raw; setCryptoState(s => ({ ...s, restoring: false, restoreStage: "error", error: message })); Toast.error(message); } };
-  const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); setSyncing(true); setTimeout(() => setSyncing(false), 15000); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setPresence("offline"); setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const authExpired = /unknown token|M_UNKNOWN_TOKEN|401/i.test(text); const message = authExpired ? "Matrix 登录状态已失效，请重新登录" : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired) { client.stopClient?.(); window.orbitMatrixClient = null; localStorage.removeItem("orbit.matrix.session"); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); } }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room, toStartOfTimeline) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const selectedRoom = room?.roomId === selectedIdRef.current; const scrollNode = selectedRoom ? document.querySelector(".message-scroll") : null; const nearBottom = Boolean(scrollNode && scrollNode.scrollHeight - scrollNode.scrollTop - scrollNode.clientHeight <= 140); if (selectedRoom && !document.hidden && nearBottom) { Promise.resolve(markRoomRead(client, room?.roomId, event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && !toStartOfTimeline && eventId && (room?.roomId !== selectedIdRef.current || document.hidden || !document.hasFocus?.() || !nearBottom); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); if (!hasDecryptedNotificationContent(event)) { const fallbackTitle = notificationSenderName(event, room); const timer = setTimeout(() => { orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title: fallbackTitle, body: "几条消息", compact: true }); }, 1400); orbitPendingEncryptedNotifications.set(eventId, { room, eventId, title, timer }); } else { markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body }); } } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", () => queueRefresh(client)); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user?.presence === "offline" ? "online" : (user?.presence || "online")); queueRefresh(client); }); client.on("Event.decrypted", event => { queueRefresh(client); const eventId = event?.getId?.(); const pending = eventId && orbitPendingEncryptedNotifications.get(eventId); if (!pending) return; clearTimeout(pending.timer); orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room: pending.room, roomId: pending.room?.roomId, eventId, title: pending.title, body: notificationBody(event) }); }); queueRefresh(client); setShowLogin(false); };
-  React.useEffect(() => { const saved = localStorage.getItem("orbit.matrix.session"); if (!saved) return; (async () => { try { const session = JSON.parse(saved); loadPersistedRecoveryKey(session.userId); const resolved = await resolveHomeserver(session.homeserver); const client = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, userId: session.userId, accessToken: session.accessToken, deviceId: session.deviceId, cryptoCallbacks: orbitCryptoCallbacks }); await initCryptoSafely(client); try { await client.getCrypto?.()?.loadSessionBackupPrivateKeyFromSecretStorage?.(); } catch {} window.orbitMatrixClient = client; connectedHandler({ client, userId: session.userId, homeserver: resolved.homeserver }); startOrbitSync(client, resolved); } catch { localStorage.removeItem("orbit.matrix.session"); } })(); }, []);
+  const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); setSyncing(true); setTimeout(() => setSyncing(false), 15000); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setPresence("offline"); setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const authExpired = /unknown token|M_UNKNOWN_TOKEN|401/i.test(text); const message = authExpired ? (client.getRefreshToken?.() ? "Matrix 访问令牌过期，正在尝试刷新" : "Matrix 登录状态已失效，请重新登录") : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired && !client.getRefreshToken?.()) { client.stopClient?.(); window.orbitMatrixClient = null; localStorage.removeItem(MATRIX_SESSION_STORAGE_KEY); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); } }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room, toStartOfTimeline) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const selectedRoom = room?.roomId === selectedIdRef.current; const scrollNode = selectedRoom ? document.querySelector(".message-scroll") : null; const nearBottom = Boolean(scrollNode && scrollNode.scrollHeight - scrollNode.scrollTop - scrollNode.clientHeight <= 140); if (selectedRoom && !document.hidden && nearBottom) { Promise.resolve(markRoomRead(client, room?.roomId, event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && !toStartOfTimeline && eventId && (room?.roomId !== selectedIdRef.current || document.hidden || !document.hasFocus?.() || !nearBottom); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); if (!hasDecryptedNotificationContent(event)) { const fallbackTitle = notificationSenderName(event, room); const timer = setTimeout(() => { orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title: fallbackTitle, body: "几条消息", compact: true }); }, 1400); orbitPendingEncryptedNotifications.set(eventId, { room, eventId, title, timer }); } else { markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body }); } } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", () => { queueRefresh(client); }); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user?.presence === "offline" ? "online" : (user?.presence || "online")); queueRefresh(client); }); client.on("Event.decrypted", event => { queueRefresh(client); const eventId = event?.getId?.(); const pending = eventId && orbitPendingEncryptedNotifications.get(eventId); if (!pending) return; clearTimeout(pending.timer); orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room: pending.room, roomId: pending.room?.roomId, eventId, title: pending.title, body: notificationBody(event) }); }); queueRefresh(client); setShowLogin(false); };
+  React.useEffect(() => { const session = readMatrixSession(); if (!session) return; (async () => { try { loadPersistedRecoveryKey(session.userId); const resolved = await resolveHomeserver(session.homeserver); const client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, session); await initCryptoSafely(client); try { await client.getCrypto?.()?.loadSessionBackupPrivateKeyFromSecretStorage?.(); } catch {} window.orbitMatrixClient = client; connectedHandler({ client, userId: session.userId, homeserver: resolved.homeserver }); startOrbitSync(client, resolved); } catch { localStorage.removeItem(MATRIX_SESSION_STORAGE_KEY); } })(); }, []);
   React.useEffect(() => {
     const url = new URL(window.location.href);
     const loginToken = url.searchParams.get("loginToken");
@@ -3413,9 +3596,9 @@ function App() {
     (async () => {
       try {
         const pending = JSON.parse(pendingRaw);
-        const { resolved, result, client } = await loginWithMatrixToken(pending.homeserver, loginToken);
+        const { resolved, result, session, client } = await loginWithMatrixToken(pending.homeserver, loginToken);
         localStorage.removeItem("orbit.matrix.sso.pending");
-        localStorage.setItem("orbit.matrix.session", JSON.stringify({ homeserver: resolved.homeserver, userId: result.user_id, accessToken: result.access_token, deviceId: result.device_id }));
+        saveMatrixSession(session);
         window.orbitMatrixClient = client;
         connectedHandler({ client, userId: result.user_id, homeserver: resolved.homeserver });
         startOrbitSync(client, resolved);
@@ -3612,7 +3795,7 @@ function App() {
   const jumpTo = async eventId => { if (!eventId) return; const safe = String(eventId).replace(/[^a-zA-Z0-9_-]/g, "_"); let node = document.getElementById(`event-${safe}`); if (!node && room) { try { await connected.client.scrollback(room.matrixRoom, 100); await refresh(connected.client); await new Promise(resolve => setTimeout(resolve, 80)); node = document.getElementById(`event-${safe}`); } catch {} } if (node) { node.scrollIntoView({ behavior: "smooth", block: "center" }); node.classList.add("message-highlight"); setTimeout(() => node.classList.remove("message-highlight"), 1600); } else Toast.info("原消息不在当前服务器返回的历史范围内"); };
   window.orbitNavigateToMessage = (roomId, eventId) => { if (!roomId) return; const target = rooms.find(entry => entry.id === roomId); setViewMode(target?.isGroup ? "groups" : "messages"); setSelectedId(roomId); markRead(roomId); setTimeout(() => { const safe = String(eventId || "").replace(/[^a-zA-Z0-9_-]/g, "_"); const node = eventId && document.getElementById(`event-${safe}`); if (node) { node.scrollIntoView({ behavior: "smooth", block: "center" }); node.classList.add("message-highlight"); setTimeout(() => node.classList.remove("message-highlight"), 1600); } }, 180); };
   const leaveRoom = async () => { if (!room || !confirm(`确定离开「${room.name}」吗？`)) return; try { await connected.client.leave(room.id); setSelectedId(null); refresh(connected.client); Toast.success("已离开房间"); } catch (error) { Toast.error(`离开房间失败：${error?.message || "未知错误"}`); } };
-  const logout = async () => { try { await connected.client.logout(); } catch {} connected.client.stopClient(); pendingJoinRoomIdsRef.current.clear(); optimisticJoinedRoomsRef.current.clear(); window.orbitMatrixClient = null; localStorage.removeItem("orbit.matrix.session"); try { localStorage.removeItem(recoveryStorageKey(connected.userId)); localStorage.removeItem(localVerificationKey(connected.client)); } catch {} setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); Toast.success("已退出 Matrix"); };
+  const logout = async () => { try { await connected.client.logout(); } catch {} connected.client.stopClient(); pendingJoinRoomIdsRef.current.clear(); optimisticJoinedRoomsRef.current.clear(); window.orbitMatrixClient = null; localStorage.removeItem(MATRIX_SESSION_STORAGE_KEY); try { localStorage.removeItem(recoveryStorageKey(connected.userId)); localStorage.removeItem(localVerificationKey(connected.client)); } catch {} setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); Toast.success("已退出 Matrix"); };
   if (!connected) return h("div", { className: "app-shell" }, h("div", { className: "sidebar landing-sidebar" }, h("div", { className: "brand-row" }, h("div", { className: "brand" }, h("div", { className: "brand-mark" }, "O"), h("div", null, "Orbit", h("div", { className: "workspace-pill" }, "Matrix 工作台")))), h("div", { className: "sidebar-footer" }, h("div", { className: "connection-state" }, h("span", { className: "offline-dot" }), "未连接"))), h("main", { className: "main-panel" }, h("div", { className: "login-landing" }, h("div", { className: "landing-mark" }, "O"), h("div", { className: "landing-title" }, "连接你的 Matrix 世界"), h("div", { className: "landing-copy" }, "登录后同步真实房间、消息和成员。"), h("button", { className: "primary-btn landing-button", onClick: () => setShowLogin(true) }, "连接 Matrix 账户"))), showLogin && h(LoginDialog, { onConnected: connectedHandler, onClose: () => setShowLogin(false) }));
   const setSelectingState = active => {
     if (active === false) {
@@ -3632,9 +3815,10 @@ function AccountDialog({ client, onClose, cryptoState, onRestore }) {
   const [notificationPermission, setNotificationPermission] = useState(() => typeof Notification === "undefined" ? "unsupported" : Notification.permission);
   const saveName = async () => { const value = displayName.trim(); if (!value) return; try { await client.setDisplayName?.(value); Toast.success("昵称已更新"); } catch (error) { Toast.error(`昵称更新失败：${error?.message || "请检查账户权限"}`); } };
   const enableNotifications = async () => { if (typeof Notification === "undefined") return Toast.error("当前浏览器不支持桌面通知"); const result = await Notification.requestPermission(); setNotificationPermission(result); Toast[result === "granted" ? "success" : "warning"](result === "granted" ? "桌面通知已开启" : "桌面通知未授权"); };
+  const exportSession = () => { try { const session = downloadMatrixSession(client); Toast.success(`Session 已下载：${session.deviceId}`); } catch (error) { Toast.error(`Session 导出失败：${error?.message || "当前会话信息不完整"}`); } };
   if (active === "security") return h(LegacyAccountDialog, { client, onClose, onBack: () => setActive("general"), cryptoState, onRestore });
   const nav = [{ id: "general", label: "常规", hint: "界面与消息" }, { id: "account", label: "账号", hint: "资料与身份" }, { id: "notifications", label: "通知", hint: "提醒方式" }, { id: "security", label: "设备与安全", hint: "加密与设备" }, { id: "emoji", label: "表情与分类", hint: "云端目录" }, { id: "ai", label: "AI 助手", hint: "可选能力" }, { id: "developer", label: "开发工具", hint: "连接信息" }, { id: "about", label: "关于", hint: "版本信息" }];
-  const panel = active === "general" ? h("div", { className: "settings-panel-content" }, h("h3", null, "常规"), h("p", null, "保持清晰、克制的企业工作台体验。"), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "外观主题"), h("span", null, "浅色 · 企业蓝")), h("span", { className: "settings-value-chip" }, "当前")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "消息排版"), h("span", null, "紧凑布局，长文本保留原始换行")), h("span", { className: "settings-value-chip" }, "紧凑")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "发送方式"), h("span", null, "Enter 发送 · Shift + Enter 换行")), h("span", { className: "settings-value-chip" }, "默认"))) : active === "account" ? h("div", { className: "settings-panel-content" }, h("h3", null, "账号"), h("p", null, "你的资料会通过 Matrix 账户接口同步到其他客户端。"), h("label", { className: "settings-field-label" }, "显示昵称", h(Input, { value: displayName, onChange: setDisplayName, placeholder: "输入显示昵称" })), h(UiButton, { variant: "primary", onClick: saveName }, "保存昵称"), h("div", { className: "settings-account-id" }, h("span", null, "Matrix ID"), h("code", null, client.getUserId?.() || "未知"))) : active === "notifications" ? h("div", { className: "settings-panel-content" }, h("h3", null, "通知"), h("p", null, "只在后台或当前房间之外提醒新消息。"), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "桌面通知"), h("span", null, notificationPermission === "granted" ? "浏览器通知已授权" : "需要授权后接收提醒")), h(UiButton, { size: "small", onClick: enableNotifications }, notificationPermission === "granted" ? "已开启" : "开启")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "未读红点"), h("span", null, "房间列表会显示未读数量")), h("span", { className: "settings-value-chip" }, "已启用"))) : active === "emoji" ? h("div", { className: "settings-panel-content" }, h("h3", null, "表情与分类"), h("p", null, "从云端目录加载分类，发送时使用标准 Matrix 图片事件，GIF 保留动画。"), h("div", { className: "settings-account-id" }, h("span", null, "目录地址"), h("code", null, "image.527012.xyz/index.json")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "已加载分类"), h("span", null, "QQ、钉钉、月薪喵、B 站等")), h("span", { className: "settings-value-chip" }, "云端"))) : active === "ai" ? h("div", { className: "settings-panel-content" }, h("h3", null, "AI 助手"), h("p", null, "当前未配置 AI 服务。配置后可在不影响 Matrix 数据的前提下启用辅助能力。"), h("div", { className: "settings-empty-state" }, "未配置")) : active === "developer" ? h("div", { className: "settings-panel-content" }, h("h3", null, "开发工具"), h("div", { className: "settings-account-id" }, h("span", null, "Homeserver"), h("code", null, client.getHomeserverUrl?.() || "未知")), h("div", { className: "settings-account-id" }, h("span", null, "设备 ID"), h("code", null, client.getDeviceId?.() || "未知")), h("div", { className: "settings-account-id" }, h("span", null, "Matrix SDK"), h("code", null, "matrix-js-sdk 42.3.0"))) : h("div", { className: "settings-panel-content" }, h("h3", null, "关于"), h("p", null, "Orbit 是基于 Matrix 的企业级聊天工作台。"), h("div", { className: "settings-about-version" }, "Orbit Web · Matrix Client-Server API · E2EE Rust Crypto"));
+  const panel = active === "general" ? h("div", { className: "settings-panel-content" }, h("h3", null, "常规"), h("p", null, "保持清晰、克制的企业工作台体验。"), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "外观主题"), h("span", null, "浅色 · 企业蓝")), h("span", { className: "settings-value-chip" }, "当前")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "消息排版"), h("span", null, "紧凑布局，长文本保留原始换行")), h("span", { className: "settings-value-chip" }, "紧凑")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "发送方式"), h("span", null, "Enter 发送 · Shift + Enter 换行")), h("span", { className: "settings-value-chip" }, "默认"))) : active === "account" ? h("div", { className: "settings-panel-content" }, h("h3", null, "账号"), h("p", null, "你的资料会通过 Matrix 账户接口同步到其他客户端。"), h("label", { className: "settings-field-label" }, "显示昵称", h(Input, { value: displayName, onChange: setDisplayName, placeholder: "输入显示昵称" })), h(UiButton, { variant: "primary", onClick: saveName }, "保存昵称"), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "Matrix Session"), h("span", null, "导出后可在其他浏览器复用同一个设备")), h(UiButton, { size: "small", onClick: exportSession }, "下载 Session")), h("div", { className: "session-security-note" }, "Session 文件包含登录凭据，请只保存到你信任的位置，不要发送给他人。端到端加密密钥不会包含在此文件中。"), h("div", { className: "settings-account-id" }, h("span", null, "Matrix ID"), h("code", null, client.getUserId?.() || "未知"))) : active === "notifications" ? h("div", { className: "settings-panel-content" }, h("h3", null, "通知"), h("p", null, "只在后台或当前房间之外提醒新消息。"), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "桌面通知"), h("span", null, notificationPermission === "granted" ? "浏览器通知已授权" : "需要授权后接收提醒")), h(UiButton, { size: "small", onClick: enableNotifications }, notificationPermission === "granted" ? "已开启" : "开启")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "未读红点"), h("span", null, "房间列表会显示未读数量")), h("span", { className: "settings-value-chip" }, "已启用"))) : active === "emoji" ? h("div", { className: "settings-panel-content" }, h("h3", null, "表情与分类"), h("p", null, "从云端目录加载分类，发送时使用标准 Matrix 图片事件，GIF 保留动画。"), h("div", { className: "settings-account-id" }, h("span", null, "目录地址"), h("code", null, "image.527012.xyz/index.json")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "已加载分类"), h("span", null, "QQ、钉钉、月薪喵、B 站等")), h("span", { className: "settings-value-chip" }, "云端"))) : active === "ai" ? h("div", { className: "settings-panel-content" }, h("h3", null, "AI 助手"), h("p", null, "当前未配置 AI 服务。配置后可在不影响 Matrix 数据的前提下启用辅助能力。"), h("div", { className: "settings-empty-state" }, "未配置")) : active === "developer" ? h("div", { className: "settings-panel-content" }, h("h3", null, "开发工具"), h("div", { className: "settings-account-id" }, h("span", null, "Homeserver"), h("code", null, client.getHomeserverUrl?.() || "未知")), h("div", { className: "settings-account-id" }, h("span", null, "设备 ID"), h("code", null, client.getDeviceId?.() || "未知")), h("div", { className: "settings-account-id" }, h("span", null, "Matrix SDK"), h("code", null, "matrix-js-sdk 42.3.0"))) : h("div", { className: "settings-panel-content" }, h("h3", null, "关于"), h("p", null, "Orbit 是基于 Matrix 的企业级聊天工作台。"), h("div", { className: "settings-about-version" }, "Orbit Web · Matrix Client-Server API · E2EE Rust Crypto"));
   return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card settings-card" }, h("div", { className: "modal-head settings-card-head" }, h("div", null, h("div", { className: "modal-title" }, "我的设置"), h("div", { className: "modal-copy" }, "按分类管理账户、通知和设备安全。")), h(UiButton, { className: "icon-button", type: "text", onClick: onClose, "aria-label": "关闭" }, "×")), h("div", { className: "settings-layout" }, h("nav", { className: "settings-sidebar", "aria-label": "设置分类" }, nav.map(item => h("button", { type: "button", key: item.id, className: `settings-nav-item ${active === item.id ? "active" : ""}`, onClick: () => setActive(item.id) }, h("span", null, item.label), h("small", null, item.hint)))), h("section", { className: "settings-panel" }, panel))));
 }
 
