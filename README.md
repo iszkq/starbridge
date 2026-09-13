@@ -23,7 +23,6 @@
 - 会话：实时 timeline、历史分页、回复、编辑、撤回、表情回应、已读回执、输入状态与文件/图片发送。
 - 线程与关系：线程回复使用 `m.thread`，消息编辑、撤回、回应会在时间线中聚合显示。
 - 数据可靠性：登录会话保存在浏览器本地（保存 access token、refresh token 和 device ID，不保存密码），刷新页面自动恢复；支持刷新令牌的 homeserver 会在访问令牌过期时自动续期并保留原设备。
-- Session 搬运：已登录后可从“设置 → 账号”下载 Session JSON，在登录窗口导入后复用同一个 Matrix 设备；Session 文件包含敏感登录凭据，只应保存在可信位置，且不包含 E2EE 密钥。
 - 协作侧栏：房间简介、成员头像、共享文件、隐私说明。
 - Matrix 连接：Homeserver / 用户名 / 密码登录弹窗，成功后启动初始同步并发送真实消息；退出登录会调用 `client.logout()`。
 - Homeserver 发现：如果输入的是 Element 网页域名，会读取 `/.well-known/matrix/client` 并自动切换到真实的 `m.homeserver.base_url`；连接前还会验证 `/_matrix/client/versions`。

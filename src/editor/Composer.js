@@ -79,13 +79,76 @@ export const PlainComposer = React.forwardRef(function PlainComposer({ value, on
   });
 });
 
+
+function editorLeafText(node) {
+  if (node?.type?.name === "orbitEmoji") return node.attrs?.token || `:${node.attrs?.name || "表情"}:`;
+  if (node?.type?.name === "hardBreak") return "\n";
+  return "";
+}
+
+function serializeEditorText(editor) {
+  if (!editor) return "";
+  return editor.state.doc.textBetween(0, editor.state.doc.content.size, "", editorLeafText);
+}
+
+function findEmojiItem(name, extraItems = []) {
+  const needle = String(name || "").replace(/^:+|:+$/g, "").trim().toLowerCase();
+  if (!needle) return null;
+  return [...(window.orbitEmojiItems || []), ...(extraItems || [])].find(entry =>
+    String(entry?.name || "").trim().toLowerCase() === needle
+    || String(entry?.shortcode || "").replace(/^:+|:+$/g, "").trim().toLowerCase() === needle
+  ) || null;
+}
+
+function emojiAttrsFromElement(element) {
+  const image = element?.tagName === "IMG" ? element : element?.querySelector?.("img");
+  const token = String(element?.getAttribute?.("data-emoji-token") || image?.getAttribute?.("data-emoji-token") || "").trim();
+  const alt = String(image?.getAttribute?.("alt") || image?.getAttribute?.("title") || element?.getAttribute?.("data-alt") || "").replace(/^:+|:+$/g, "").trim();
+  const name = alt || token.replace(/^:+|:+$/g, "") || "表情";
+  return {
+    token: token || `:${name}:`,
+    name,
+    src: image?.getAttribute?.("src") || element?.getAttribute?.("data-src") || "",
+    mxc: element?.getAttribute?.("data-mxc") || image?.getAttribute?.("data-mxc") || "",
+  };
+}
+
+function textToEditorHtml(text, extraItems = []) {
+  const source = String(text || "").replace(/:K歌:/gi, "");
+  const html = source.split(/(:[^:\s]+:)/g).map(part => {
+    const match = part.match(/^:([^:\s]+):$/);
+    const item = match && findEmojiItem(match[1], extraItems);
+    if (!item) return editorEscape(part).replace(/\n/g, "<br>");
+    const token = `:${String(item.name || item.shortcode || match[1]).replace(/^:+|:+$/g, "")}:`;
+    const src = item.thumbUrl || item.url || "";
+    return `<span class="editor-emoji-chip" data-emoji-token="${editorEscape(token)}" data-mxc="${editorEscape(item.mxc || "")}" contenteditable="false"><img draggable="false" src="${editorEscape(src)}" alt="${editorEscape(item.name || token)}"><span class="editor-emoji-label">${editorEscape(item.name || token)}</span></span>`;
+  }).join("");
+  if (!html) return "";
+  return `<p>${html}</p>`;
+}
+
+function flattenPastedHtml(html) {
+  return String(html || "")
+    .replace(/<br\b[^>]*class\s*=\s*(["'])[^"']*ProseMirror-trailingBreak[^"']*\1[^>]*>/gi, "")
+    .replace(/<\/(?:p|div|h[1-6]|li|blockquote)>\s*<(?:p|div|h[1-6]|li|blockquote)(?:\s[^>]*)?>/gi, "<br>")
+    .replace(/<\/?(?:p|div)(?:\s[^>]*)?>/gi, "");
+}
+
 export const HaloComposer = React.forwardRef(function HaloComposer({ value, onChange, onKeyDown, onFiles, placeholder, toolbarExtra, emojiFallbackItems = [] }, ref) {
   const hostRef = useRef(null);
   const editorRef = useRef(null);
+  const lastEmittedRef = useRef(String(value || ""));
+  const valueRef = useRef(value);
+  const onChangeRef = useRef(onChange);
+  const fallbackRef = useRef(emojiFallbackItems);
+  valueRef.current = value;
+  onChangeRef.current = onChange;
+  fallbackRef.current = emojiFallbackItems;
   const [, setEditorVersion] = useState(0);
   const [fontSize, setFontSize] = useState("16px");
   const [failed, setFailed] = useState(false);
-  const emojiHtmlRef = useRef(text => String(text || ""));
+
+  const htmlFromText = text => textToEditorHtml(text, fallbackRef.current);
 
   useEffect(() => {
     let active = true;
@@ -105,35 +168,35 @@ export const HaloComposer = React.forwardRef(function HaloComposer({ value, onCh
         const OrbitEmoji = Node.create({
           name: "orbitEmoji", inline: true, group: "inline", atom: true, selectable: true, draggable: true,
           addAttributes: () => ({ token: { default: ":表情:" }, name: { default: "表情" }, src: { default: "" }, mxc: { default: "" } }),
-          parseHTML: () => [{ tag: "span[data-emoji-token]", getAttrs: element => ({ token: element.getAttribute("data-emoji-token") || ":表情:", name: element.querySelector("img")?.getAttribute("alt") || element.getAttribute("data-emoji-token") || "表情", src: element.querySelector("img")?.getAttribute("src") || "", mxc: element.getAttribute("data-mxc") || "" }) }],
-          renderHTML: ({ node, HTMLAttributes }) => ["span", mergeAttributes(HTMLAttributes, { class: "editor-emoji-chip", "data-emoji-token": node.attrs.token, "data-mxc": node.attrs.mxc || undefined, contenteditable: "false", draggable: "true" }), ["img", { src: node.attrs.src || "", alt: node.attrs.name || node.attrs.token, draggable: "false" }], ["span", {}, node.attrs.name || node.attrs.token]],
+          parseHTML: () => [
+            { tag: "span[data-emoji-token]", getAttrs: element => emojiAttrsFromElement(element) },
+            { tag: "span.editor-emoji-chip", getAttrs: element => emojiAttrsFromElement(element) },
+            { tag: "img[data-mx-emoticon]", getAttrs: element => emojiAttrsFromElement(element) },
+            { tag: "img[data-emoji-token]", getAttrs: element => emojiAttrsFromElement(element) },
+          ],
+          renderHTML: ({ node, HTMLAttributes }) => ["span", mergeAttributes(HTMLAttributes, { class: "editor-emoji-chip", "data-emoji-token": node.attrs.token, "data-mxc": node.attrs.mxc || undefined, contenteditable: "false", draggable: "true" }), ["img", { src: node.attrs.src || "", alt: node.attrs.name || node.attrs.token, draggable: "false" }], ["span", { class: "editor-emoji-label" }, node.attrs.name || node.attrs.token]],
           renderText: ({ node }) => node.attrs.token || `:${node.attrs.name || "表情"}:`,
         });
-        const emojiHtml = text => String(text || "").replace(/:K歌:/gi, "").split(/(:[^:\s]+:)/g).map(part => {
-          const name = part.replace(/^:+|:+$/g, "").trim().toLowerCase();
-          const item = [...(window.orbitEmojiItems || []), ...emojiFallbackItems].find(entry => String(entry?.name || "").trim().toLowerCase() === name || String(entry?.shortcode || "").replace(/^:+|:+$/g, "").trim().toLowerCase() === name);
-          if (!item) return String(part).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>");
-          const token = `:${String(item.name || item.shortcode || "表情").replace(/^:+|:+$/g, "")}:`;
-          const src = item.thumbUrl || item.url || "";
-          return `<span class="editor-emoji-chip" data-emoji-token="${token}" data-mxc="${editorEscape(item.mxc || "")}" contenteditable="false"><img draggable="false" src="${src}" alt="${item.name || token}"><span>${item.name || token}</span></span>`;
-        }).join("");
-        emojiHtmlRef.current = emojiHtml;
-        const serializeEditorText = current => current.state.doc.textBetween(0, current.state.doc.content.size, "\n", node => node.type?.name === "orbitEmoji" ? (node.attrs?.token || ":表情:") : "");
         const editor = new Editor({
           element: hostRef.current,
-          content: emojiHtml(value),
+          content: htmlFromText(valueRef.current),
           extensions: [StarterKit.configure({ heading: { levels: [1, 2, 3] }, codeBlock: true }), OrbitEmoji, Underline, TextStyle, Color.configure({ types: ["textStyle"] }), FontSize, Link.configure({ openOnClick: false, defaultProtocol: "https" }), Placeholder.configure({ placeholder: placeholder || "输入消息…" })],
-          onUpdate: ({ editor: current }) => { setEditorVersion(version => version + 1); onChange?.(serializeEditorText(current), current.getHTML()); },
+          editorProps: {
+            transformPastedHTML: html => flattenPastedHtml(html),
+          },
+          onUpdate: ({ editor: current }) => {
+            const text = serializeEditorText(current);
+            lastEmittedRef.current = text;
+            setEditorVersion(version => version + 1);
+            onChangeRef.current?.(text, current.getHTML());
+          },
           onSelectionUpdate: () => setEditorVersion(version => version + 1),
         });
         editorRef.current = editor;
-        // Never inherit a browser-restored editor subtree when the React
-        // draft is empty. A fresh room composer must start blank.
-        if (!String(value || "").trim()) {
-          requestAnimationFrame(() => {
-            if (active && editorRef.current === editor) editor.commands.clearContent(false);
-          });
-        }
+        const currentValue = String(valueRef.current || "");
+        lastEmittedRef.current = currentValue;
+        if (currentValue.trim()) editor.commands.setContent(htmlFromText(currentValue), false);
+        else editor.commands.clearContent(false);
       } catch (error) {
         window.__haloEditorError = String(error?.stack || error?.message || error);
         setFailed(true);
@@ -144,26 +207,26 @@ export const HaloComposer = React.forwardRef(function HaloComposer({ value, onCh
 
   useEffect(() => {
     const editor = editorRef.current;
-    const buildEmojiHtml = text => String(text || "").split(/(:[^:\s]+:)/g).map(part => {
-      const name = part.replace(/^:+|:+$/g, "").trim().toLowerCase();
-      const item = [...(window.orbitEmojiItems || []), ...emojiFallbackItems].find(entry => String(entry?.name || "").trim().toLowerCase() === name || String(entry?.shortcode || "").replace(/^:+|:+$/g, "").trim().toLowerCase() === name);
-      if (!item) return String(part).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>");
-      const token = `:${String(item.name || item.shortcode || "表情").replace(/^:+|:+$/g, "")}:`;
-      const src = item.thumbUrl || item.url || "";
-      return `<span class="editor-emoji-chip" data-emoji-token="${token}" data-mxc="${editorEscape(item.mxc || "")}" contenteditable="false"><img draggable="false" src="${src}" alt="${item.name || token}"><span>${item.name || token}</span></span>`;
-    }).join("");
-    emojiHtmlRef.current = buildEmojiHtml;
-    if (editor && String(value || "") !== editor.state.doc.textBetween(0, editor.state.doc.content.size, "\n", node => node.type?.name === "orbitEmoji" ? (node.attrs?.token || ":表情:") : "")) {
-      editor.commands.setContent(buildEmojiHtml(String(value || "")), false);
+    if (!editor) return;
+    const next = String(value || "");
+    if (!next.trim()) {
+      lastEmittedRef.current = "";
+      if (serializeEditorText(editor).trim()) editor.commands.clearContent(false);
+      return;
     }
-  }, [value, emojiFallbackItems]);
+    if (next === lastEmittedRef.current) return;
+    lastEmittedRef.current = next;
+    editor.commands.setContent(htmlFromText(next), false);
+  }, [value]);
 
   useImperativeHandle(ref, () => ({
     focus: () => editorRef.current?.chain().focus().run() || hostRef.current?.focus(),
     setContent: text => {
       const editor = editorRef.current;
       if (!editor) return false;
-      editor.commands.setContent(emojiHtmlRef.current(String(text || "").replace(/:K歌:/gi, "")), false);
+      const next = String(text || "");
+      lastEmittedRef.current = next;
+      editor.commands.setContent(htmlFromText(next), false);
       return true;
     },
     insertText: text => { const editor = editorRef.current; if (editor) editor.chain().focus().insertContent(String(text || "")).run(); else onChange?.(`${String(value || "")}${String(text || "")}`, ""); },
@@ -173,30 +236,21 @@ export const HaloComposer = React.forwardRef(function HaloComposer({ value, onCh
       const name = String(item.name || item.shortcode || "表情").replace(/^:+|:+$/g, "");
       const token = `:${name}:`;
       const src = item.thumbUrl || item.url || "";
-      let selection = editor.state.selection;
-      const fullText = editor.state.doc.textBetween(0, editor.state.doc.content.size, "\n", "\n");
-      let from = selection.from;
-      let to = selection.to;
+      const fullText = serializeEditorText(editor);
+      let from = editor.state.selection.from;
+      let to = editor.state.selection.to;
       if (replaceQuery) {
         const explicit = String(query || "").trim();
-        // The suggestion click can happen after the browser moved the caret.
-        // When the current document still ends with the query, move the range
-        // to the document end and replace only that query, preserving all text
-        // before it (including Chinese text without a separating space).
         if (explicit && new RegExp(`${explicit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "iu").test(fullText)) {
           const queryMatch = fullText.match(new RegExp(`${explicit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "iu"));
           const removeLength = queryMatch?.[0]?.length || explicit.length;
-          // `doc.content.size` is the position after the paragraph's closing
-          // boundary. The last editable character sits one position before it.
           const docEnd = Math.max(1, editor.state.doc.content.size - 1);
           to = docEnd;
           from = Math.max(0, to - removeLength);
-          // A colon is part of the unfinished Matrix-style trigger.
           const textBeforeQuery = fullText.slice(0, Math.max(0, fullText.length - removeLength));
           if (textBeforeQuery.endsWith(":")) from -= 1;
-          selection = { from, to };
         } else {
-          const before = editor.state.doc.textBetween(0, selection.from, "\n", "\n");
+          const before = editor.state.doc.textBetween(0, editor.state.selection.from, "\n", editorLeafText);
           const match = before.match(/(?:^|\s)(?::[^:\s]*|[\p{L}\p{N}_-]{1,32})$/u);
           if (match) from -= match[0].length - (match[0].startsWith(" ") ? 1 : 0);
         }
@@ -206,7 +260,11 @@ export const HaloComposer = React.forwardRef(function HaloComposer({ value, onCh
       chain.insertContent({ type: "orbitEmoji", attrs: { token, name, src, mxc } }).insertContent(" ").run();
       return true;
     },
-    clear: () => { editorRef.current?.commands.clearContent(); onChange?.("", ""); },
+    clear: () => {
+      lastEmittedRef.current = "";
+      editorRef.current?.commands.clearContent(false);
+      onChange?.("", "");
+    },
   }));
 
   if (failed) return h(PlainComposer, { ref, value, onChange, onKeyDown, onFiles, placeholder });
