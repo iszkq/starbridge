@@ -1,0 +1,4502 @@
+import React, { useEffect, useMemo, useRef, useState } from "https://esm.sh/react@18.3.1";
+import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
+import { createPortal } from "https://esm.sh/react-dom@18.3.1";
+import * as Antd from "https://esm.sh/antd@5.27.4?bundle&deps=react@18.3.1,react-dom@18.3.1";
+import Plyr from "https://esm.sh/plyr@3.7.8?bundle";
+import * as MatrixSDK from "https://esm.sh/matrix-js-sdk@42.3.0?bundle&external=@matrix-org/matrix-sdk-crypto-wasm";
+import { decodeRecoveryKey } from "https://esm.sh/matrix-js-sdk@42.3.0/lib/crypto-api/recovery-key?bundle";
+import { SlidingSync } from "https://esm.sh/matrix-js-sdk@42.3.0/lib/sliding-sync.js?bundle&external=@matrix-org/matrix-sdk-crypto-wasm";
+import Icon from "./src/ui/Icon.js?v=271";
+import { HaloComposer } from "./src/editor/Composer.js?v=264";
+import {
+  hasActiveMatrixRtcSession,
+  parseRtcNotification,
+  parseRtcDecline,
+  sendRtcDecline,
+  createElementCallEmbed,
+  disposeElementCallEmbed,
+  setElementCallMute,
+  hangupElementCall,
+} from "./src/call/ElementCall.js?v=271";
+
+// esm.sh's bundled SDK points the Rust WASM request at a non-existent path.
+// Redirect that one asset to the published crypto-wasm package while leaving
+// all other network requests untouched.
+const orbitFetch = window.fetch.bind(window);
+window.fetch = (input, init) => {
+  const url = typeof input === "string" ? input : input?.url || "";
+  if (url.includes("/matrix-js-sdk@42.3.0/es2022/pkg/matrix_sdk_crypto_wasm_bg.wasm")) {
+    const fixed = url.replace("/matrix-js-sdk@42.3.0/es2022/pkg/", "/@matrix-org/matrix-sdk-crypto-wasm@18.4.0/es2022/pkg/");
+    return orbitFetch(fixed, init);
+  }
+  return orbitFetch(input, init);
+};
+
+const { Input: AntInput, Avatar: AntAvatar, Button: AntButton, Popover: AntPopover, Checkbox: AntCheckbox, message: antMessage } = Antd;
+const TextArea = AntInput.TextArea;
+const Input = props => h(AntInput, { ...props, allowClear: props.showClear, onChange: event => props.onChange?.(event?.target?.value ?? event) });
+const Avatar = props => h(AntAvatar, { ...props, size: props.size === "small" ? 32 : props.size, shape: props.shape === "square" ? "square" : props.shape });
+const Toast = { success: value => antMessage?.success(value), error: value => antMessage?.error(value), warning: value => antMessage?.warning(value), info: value => antMessage?.info(value) };
+
+// Desktop notifications keep enough routing information in their tag to
+// bring Orbit back to the originating room and newest event when clicked.
+try {
+  if (typeof window.Notification === "function" && !window.Notification.__orbitWrapped) {
+    const NativeNotification = window.Notification;
+    const WrappedNotification = new Proxy(NativeNotification, { construct(Target, args) {
+      const notice = new Target(...args);
+      notice.addEventListener?.("click", () => {
+        const options = args?.[1] || {};
+        const tag = String(options.tag || "");
+        let roomId = options.data?.roomId || null;
+        if (!roomId && tag.startsWith("orbit-")) {
+          try { roomId = decodeURIComponent(tag.slice(6)); } catch { roomId = tag.slice(6); }
+        }
+        const eventId = options.data?.eventId || (roomId ? window.orbitMatrixClient?.getRoom?.(roomId)?.getLastLiveEvent?.()?.getId?.() : null);
+        window.focus?.(); window.orbitNavigateToMessage?.(roomId, eventId); notice.close?.();
+      });
+      return notice;
+    } });
+    WrappedNotification.__orbitWrapped = true;
+    window.Notification = WrappedNotification;
+  }
+} catch {}
+const UiButton = ({ variant = "default", danger = false, ...props }) => h(AntButton, { type: variant === "primary" ? "primary" : "default", danger, ...props });
+const h = React.createElement;
+function LegacyIcon({ name, size = 17 }) {
+  const paths = { search: "M11 19a8 8 0 1 1 5.66-2.34L21 21", phone: "M22 16.92v3a2 2 0 0 1-2.18 2 19.8 19.8 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.12.9.33 1.78.62 2.63a2 2 0 0 1-.45 2.11L8 9.73a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.85.29 1.73.5 2.63.62A2 2 0 0 1 22 16.92Z", video: "M15 10l4.55-2.28A1 1 0 0 1 21 8.62v6.76a1 1 0 0 1-1.45.9L15 14M3 6h12v12H3z", play: "M8 5.5a1 1 0 0 1 1.52-.86l9.22 6.5a1 1 0 0 1 0 1.72l-9.22 6.5A1 1 0 0 1 8 18.5z", pause: "M8 5v14M16 5v14", fullscreen: "M8 3H3v5M3 3l6 6M16 3h5v5M21 3l-6 6M8 21H3v-5M3 21l6-6M16 21h5v-5M21 21l-6-6", list: "M5 6h.01M9 6h10M5 12h.01M9 12h10M5 18h.01M9 18h10", pin: "M9 3h6l-1 6 4 3v2h-5v7h-2v-7H6v-2l4-3z", room: "M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18.5zM8 8h8M8 12h5M8 16h3", chevronLeft: "M15 18l-6-6 6-6", chevronRight: "M9 18l6-6-6-6", forward: "M14 5l7 7-7 7M21 12H3", reply: "M9 17l-5-5 5-5M4 12h10a6 6 0 0 1 6 6v1", thread: "M4 6h16M4 12h11M4 18h7", edit: "M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z", redact: "M6 7h12M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v6m4-6v6", copy: "M9 9h11v11H9zM5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1", select: "M12 3a9 9 0 1 0 9 9M8 12l2.5 2.5L16 9", quote: "M7 17H4a2 2 0 0 1-2-2v-3a4 4 0 0 1 4-4h1v4H5M19 17h-3a2 2 0 0 1-2-2v-3a4 4 0 0 1 4-4h1v4h-2" };
+  paths.room = "M3 11.5 12 4l9 7.5M5 10v10h14V10M9 20v-6h6v6";
+  Object.assign(paths, { mic: "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3zM5 11a7 7 0 0 0 14 0M12 18v4M8 22h8", attachment: "M21.4 11.6 12 21a6 6 0 0 1-8.5-8.5l9.9-9.9a4 4 0 0 1 5.7 5.7l-9.9 9.9a2 2 0 0 1-2.8-2.8l9.2-9.2", smile: "M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0", bold: "M6 12h7a4 4 0 0 0 0-8H6zm0 0h8a4 4 0 0 1 0 8H6z", italic: "M10 4h6m-3 0-2 16m-3 0h6", underline: "M6 20h12M7 4v7a5 5 0 0 0 10 0V4", strike: "M19 12a1 1 0 1 1 0 2h-2.113c.217.328.395.684.521 1.063c.974 2.921-1.2 5.937-4.278 5.937h-1.702a5.74 5.74 0 0 1-5.132-3.17l-.19-.383a1 1 0 0 1 1.789-.894l.19.382A3.74 3.74 0 0 0 11.428 19h1.702a2.51 2.51 0 0 0 1.122-4.756L13.764 14H5a1 1 0 1 1 0-2zm-6.428-9a5.74 5.74 0 0 1 5.132 3.17l.19.383a1 1 0 0 1-1.788.894l-.191-.382A3.74 3.74 0 0 0 12.572 5H10.87a2.51 2.51 0 0 0-1.122 4.756L12.236 11h-4.22a4.5 4.5 0 0 1-1.424-2.063C5.618 6.017 7.792 3 10.87 3z", code: "M8 4H7a2 2 0 0 0-2 2v3.99a2 2 0 0 1-2 2M3 12c1.1.005 2 .9 2 2v4a2 2 0 0 0 2 2h1m8 0h1a2 2 0 0 0 2-2v-4c0-1.1.9-1.995 2-2m-5-8h1a2 2 0 0 1 2 2v3.99a2 2 0 0 0 2 2", quoteMark: "M5 14.5a2.5 2.5 0 1 0 5 0C4.833 13 5 10 9 7m5 7.5C13.833 13 14 10 18 7m-4 7.5a2.5 2.5 0 1 0 5 0", codeBlock: "M14.216 4.106 9.784 19.894M6.5 7.757 2.257 12 6.5 16.243m11-8.486L21.743 12 17.5 16.243" });
+  if (name === "quoteMark") paths.quoteMark = "M10.5 10H7.8a2.8 2.8 0 0 0-2.8 2.8v1.4A2.8 2.8 0 0 0 7.8 17h.4a2.8 2.8 0 0 0 2.8-2.8V10Zm8.5 0h-2.7a2.8 2.8 0 0 0-2.8 2.8v1.4a2.8 2.8 0 0 0 2.8 2.8h.4a2.8 2.8 0 0 0 2.8-2.8V10ZM5 10c0-2.2 1.2-3.8 3.6-4.8M13.5 10c0-2.2 1.2-3.8 3.6-4.8";
+  const filledIcon = name === "strike";
+  return h("svg", { className: "ui-icon", width: size, height: size, viewBox: "0 0 24 24", fill: filledIcon ? "currentColor" : "none", stroke: filledIcon ? "none" : "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" }, h("path", { d: paths[name] || paths.room }));
+}
+const colors = ["#6264dc", "#2e9d78", "#e58a45", "#b66ad0", "#db6872", "#4d91c6"];
+const initials = (name = "?") => [...name.replace(/^[@#]/, "")].slice(0, 2).join("") || "?";
+const colorFor = (id = "") => colors[[...id].reduce((n, c) => n + c.charCodeAt(0), 0) % colors.length];
+const orbitNotifiedEvents = new Set();
+const orbitPendingEncryptedNotifications = new Map();
+const orbitNotificationBuckets = new Map();
+const ORBIT_NOTIFICATION_WINDOW = 2200;
+const orbitEmojiUploadCache = new Map();
+const orbitStickerUploadCache = new Map();
+const orbitEmojiPackPublishCache = new Map();
+const orbitMatrixAssetCache = new Map();
+const orbitMatrixAssetPending = new Map();
+const ORBIT_MATRIX_ASSET_CACHE_LIMIT = 320;
+const orbitOfficeEditorUrl = window.orbitOfficeEditorUrl || "https://124.222.193.241:6258/editor";
+
+function isNotifiableMessage(event) {
+  const type = event?.getClearType?.() || event?.getType?.();
+  if (type === "m.sticker") return true;
+  if (type === "m.room.encrypted") return true;
+  if (type !== "m.room.message") return false;
+  const msgtype = event?.getClearContent?.()?.msgtype || event?.getContent?.()?.msgtype;
+  return ["m.text", "m.notice", "m.emote", "m.image", "m.file", "m.video", "m.audio", "m.sticker"].includes(msgtype);
+}
+
+function notificationBody(event) {
+  const content = event?.getClearContent?.() || event?.getContent?.() || {};
+  if (event?.getType?.() === "m.sticker") return "发送了一个贴纸";
+  if (event?.getType?.() === "m.room.encrypted" && (event?.getClearType?.() === "m.room.encrypted" || !event?.getClearContent?.()?.body)) return "收到一条加密消息，打开房间查看";
+  if (content.msgtype === "m.image") return "发送了一张图片";
+  if (content.msgtype === "m.video") return "发送了一段视频";
+  if (content.msgtype === "m.audio") return "发送了一段音频";
+  if (content.msgtype === "m.sticker") return "发送了一个贴纸";
+  if (content.msgtype === "m.file") return content.body ? `发送了文件：${content.body}` : "发送了一个文件";
+  const plain = String(content.body || "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+  return compactNotificationText(plain || "收到一条新消息");
+}
+
+function compactNotificationText(value, max = 96) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function hasDecryptedNotificationContent(event) {
+  if (event?.getType?.() !== "m.room.encrypted") return true;
+  const clear = event?.getClearContent?.();
+  return Boolean(clear?.body && event?.getClearType?.() !== "m.room.encrypted");
+}
+
+function notificationSenderName(event, room) {
+  const sender = event?.getSender?.() || "用户";
+  const member = room?.getMember?.(sender) || (event?.getRoomId?.() && window.orbitMatrixClient?.getRoom?.(event.getRoomId?.())?.getMember?.(sender));
+  return member?.name || member?.rawDisplayName || sender;
+}
+
+function markOrbitNotifiedEvent(eventId) {
+  orbitNotifiedEvents.add(eventId);
+  if (orbitNotifiedEvents.size > 500) orbitNotifiedEvents.delete(orbitNotifiedEvents.values().next().value);
+}
+
+function enqueueMessageNotification({ room, roomId, eventId, title, body, compact = false }) {
+  if (!roomId || !eventId) return;
+  const existing = orbitNotificationBuckets.get(roomId) || { title, count: 0, latestBody: body, latestEventId: eventId, timer: null };
+  existing.title = title || existing.title;
+  existing.count += 1;
+  existing.latestBody = compactNotificationText(body || existing.latestBody);
+  existing.compact = existing.compact || compact;
+  existing.latestEventId = eventId;
+  if (!existing.timer) {
+    existing.timer = setTimeout(() => {
+      orbitNotificationBuckets.delete(roomId);
+      const countLabel = existing.count > 1 ? `收到 ${existing.count} 条新消息，最后一条：` : "";
+      // Keep room routing metadata intact while constraining what is rendered
+      // in the toast/desktop notification. Long room names and message bodies
+      // should never make the notification span the entire viewport.
+      const displayTitle = compactNotificationText(existing.title || "Matrix 新消息", 32);
+      const text = existing.compact
+        ? `${displayTitle}：${existing.count} 条消息`
+        : `${displayTitle}：${countLabel}${compactNotificationText(existing.latestBody, 56)}`;
+      let desktopShown = false;
+      if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+        try {
+          new Notification(displayTitle, { body: existing.compact ? `${existing.count} 条消息` : (countLabel ? `${countLabel}${compactNotificationText(existing.latestBody, 56)}` : compactNotificationText(existing.latestBody, 56)), tag: `orbit-${encodeURIComponent(roomId)}`, renotify: true, data: { roomId, eventId: existing.latestEventId } });
+          desktopShown = true;
+        } catch {}
+      }
+      if (!desktopShown || !document.hidden) {
+        const key = `orbit-notification-${roomId}`;
+        if (antMessage?.open) antMessage.open({
+          key,
+          type: "info",
+          duration: existing.count > 1 ? 6 : 5,
+          onClick: () => { window.orbitNavigateToMessage?.(roomId, existing.latestEventId); antMessage.destroy?.(key); },
+          content: h("button", { type: "button", className: "toast-notification-link", "data-room-id": roomId, onClick: event => { event.preventDefault(); event.stopPropagation(); window.orbitNavigateToMessage?.(roomId, existing.latestEventId); antMessage.destroy?.(key); } }, text)
+        });
+        else Toast.info(text);
+      }
+    }, ORBIT_NOTIFICATION_WINDOW);
+    orbitNotificationBuckets.set(roomId, existing);
+  }
+}
+
+async function markRoomRead(client, roomId, event) {
+  if (!client || !roomId || !event) return;
+  if (typeof client.setRoomReadMarkers === "function" && event.getId?.()) {
+    // matrix-js-sdk expects the receipt argument to be the MatrixEvent, not
+    // another event-id string. Supplying the id here can leave the local SDK
+    // unread cache behind even though the server accepted the read marker.
+    await client.setRoomReadMarkers(roomId, event.getId(), event);
+  } else {
+    await client.sendReadReceipt?.(event);
+  }
+}
+
+function roomAvatarMxc(room) {
+  const event = room?.currentState?.getStateEvents?.("m.room.avatar", "");
+  const content = Array.isArray(event) ? event[0]?.getContent?.() : event?.getContent?.();
+  return room?.getMxcAvatarUrl?.() || content?.url || room?.getAvatarUrl?.() || null;
+}
+
+function isMatrixSpace(room) {
+  const type = room?.getType?.();
+  if (type === "m.space") return true;
+  try {
+    const create = room?.currentState?.getStateEvents?.("m.room.create", "");
+    const content = Array.isArray(create) ? create[0]?.getContent?.() : create?.getContent?.();
+    return content?.type === "m.space";
+  } catch { return false; }
+}
+
+function memberAvatarMxc(member) {
+  return member?.getMxcAvatarUrl?.() || member?.avatarUrl || member?.events?.member?.getContent?.()?.avatar_url || null;
+}
+
+function decodeBase64(value) {
+  const normalized = String(value || "").replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(String(value || "").length / 4) * 4, "=");
+  const binary = atob(normalized); const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function encodeBase64Url(bytes) {
+  let binary = "";
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  for (let index = 0; index < view.length; index += 1) binary += String.fromCharCode(view[index]);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function encodeUnpaddedBase64(bytes) {
+  let binary = "";
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  for (let index = 0; index < view.length; index += 1) binary += String.fromCharCode(view[index]);
+  return btoa(binary).replace(/=+$/g, "");
+}
+
+function recoveryStorageKey(userId) {
+  return `orbit.matrix.recovery-key:${String(userId || "anonymous")}`;
+}
+
+function loadPersistedRecoveryKey(userId) {
+  try {
+    const encoded = localStorage.getItem(recoveryStorageKey(userId));
+    if (encoded) window.orbitRecoveryKeyBytes = decodeBase64(encoded);
+  } catch {}
+}
+
+async function decryptMatrixBuffer(buffer, encryptedInfo) {
+  if (!encryptedInfo?.key?.k || !encryptedInfo?.iv) return buffer;
+  const key = await window.crypto.subtle.importKey("raw", decodeBase64(encryptedInfo.key.k), { name: "AES-CTR" }, false, ["decrypt"]);
+  return window.crypto.subtle.decrypt({ name: "AES-CTR", counter: decodeBase64(encryptedInfo.iv), length: 64 }, key, buffer);
+}
+
+async function uploadMatrixMedia(client, file, encrypted = false, onProgress) {
+  if (!encrypted || !window.crypto?.subtle) {
+    const uploaded = await client.uploadContent(file, { name: file.name, type: file.type, progressHandler: onProgress });
+    return { uploaded, fileInfo: null };
+  }
+  // E2EE media is encrypted before it leaves the browser. The event itself is
+  // then encrypted by the Matrix SDK as usual, while the `file` descriptor
+  // lets every compatible client decrypt the downloaded bytes.
+  const rawKey = new Uint8Array(32); const iv = new Uint8Array(16);
+  window.crypto.getRandomValues(rawKey);
+  // Matrix encrypted attachments use a random 64-bit IV prefix and reserve
+  // the lower 64 bits for the AES-CTR counter.
+  window.crypto.getRandomValues(iv.subarray(0, 8));
+  const key = await window.crypto.subtle.importKey("raw", rawKey, { name: "AES-CTR" }, false, ["encrypt"]);
+  const cipher = await window.crypto.subtle.encrypt({ name: "AES-CTR", counter: iv, length: 64 }, key, await file.arrayBuffer());
+  const digest = await window.crypto.subtle.digest("SHA-256", cipher);
+  const encryptedFile = new File([cipher], file.name || "attachment", { type: file.type || "application/octet-stream" });
+   const uploaded = await client.uploadContent(encryptedFile, { includeFilename: true, name: encryptedFile.name, type: encryptedFile.type, progressHandler: onProgress });
+  // Matrix encrypted media (MSC3916 / current clients) carries the MXC URL
+  // inside the `file` descriptor.  Keep the descriptor URL-free here so the
+  // caller can attach the URL returned by uploadContent exactly once.
+  // Cinny's matrix-encrypt-attachment implementation uses JWK base64url only
+  // for key.k. Matrix encrypted-file IVs and hashes are standard unpadded
+  // base64; encoding those as base64url makes strict clients reject the file.
+  return { uploaded, fileInfo: { v: "v2", key: { alg: "A256CTR", ext: true, k: encodeBase64Url(rawKey), key_ops: ["encrypt", "decrypt"], kty: "oct" }, iv: encodeUnpaddedBase64(iv), hashes: { sha256: encodeUnpaddedBase64(digest) } } };
+}
+
+function applyUploadedMedia(content, uploaded, fileInfo) {
+  if (!uploaded?.content_uri) throw new Error("Matrix 未返回媒体地址");
+  if (fileInfo) {
+    content.file = { ...fileInfo, url: uploaded.content_uri };
+    delete content.url;
+  } else content.url = uploaded.content_uri;
+  return content;
+}
+
+function floatTo16BitPcm(input) {
+  const output = new Int16Array(input.length);
+  for (let index = 0; index < input.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, input[index]));
+    output[index] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+  }
+  return output;
+}
+
+function mixToMonoPcm(buffer) {
+  if (buffer.numberOfChannels < 2) return floatTo16BitPcm(buffer.getChannelData(0));
+  const left = buffer.getChannelData(0);
+  const right = buffer.getChannelData(1);
+  const mixed = new Float32Array(buffer.length);
+  for (let index = 0; index < buffer.length; index += 1) mixed[index] = (left[index] + right[index]) * 0.5;
+  return floatTo16BitPcm(mixed);
+}
+
+async function encodeVoiceMp3(blob) {
+  const bytes = await blob.arrayBuffer();
+  const context = new (window.AudioContext || window.webkitAudioContext)();
+  try {
+    const audioBuffer = await context.decodeAudioData(bytes.slice(0));
+    const samples = mixToMonoPcm(audioBuffer);
+    const lame = await import("https://esm.sh/@breezystack/lamejs@1.2.2");
+    const Encoder = lame.Mp3Encoder || lame.default?.Mp3Encoder;
+    if (!Encoder) throw new Error("浏览器无法加载 MP3 编码器");
+    const encoder = new Encoder(1, audioBuffer.sampleRate, 128);
+    const chunks = [];
+    const block = 1152;
+    for (let offset = 0; offset < samples.length; offset += block) {
+      const encoded = encoder.encodeBuffer(samples.subarray(offset, offset + block));
+      if (encoded?.length) chunks.push(encoded);
+    }
+    const flushed = encoder.flush();
+    if (flushed?.length) chunks.push(flushed);
+    const mp3 = new Blob(chunks, { type: "audio/mpeg" });
+    if (!mp3.size) throw new Error("MP3 编码结果为空");
+    const file = new File([mp3], "voice-" + Date.now() + ".mp3", { type: "audio/mpeg" });
+    file.orbitVoiceDuration = Math.round(audioBuffer.duration * 1000);
+    return file;
+  } finally {
+    try { await context.close(); } catch {}
+  }
+}
+
+async function normalizeImageBlob(blob) {
+  const declared = String(blob?.type || "").toLowerCase();
+  const bytes = new Uint8Array(await blob.slice(0, 512).arrayBuffer());
+  let mime = "";
+  if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) mime = "image/gif";
+  else if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) mime = "image/png";
+  else if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) mime = "image/jpeg";
+  else if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) mime = "image/webp";
+  else if (String.fromCharCode(...bytes.slice(4, 12)).startsWith("ftyp") && /^(?:avif|avis)$/.test(String.fromCharCode(...bytes.slice(8, 12)))) mime = "image/avif";
+  else if (new TextDecoder().decode(bytes).trimStart().startsWith("<svg")) mime = "image/svg+xml";
+  else if (declared.startsWith("image/")) mime = declared;
+  else mime = "application/octet-stream";
+  return declared === mime ? blob : new Blob([blob], { type: mime });
+}
+
+async function fetchEmojiBlob(item) {
+  const response = await fetch(assetRequestUrl(item.url));
+  if (!response.ok) throw new Error(`表情下载失败（${response.status}）`);
+  return normalizeImageBlob(await response.blob());
+}
+
+async function composeEmojiRowFile(items) {
+  const blobs = await Promise.all(items.map(fetchEmojiBlob));
+  const bitmaps = await Promise.all(blobs.map(blob => createImageBitmap(blob)));
+  const cell = 40; const gap = 4; const width = Math.max(cell, items.length * cell + Math.max(0, items.length - 1) * gap); const height = cell;
+  const canvas = document.createElement("canvas"); canvas.width = width; canvas.height = height;
+  const context = canvas.getContext("2d"); context.clearRect(0, 0, width, height);
+  bitmaps.forEach((bitmap, index) => { const scale = Math.min(cell / bitmap.width, cell / bitmap.height); const drawWidth = Math.max(1, Math.round(bitmap.width * scale)); const drawHeight = Math.max(1, Math.round(bitmap.height * scale)); const x = index * (cell + gap) + Math.round((cell - drawWidth) / 2); const y = Math.round((cell - drawHeight) / 2); context.drawImage(bitmap, x, y, drawWidth, drawHeight); bitmap.close?.(); });
+  const output = await new Promise((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error("表情合成失败")), "image/png"));
+  return new File([output], "emoji-row.png", { type: "image/png" });
+}
+
+function emojiFileName(item, mimeType) {
+  const safe = String(item?.fileName || item?.name || "emoji").replace(/[\\/:*?"<>|]/g, "_").replace(/\.[a-z0-9]{2,5}$/i, "");
+  const extension = ({ "image/gif": "gif", "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/avif": "avif", "image/svg+xml": "svg" })[String(mimeType).toLowerCase()] || "gif";
+  return `${safe || "emoji"}.${extension}`;
+}
+
+async function uploadRemoteEmojiMxc(client, item) {
+  if (String(item?.url || "").startsWith("mxc://")) return item.url;
+  const cacheKey = `${client.getUserId?.() || "anonymous"}:${item.url}`;
+  let uploadPromise = orbitEmojiUploadCache.get(cacheKey);
+  if (!uploadPromise) {
+    uploadPromise = (async () => {
+      const blob = await fetchEmojiBlob(item);
+      const mimeType = blob.type || item.mimeType || "image/gif";
+      const fileName = emojiFileName(item, mimeType);
+      const file = new File([blob], fileName, { type: mimeType });
+      const uploaded = await client.uploadContent(file, { includeFilename: true, name: fileName, type: mimeType });
+      if (!uploaded?.content_uri) throw new Error("Matrix 未返回表情媒体地址");
+      return uploaded.content_uri;
+    })().catch(error => {
+      orbitEmojiUploadCache.delete(cacheKey);
+      throw error;
+    });
+    orbitEmojiUploadCache.set(cacheKey, uploadPromise);
+  }
+  return uploadPromise;
+}
+
+function emojiShortcode(item) {
+  return String(item?.name || item?.shortcode || "表情").replace(/^:+|:+$/g, "");
+}
+
+async function prepareRemoteEmoji(client, item) {
+  return { item, shortcode: emojiShortcode(item), mxc: await uploadRemoteEmojiMxc(client, item) };
+}
+
+// Publish the selected remote emoji as a Matrix image pack.  Reactions use
+// the uploaded MXC URI as their wire key (the format understood by Cinny and
+// other clients), while this room pack lets clients resolve that key to the
+// actual image instead of displaying a literal :shortcode: string.
+async function publishRoomEmojiPack(client, room, item, mxc) {
+  const roomId = room?.roomId || room?.id;
+  if (!client || !roomId || !mxc?.startsWith?.("mxc://") || !item) return;
+  const shortcode = emojiShortcode(item);
+  const userPart = String(client.getUserId?.() || "user").replace(/[^A-Za-z0-9._=-]/g, "_").slice(0, 48);
+  const stateKey = `orbit-${userPart || "user"}`;
+  const cacheKey = `${roomId}|${stateKey}|${shortcode}|${mxc}`;
+  const cached = orbitEmojiPackPublishCache.get(cacheKey);
+  if (cached) return cached;
+  const pending = (async () => {
+    const state = room?.currentState?.getStateEvents?.("im.ponies.room_emotes", stateKey);
+    const existing = Array.isArray(state) ? state[0]?.getContent?.() : state?.getContent?.();
+    const images = { ...(existing?.images || {}) };
+    images[shortcode] = { ...(images[shortcode] || {}), url: mxc, body: `:${shortcode}:`, usage: ["emoticon"] };
+    await client.sendStateEvent(roomId, "im.ponies.room_emotes", {
+      pack: { ...(existing?.pack || {}), display_name: existing?.pack?.display_name || "Orbit 表情", usage: ["emoticon"] },
+      images,
+    }, stateKey);
+  })().catch(error => {
+    orbitEmojiPackPublishCache.delete(cacheKey);
+    // A reaction remains valid even when the homeserver disallows custom
+    // emoji state events, so publishing is deliberately best-effort.
+    return undefined;
+  });
+  orbitEmojiPackPublishCache.set(cacheKey, pending);
+  return pending;
+}
+
+// Exact Cinny wire format: the picker resolves the remote image to MXC before
+// it becomes an editor emoticon node. Sending only serializes those resolved
+// nodes; it never re-identifies an emoji later by its display name.
+function createEmojiTextContent(text, resolvedEmoji, mentions = []) {
+  let formattedBody = mentionHtml(text, mentions);
+  let fallbackBody = String(text || "");
+  (resolvedEmoji || []).forEach(({ shortcode, mxc }) => {
+    if (!mxc?.startsWith?.("mxc://")) return;
+    const bareName = String(shortcode || "表情").replace(/^:+|:+$/g, "");
+    const token = `:${bareName}:`;
+    const pattern = new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    const safeShortcode = escapeEditorText(bareName);
+    const imageHtml = `<img data-mx-emoticon src="${escapeEditorText(mxc)}" alt="${safeShortcode}" title="${safeShortcode}" height="32" />`;
+    const trailingBare = new RegExp(bareName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*$", "i");
+    formattedBody = pattern.test(formattedBody)
+      ? formattedBody.replace(pattern, imageHtml)
+      : (trailingBare.test(formattedBody) ? formattedBody.replace(trailingBare, imageHtml) : (formattedBody.trim() === bareName ? imageHtml : formattedBody));
+    // The HTML body carries the real image. Remove its trigger token from the
+    // plain fallback so clients do not show keyword plus emoji together.
+    fallbackBody = pattern.test(fallbackBody)
+      ? fallbackBody.replace(pattern, "")
+      : (trailingBare.test(fallbackBody) ? fallbackBody.replace(trailingBare, "") : (fallbackBody.trim() === bareName ? "" : fallbackBody));
+  });
+  fallbackBody = fallbackBody.replace(/[ \t]{2,}/g, " ").replace(/[ \t]+\n/g, "\n").replace(/\n[ \t]+/g, "\n").trim();
+  return { msgtype: "m.text", body: fallbackBody, format: "org.matrix.custom.html", formatted_body: formattedBody };
+}
+
+async function createStickerEventContent(client, room, item) {
+  if (String(item?.url || "").startsWith("mxc://")) {
+    const info = { ...(item.info || {}) };
+    if (item.mimeType && !info.mimetype) info.mimetype = item.mimeType;
+    return { body: emojiShortcode(item) || "贴纸", url: item.url, ...(Object.keys(info).length ? { info } : {}) };
+  }
+  const encrypted = Boolean(room?.hasEncryptionStateEvent?.());
+  const cacheKey = `${encrypted ? `encrypted:${room.roomId}` : "plain"}:${item.url}`;
+  let uploadPromise = orbitStickerUploadCache.get(cacheKey);
+  if (!uploadPromise) {
+    uploadPromise = (async () => {
+      const blob = await fetchEmojiBlob(item);
+      const mimeType = blob.type || item.mimeType || "image/gif";
+      const fileName = emojiFileName(item, mimeType);
+      const file = new File([blob], fileName, { type: mimeType });
+      const { uploaded, fileInfo } = await uploadMatrixMedia(client, file, encrypted);
+      const info = { mimetype: mimeType, size: file.size };
+      try {
+        const bitmap = await createImageBitmap(blob);
+        info.w = bitmap.width; info.h = bitmap.height; bitmap.close?.();
+      } catch {}
+      // m.sticker content intentionally has no msgtype. This is the standard
+      // event shape used by Cinny and Element.
+      return applyUploadedMedia({ body: item.name || "贴纸", info }, uploaded, fileInfo);
+    })().catch(error => {
+      orbitStickerUploadCache.delete(cacheKey);
+      throw error;
+    });
+    orbitStickerUploadCache.set(cacheKey, uploadPromise);
+  }
+  return JSON.parse(JSON.stringify(await uploadPromise));
+}
+
+// Cinny sends stickers through a local MatrixEvent so encryption happens
+// before the event is posted, without waiting behind the normal message
+// queue. Fall back to the public SDK method when these SDK internals are not
+// available.
+async function sendStickerEvent(client, room, content) {
+  const MatrixEvent = MatrixSDK.MatrixEvent;
+  const EventStatus = MatrixSDK.EventStatus;
+  if (!client || !room || !MatrixEvent || !EventStatus || typeof client.encryptEventIfNeeded !== "function" || typeof client.sendEventHttpRequest !== "function") {
+    return client.sendEvent(room.roomId, "m.sticker", content);
+  }
+  const txnId = client.makeTxnId();
+  const localEvent = new MatrixEvent({
+    type: "m.sticker",
+    content,
+    event_id: `~${room.roomId}:${txnId}`,
+    sender: client.getUserId?.() || undefined,
+    room_id: room.roomId,
+    origin_server_ts: Date.now(),
+  });
+  localEvent.setTxnId(txnId);
+  localEvent.setStatus(EventStatus.SENDING);
+  room.addPendingEvent(localEvent, txnId);
+  try {
+    await client.encryptEventIfNeeded(localEvent, room);
+    if (localEvent.status === EventStatus.ENCRYPTING) room.updatePendingEvent(localEvent, EventStatus.SENDING);
+    const response = await client.sendEventHttpRequest(localEvent);
+    if (!response?.event_id) throw new Error("Matrix 未返回贴纸事件 ID");
+    room.updatePendingEvent(localEvent, EventStatus.SENT, response.event_id);
+    return response;
+  } catch (error) {
+    Object.assign(localEvent, { error });
+    room.updatePendingEvent(localEvent, EventStatus.NOT_SENT);
+    throw error;
+  }
+}
+
+function mediaRequestUrl(client, url) {
+  if (!url || !/^https?:\/\//i.test(url)) return url;
+  try {
+    const parsed = new URL(url);
+    if (parsed.origin === location.origin && parsed.pathname.startsWith("/__matrix_proxy/")) return url;
+    const home = client?.getHomeserverUrl?.() || parsed.origin;
+    if (["localhost", "127.0.0.1"].includes(location.hostname)) return `${location.origin}/__matrix_proxy/${encodeURIComponent(home)}${parsed.pathname}${parsed.search}`;
+  } catch {}
+  return url;
+}
+
+function matrixHomeserverUrl(client) {
+  const configured = client?.getHomeserverUrl?.() || "";
+  try {
+    const parsed = new URL(configured);
+    if (["localhost", "127.0.0.1"].includes(parsed.hostname) && parsed.pathname.startsWith("/__matrix_proxy/")) {
+      const encoded = parsed.pathname.slice("/__matrix_proxy/".length).split("/")[0];
+      const decoded = decodeURIComponent(encoded);
+      if (/^https?:\/\//i.test(decoded)) return decoded.replace(/\/+$/, "");
+    }
+  } catch {}
+  return configured.replace(/\/+$/, "");
+}
+
+function mediaRequestCandidates(client, rawUrl, requestUrl) {
+  const candidates = requestUrl ? [requestUrl] : [];
+  if (rawUrl?.startsWith("mxc://")) {
+    const [, server, mediaId] = rawUrl.match(/^mxc:\/\/([^/]+)\/(.+)$/) || [];
+    const home = matrixHomeserverUrl(client);
+    if (server && mediaId && home) {
+      // Synapse deployments increasingly disable the legacy unauthenticated
+      // media API. Try the authenticated Client-Server v1 route first, then
+      // retain v3/r0 compatibility for older homeservers.
+      for (const prefix of ["/_matrix/client/v1/media/download/", "/_matrix/media/v3/download/", "/_matrix/media/r0/download/"]) {
+        const legacy = mediaRequestUrl(client, `${home}${prefix}${encodeURIComponent(server)}/${encodeURIComponent(mediaId)}`);
+        if (!candidates.includes(legacy)) candidates.push(legacy);
+      }
+    }
+  }
+  return candidates;
+}
+
+// matrix-js-sdk normally supplies mxcUrlToHttp(), but some homeserver/client
+// combinations return an empty or relative URL for the authenticated media
+// API. Build the current Matrix media endpoint ourselves as a last resort.
+// This is also useful for MSC3916 media where the legacy /_matrix/media/r0
+// route has been disabled by Synapse.
+function matrixDownloadFallbackUrl(client, rawUrl) {
+  const match = String(rawUrl || "").match(/^mxc:\/\/([^/]+)\/(.+)$/i);
+  if (!match) return "";
+  const home = matrixHomeserverUrl(client);
+  if (!/^https?:\/\//i.test(home)) return "";
+  return `${home.replace(/\/+$/, "")}/_matrix/client/v1/media/download/${encodeURIComponent(match[1])}/${encodeURIComponent(match[2])}`;
+}
+
+function assetRequestUrl(url) {
+  if (!url || !/^https:\/\//i.test(url)) return url;
+  if (["localhost", "127.0.0.1"].includes(location.hostname) && url.includes("image.527012.xyz")) return `${location.origin}/__asset_proxy/${encodeURIComponent(url)}`;
+  return url;
+}
+
+let orbitEmojiCatalogPromise;
+function ensureEmojiCatalog() {
+  if (window.orbitEmojiItems?.length) return Promise.resolve(window.orbitEmojiItems);
+  if (!orbitEmojiCatalogPromise) orbitEmojiCatalogPromise = fetch(assetRequestUrl("https://image.527012.xyz/index.json")).then(response => response.ok ? response.json() : null).then(data => { window.orbitEmojiItems = data?.items || []; window.orbitEmojiPacks = data?.packs || []; return window.orbitEmojiItems; }).catch(() => []);
+  return orbitEmojiCatalogPromise;
+}
+
+function fuzzyScore(value, query) {
+  const text = String(value || "").toLowerCase();
+  const needle = String(query || "").trim().toLowerCase();
+  if (!needle) return 0;
+  if (text === needle) return 10000;
+  if (text.startsWith(needle)) return 7000 - Math.min(text.length, 300);
+  const at = text.indexOf(needle);
+  if (at >= 0) return 5000 - at * 4 - Math.min(text.length, 300);
+  let cursor = 0; let gaps = 0;
+  for (const char of needle) {
+    const found = text.indexOf(char, cursor);
+    if (found < 0) return 0;
+    gaps += found - cursor; cursor = found + 1;
+  }
+  return Math.max(1, 1800 - gaps * 12 - (text.length - needle.length));
+}
+
+function matrixAssetCacheKey(client, rawUrl, width, height, resizeMethod, encryptedInfo) {
+  if (!rawUrl) return null;
+  const encryptedKey = encryptedInfo?.key?.k
+    ? [encryptedInfo.key.k, encryptedInfo.iv, encryptedInfo.hashes?.sha256, encryptedInfo.mimetype].map(value => value || "").join(":")
+    : "plain";
+  return [client?.getHomeserverUrl?.() || "", client?.getUserId?.() || "", rawUrl, width || "", height || "", resizeMethod || "", encryptedKey].join("|");
+}
+
+function trimMatrixAssetCache() {
+  if (orbitMatrixAssetCache.size <= ORBIT_MATRIX_ASSET_CACHE_LIMIT) return;
+  const idle = [...orbitMatrixAssetCache.entries()]
+    .filter(([, asset]) => !asset.refs)
+    .sort((left, right) => (left[1].lastUsed || 0) - (right[1].lastUsed || 0));
+  while (orbitMatrixAssetCache.size > ORBIT_MATRIX_ASSET_CACHE_LIMIT && idle.length) {
+    const [key, asset] = idle.shift();
+    if (asset.objectUrl) URL.revokeObjectURL(asset.src);
+    orbitMatrixAssetCache.delete(key);
+  }
+}
+
+function useMatrixAsset(client, rawUrl, width = null, height = null, resizeMethod = null, encryptedInfo = null) {
+  const cacheKey = matrixAssetCacheKey(client, rawUrl, width, height, resizeMethod, encryptedInfo);
+  const initialAsset = cacheKey ? orbitMatrixAssetCache.get(cacheKey) : null;
+  const [assetState, setAssetState] = useState(() => ({ key: cacheKey, src: initialAsset?.src || null, url: initialAsset?.url || null, failed: false }));
+  const renderCached = cacheKey ? orbitMatrixAssetCache.get(cacheKey) : null;
+  const currentState = assetState.key === cacheKey ? assetState : { key: cacheKey, src: renderCached?.src || null, url: renderCached?.url || null, failed: false };
+  useEffect(() => {
+    let active = true;
+    let acquired = null;
+    const acquire = asset => {
+      if (!asset || acquired === asset) return;
+      acquired = asset;
+      asset.refs = (asset.refs || 0) + 1;
+      asset.lastUsed = Date.now();
+    };
+    const release = () => {
+      if (!acquired) return;
+      acquired.refs = Math.max(0, (acquired.refs || 1) - 1);
+      acquired.lastUsed = Date.now();
+      acquired = null;
+      trimMatrixAssetCache();
+    };
+    const cached = cacheKey && orbitMatrixAssetCache.get(cacheKey);
+    if (cached) {
+      acquire(cached);
+      setAssetState({ key: cacheKey, src: cached.src, url: cached.url, failed: false });
+      return () => { active = false; release(); };
+    }
+    setAssetState({ key: cacheKey, src: null, url: null, failed: false });
+    if (!rawUrl || !cacheKey) return () => {};
+    const encrypted = Boolean(encryptedInfo?.key?.k && encryptedInfo?.iv);
+    let httpUrl = rawUrl.startsWith("mxc://") ? client?.mxcUrlToHttp?.(rawUrl, encrypted ? undefined : width, encrypted ? undefined : height, encrypted ? undefined : resizeMethod, false, true, true) : rawUrl;
+    // Older SDKs can return a relative URL. Relative media URLs point at the
+    // Orbit app rather than the homeserver and manifest as a generic 404.
+    // Prefer an explicit authenticated download URL in that case.
+    if (rawUrl.startsWith("mxc://") && !/^https?:\/\//i.test(String(httpUrl || ""))) httpUrl = matrixDownloadFallbackUrl(client, rawUrl);
+    if (!httpUrl) {
+      setAssetState({ key: cacheKey, src: null, url: null, failed: true });
+      return () => {};
+    }
+    const requestUrl = mediaRequestUrl(client, httpUrl);
+    const token = client?.getAccessToken?.();
+    if (!token) {
+      const asset = { src: requestUrl, url: requestUrl, objectUrl: false, refs: 0, lastUsed: Date.now() };
+      orbitMatrixAssetCache.set(cacheKey, asset);
+      acquire(asset);
+      setAssetState({ key: cacheKey, src: asset.src, url: asset.url, failed: false });
+      trimMatrixAssetCache();
+      return () => { active = false; release(); };
+    }
+    const load = async () => {
+      let lastError = null;
+      for (const candidate of mediaRequestCandidates(client, rawUrl, requestUrl)) {
+        try {
+          const response = await fetch(candidate, { headers: { Authorization: `Bearer ${token}` } });
+          if (response.ok) {
+            const buffer = await response.arrayBuffer();
+            const mimeType = encryptedInfo?.mimetype || response.headers.get("content-type") || "application/octet-stream";
+            const blob = encrypted
+              ? new Blob([await decryptMatrixBuffer(buffer, encryptedInfo)], { type: mimeType })
+              : new Blob([buffer], { type: mimeType });
+            return { src: URL.createObjectURL(blob), url: candidate, objectUrl: true, refs: 0, lastUsed: Date.now() };
+          }
+          lastError = new Error(`媒体请求失败（${response.status}）`);
+        } catch (error) { lastError = error; }
+      }
+      throw lastError || new Error("媒体请求失败");
+    };
+    let pending = orbitMatrixAssetPending.get(cacheKey);
+    if (!pending) {
+      pending = load().then(asset => {
+        const existing = orbitMatrixAssetCache.get(cacheKey);
+        if (existing) {
+          if (asset.objectUrl) URL.revokeObjectURL(asset.src);
+          return existing;
+        }
+        orbitMatrixAssetCache.set(cacheKey, asset);
+        trimMatrixAssetCache();
+        return asset;
+      });
+      orbitMatrixAssetPending.set(cacheKey, pending);
+      pending.finally(() => orbitMatrixAssetPending.delete(cacheKey)).catch(() => {});
+    }
+    pending.then(asset => {
+      if (!active) return;
+      acquire(asset);
+      setAssetState({ key: cacheKey, src: asset.src, url: asset.url, failed: false });
+    }).catch(error => {
+      console.warn("媒体解密失败", error);
+      if (active) setAssetState({ key: cacheKey, src: null, url: requestUrl, failed: true });
+    });
+    return () => { active = false; release(); };
+  }, [client, cacheKey]);
+  return { src: currentState.src, failed: currentState.failed, url: currentState.url };
+}
+
+function MatrixAvatar({ client, mxcUrl, httpUrl, size = 38, className = "room-avatar", style, fallback, alt }) {
+  const asset = useMatrixAsset(client, mxcUrl || httpUrl, size, size, "crop");
+  const [imageFailed, setImageFailed] = useState(false);
+  useEffect(() => setImageFailed(false), [asset.src]);
+  return h("div", { className, style, title: alt }, asset.src && !asset.failed && !imageFailed ? h("img", { src: asset.src, alt: alt || "", onError: () => setImageFailed(true) }) : fallback);
+}
+
+const CALL_INCOMING = MatrixSDK.CallEventHandlerEvent?.Incoming || "Call.incoming";
+const ROOM_TIMELINE = MatrixSDK.RoomEvent?.Timeline || "Room.timeline";
+const EVENT_DECRYPTED = MatrixSDK.MatrixEventEvent?.Decrypted || "Event.decrypted";
+const CALL_EVENTS = {
+  hangup: MatrixSDK.CallEvent?.Hangup || "hangup",
+  state: MatrixSDK.CallEvent?.State || "state",
+  error: MatrixSDK.CallEvent?.Error || "error",
+  feeds: MatrixSDK.CallEvent?.FeedsChanged || "feeds_changed",
+  replaced: MatrixSDK.CallEvent?.Replaced || "replaced",
+};
+const CALL_ERROR = {
+  userHangup: MatrixSDK.CallErrorCode?.UserHangup || "user_hangup",
+  noUserMedia: MatrixSDK.CallErrorCode?.NoUserMedia || "no_user_media",
+  iceFailed: MatrixSDK.CallErrorCode?.IceFailed || "ice_failed",
+  iceTimeout: MatrixSDK.CallErrorCode?.IceTimeout || "ice_timeout",
+  inviteTimeout: MatrixSDK.CallErrorCode?.InviteTimeout || "invite_timeout",
+  userBusy: MatrixSDK.CallErrorCode?.UserBusy || "user_busy",
+  answeredElsewhere: MatrixSDK.CallErrorCode?.AnsweredElsewhere || "answered_elsewhere",
+  unknownDevices: MatrixSDK.CallErrorCode?.UnknownDevices || "unknown_devices",
+};
+
+function orbitCallKind(call, fallback = "voice") {
+  if (call?.hasRemoteVideoTrack || call?.hasLocalVideoTrack) return "video";
+  const type = String(call?.type || fallback || "voice").toLowerCase();
+  return type === "video" ? "video" : (fallback || "voice");
+}
+
+function orbitCallOpponent(call, rooms = [], fallback = null) {
+  const member = call?.getOpponentMember?.();
+  const room = rooms.find(item => item.id === call?.roomId);
+  const name = member?.name || member?.rawDisplayName || fallback?.name || room?.name || "未知用户";
+  const userId = member?.userId || fallback?.userId || room?.directUserId || "";
+  const avatarMxc = memberAvatarMxc(member) || fallback?.avatarMxc || room?.avatarMxc;
+  return { name, userId, avatarMxc, color: fallback?.color || colorFor(userId || call?.roomId || name), initials: fallback?.initials || initials(name) };
+}
+
+function canPlaceOrbitCall(room) {
+  if (!room || room.isSpace) return { ok: false, message: "空间不能发起通话" };
+  const members = Number(room.members || room.matrixRoom?.getJoinedMemberCount?.() || 0);
+  if (members > 2) return { ok: false, message: "群组房间暂不支持语音/视频通话，请使用一对一私聊" };
+  if (members < 2) return { ok: false, message: "房间内没有其他成员，无法发起通话" };
+  return { ok: true };
+}
+
+function canPlaceAnyOrbitCall(room) {
+  if (!room || room.isSpace) return { ok: false, message: "空间不能发起通话" };
+  const members = Number(room.members || room.matrixRoom?.getJoinedMemberCount?.() || 0);
+  if (members < 2) return { ok: false, message: "房间内没有其他成员，无法发起通话" };
+  return { ok: true };
+}
+
+function hasActiveOrbitCall(session) {
+  return Boolean(session && session.state !== "ended");
+}
+
+function callErrorMessage(error) {
+  const code = error?.code || "";
+  if (code === CALL_ERROR.noUserMedia || /NotAllowedError|NotFoundError|PermissionDenied|getUserMedia/i.test(error?.message || "")) return "无法访问麦克风或摄像头，请允许浏览器权限后重试";
+  if (code === CALL_ERROR.iceFailed || code === CALL_ERROR.iceTimeout) return "通话连接失败，请确认 TURN 配置或双方网络";
+  if (code === CALL_ERROR.inviteTimeout) return "对方无应答，通话已取消";
+  if (code === CALL_ERROR.userBusy) return "对方忙线中";
+  if (code === CALL_ERROR.answeredElsewhere) return "通话已在其他设备接听";
+  if (code === CALL_ERROR.unknownDevices) return "对方存在未验证设备，暂时无法加密通话";
+  if (code === CALL_ERROR.userHangup) return null;
+  return error?.message || null;
+}
+
+function formatCallDuration(startedAt) {
+  if (!startedAt) return "00:00";
+  const sec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  const hours = Math.floor(sec / 3600);
+  const minutes = String(Math.floor((sec % 3600) / 60)).padStart(2, "0");
+  const seconds = String(sec % 60).padStart(2, "0");
+  return hours ? `${hours}:${minutes}:${seconds}` : `${minutes}:${seconds}`;
+}
+
+function callStatusText(session) {
+  if (!session) return "";
+  if (session.error) return session.error;
+  const state = session.state;
+  if (session.direction === "inbound" && state === "ringing") return session.kind === "video" ? "邀请你视频通话" : "邀请你语音通话";
+  if (state === "wait_local_media") return session.kind === "video" ? "正在获取摄像头…" : "正在获取麦克风…";
+  if (state === "create_offer" || state === "invite_sent") return "正在呼叫…";
+  if (state === "ringing") return "对方响铃中…";
+  if (state === "create_answer" || state === "connecting") return "正在接通…";
+  if (state === "connected") return formatCallDuration(session.startedAt);
+  if (state === "ended") return "通话已结束";
+  return "准备通话…";
+}
+
+function hangupOrbitCall(call) {
+  if (!call || call.state === "ended") return;
+  try {
+    if (call.state === "ringing" && call.direction === "inbound" && typeof call.reject === "function") {
+      call.reject();
+      return;
+    }
+  } catch {}
+  try { call.hangup?.(CALL_ERROR.userHangup, false); } catch { try { call.hangup?.(); } catch {} }
+}
+
+function stopOrbitRingtone(ringtoneRef) {
+  try { ringtoneRef?.current?.(); } catch {}
+  if (ringtoneRef) ringtoneRef.current = null;
+}
+
+function createOrbitRingtone() {
+  let ctx = null;
+  let stopped = false;
+  let timer = 0;
+  const start = async () => {
+    try {
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      if (ctx.state === "suspended") await ctx.resume();
+      const burst = () => {
+        if (stopped || !ctx) return;
+        const now = ctx.currentTime;
+        const gain = ctx.createGain();
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.exponentialRampToValueAtTime(0.08, now + 0.03);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.95);
+        gain.connect(ctx.destination);
+        [440, 553].forEach((freq, index) => {
+          const osc = ctx.createOscillator();
+          osc.type = "sine";
+          osc.frequency.value = freq;
+          osc.connect(gain);
+          osc.start(now + index * 0.02);
+          osc.stop(now + 0.9);
+        });
+        timer = window.setTimeout(burst, 1900);
+      };
+      burst();
+    } catch {}
+  };
+  start();
+  return () => {
+    stopped = true;
+    clearTimeout(timer);
+    try { ctx?.close?.(); } catch {}
+  };
+}
+
+let orbitTurnWarned = false;
+async function warnMissingTurn(client) {
+  if (orbitTurnWarned || !client) return;
+  try {
+    const existing = client.getTurnServers?.() || [];
+    const ok = existing.length ? true : await client.checkTurnServers?.();
+    if (!ok && !existing.length) {
+      orbitTurnWarned = true;
+      Toast.warning("当前 homeserver 未提供 TURN，若双方不在同一网络可能无法接通");
+    }
+  } catch {}
+}
+
+function bindOrbitCall(call, extras, setCallSession, callSessionRef, ringtoneRef) {
+  if (!call) return;
+  call.__orbitUnbind?.();
+  const snapshot = (patch = {}) => {
+    const feeds = typeof call.getFeeds === "function" ? call.getFeeds() : (callSessionRef.current?.feeds || []);
+    const prev = callSessionRef.current || {};
+    const state = call.state || prev.state || "fledgling";
+    const startedAt = state === "connected" ? (prev.startedAt || Date.now()) : prev.startedAt || null;
+    return {
+      call,
+      roomId: call.roomId,
+      kind: orbitCallKind(call, extras.kind || prev.kind || "voice"),
+      direction: extras.direction || call.direction || prev.direction || "outbound",
+      state,
+      muted: Boolean(call.isMicrophoneMuted?.()),
+      videoMuted: Boolean(call.isLocalVideoMuted?.()),
+      startedAt,
+      feeds,
+      error: prev.error || null,
+      opponent: orbitCallOpponent(call, window.orbitAllRooms || [], extras.opponent || prev.opponent),
+      ...Object.fromEntries(Object.entries(patch).filter(([, value]) => value != null)),
+      call,
+    };
+  };
+  const push = patch => {
+    const next = snapshot(patch);
+    callSessionRef.current = next;
+    setCallSession(next);
+  };
+  const stopRing = () => stopOrbitRingtone(ringtoneRef);
+  const maybeRing = () => {
+    const inboundRinging = (extras.direction || call.direction) === "inbound" && call.state === "ringing";
+    if (inboundRinging && !ringtoneRef.current) ringtoneRef.current = createOrbitRingtone();
+    if (!inboundRinging) stopRing();
+  };
+  const onState = state => {
+    if (state === "connected" || state === "ended" || (state !== "ringing" && call.direction !== "inbound")) stopRing();
+    if (state === "ringing" && call.direction === "inbound" && !ringtoneRef.current) ringtoneRef.current = createOrbitRingtone();
+    push({ state, startedAt: state === "connected" ? (callSessionRef.current?.startedAt || Date.now()) : callSessionRef.current?.startedAt });
+  };
+  const onFeeds = feeds => push({ feeds: feeds || call.getFeeds?.() || [] });
+  const onError = error => {
+    const message = callErrorMessage(error);
+    if (message) {
+      push({ error: message });
+      Toast.error(message);
+    }
+  };
+  const unbind = () => {
+    call.off?.(CALL_EVENTS.state, onState);
+    call.off?.(CALL_EVENTS.feeds, onFeeds);
+    call.off?.(CALL_EVENTS.error, onError);
+    call.off?.(CALL_EVENTS.hangup, onHangup);
+    call.off?.(CALL_EVENTS.replaced, onReplaced);
+    call.__orbitUnbind = null;
+  };
+  const onHangup = () => {
+    stopRing();
+    const reason = call.hangupReason;
+    const localEnded = reason === CALL_ERROR.userHangup;
+    const wasConnected = Boolean(callSessionRef.current?.startedAt || callSessionRef.current?.state === "connected");
+    if (reason === CALL_ERROR.answeredElsewhere) Toast.info("通话已在其他设备接听");
+    else if (reason === CALL_ERROR.inviteTimeout) Toast.info("对方无应答");
+    else if (reason === CALL_ERROR.userBusy) Toast.info("对方忙线中");
+    else if (wasConnected && !localEnded) Toast.info("对方已挂断");
+    else if (wasConnected) Toast.info("通话已结束");
+    unbind();
+    if (callSessionRef.current?.call === call) {
+      callSessionRef.current = null;
+      setCallSession(null);
+    }
+  };
+  const onReplaced = nextCall => {
+    unbind();
+    bindOrbitCall(nextCall, { ...extras, direction: nextCall?.direction || extras.direction, kind: orbitCallKind(nextCall, extras.kind) }, setCallSession, callSessionRef, ringtoneRef);
+  };
+  call.on(CALL_EVENTS.error, onError);
+  call.on(CALL_EVENTS.state, onState);
+  call.on(CALL_EVENTS.feeds, onFeeds);
+  call.on(CALL_EVENTS.hangup, onHangup);
+  call.on(CALL_EVENTS.replaced, onReplaced);
+  call.__orbitUnbind = unbind;
+  maybeRing();
+  push();
+}
+
+function CallOverlay({ session, client, onHangup, onAnswer, onToggleMute, onToggleVideo }) {
+  const remoteRef = useRef(null);
+  const localRef = useRef(null);
+  const [, setTick] = useState(0);
+  const isElement = session.mode === "element";
+  const isVideoCall = session.kind === "video";
+  const inboundRinging = session.direction === "inbound" && session.state === "ringing";
+  const compact = isVideoCall && !inboundRinging;
+  const overlayState = inboundRinging ? "incoming" : (session.state === "connected" ? "connected" : (session.state === "ended" ? "ended" : "ringing"));
+  useEffect(() => {
+    if (session.state !== "connected") return undefined;
+    const timer = setInterval(() => setTick(value => value + 1), 1000);
+    return () => clearInterval(timer);
+  }, [session.state]);
+  useEffect(() => () => {
+    if (remoteRef.current) remoteRef.current.srcObject = null;
+    if (localRef.current) localRef.current.srcObject = null;
+  }, []);
+  useEffect(() => {
+    if (isElement) return undefined;
+    const feeds = session.feeds || [];
+    const local = feeds.find(feed => feed.isLocal?.());
+    const remote = feeds.find(feed => !feed.isLocal?.());
+    const bind = (node, stream, muted) => {
+      if (!node) return;
+      if (stream && node.srcObject !== stream) node.srcObject = stream;
+      if (!stream && node.srcObject) node.srcObject = null;
+      node.muted = Boolean(muted);
+      if (stream) node.play?.().catch(() => {});
+    };
+    bind(remoteRef.current, remote?.stream, false);
+    bind(localRef.current, local?.stream, true);
+  }, [session.feeds, session.state, isElement, isVideoCall]);
+  const opponent = session.opponent || {};
+  const actions = inboundRinging
+    ? [
+        h("button", { type: "button", className: "call-action hangup", onClick: onHangup }, h("span", { className: "call-action-icon" }, h(Icon, { name: "phone", size: 20 })), h("span", null, "拒绝")),
+        h("button", { type: "button", className: "call-action answer", onClick: onAnswer }, h("span", { className: "call-action-icon" }, h(Icon, { name: isVideoCall ? "video" : "phone", size: 20 })), h("span", null, "接听")),
+      ]
+    : [
+        h("button", { type: "button", className: `call-action mute ${session.muted ? "is-on" : ""}`, onClick: onToggleMute }, h("span", { className: "call-action-icon" }, h(Icon, { name: session.muted ? "micOff" : "mic", size: 18 })), h("span", null, session.muted ? "已静音" : "静音")),
+        isVideoCall && h("button", { type: "button", className: `call-action mute ${session.videoMuted ? "is-on" : ""}`, onClick: onToggleVideo }, h("span", { className: "call-action-icon" }, h(Icon, { name: session.videoMuted ? "videoOff" : "video", size: 18 })), h("span", null, session.videoMuted ? "已关摄像头" : "摄像头")),
+        h("button", { type: "button", className: "call-action hangup", onClick: onHangup }, h("span", { className: "call-action-icon" }, h(Icon, { name: "phone", size: 20 })), h("span", null, "挂断")),
+      ];
+  return createPortal(h("div", { className: `call-overlay ${compact ? "is-video" : "is-voice"} ${isElement ? "is-element" : ""} is-${overlayState}` },
+    !isElement && isVideoCall && h("div", { className: "call-video-stage" },
+      h("video", { ref: remoteRef, className: "call-remote-video", autoPlay: true, playsInline: true }),
+      h("video", { ref: localRef, className: "call-local-video", autoPlay: true, playsInline: true, muted: true })
+    ),
+    !isElement && !isVideoCall && h("audio", { ref: remoteRef, className: "call-remote-audio", autoPlay: true }),
+    h("div", { className: "call-card" },
+      h(MatrixAvatar, { client, mxcUrl: opponent.avatarMxc, size: compact ? 42 : 88, className: "call-avatar", style: { background: opponent.color, width: compact ? 42 : 88, height: compact ? 42 : 88 }, fallback: opponent.initials, alt: opponent.name }),
+      h("div", { className: "call-copy" }, h("strong", { className: "call-name" }, opponent.name), h("span", { className: "call-status" }, callStatusText(session))),
+      session.error && h("div", { className: "call-error" }, session.error),
+      h("div", { className: "call-actions" }, actions)
+    )
+  ), document.body);
+}
+
+// Presence in Matrix is optional and many homeservers report a freshly
+// connected user's own presence as `offline` until the first presence event.
+// Keep the local session truthful while preserving an explicit offline state
+// for other members.
+function matrixPresence(client, userId) {
+  const user = client?.getUser?.(userId);
+  const raw = String(user?.presence || "").toLowerCase();
+  if (userId && userId === client?.getUserId?.() && client?.isRunning?.() !== false) return "online";
+  if (raw === "online" || raw.includes("busy")) return raw.includes("busy") ? "busy" : "online";
+  if (raw === "unavailable" || user?.currentlyActive === true) return "unavailable";
+  if (raw === "offline") return "offline";
+  return "unknown";
+}
+
+function MessageText({ text }) {
+  const [items, setItems] = useState(() => window.orbitEmojiItems || []);
+  useEffect(() => { let active = true; ensureEmojiCatalog().then(next => active && setItems(next || [])); return () => { active = false; }; }, []);
+  const catalog = items || [];
+  const parts = String(text || "").split(/(:[^:\s]+:|https?:\/\/[^\s<]+|www\.[^\s<]+)/gi);
+  return h(React.Fragment, null, parts.map((part, index) => {
+    const rawUrl = /^https?:\/\//i.test(part) ? part : /^www\./i.test(part) ? `https://${part}` : "";
+    if (rawUrl) {
+      const trailing = rawUrl.match(/[),.!?;:，。！？；：]+$/)?.[0] || "";
+      const href = trailing ? rawUrl.slice(0, -trailing.length) : rawUrl;
+      return h(React.Fragment, { key: index }, h("a", { className: "message-link", href, target: "_blank", rel: "noreferrer noopener" }, href), trailing);
+    }
+    const match = part.match(/^:([^:\s]+):$/); const tokenName = match?.[1]?.trim().toLowerCase(); const item = tokenName && catalog.find(entry => String(entry.name || "").trim().toLowerCase() === tokenName || String(entry.shortcode || "").replace(/^:+|:+$/g, "").trim().toLowerCase() === tokenName);
+    return item ? h("img", { key: index, className: "inline-message-emoji", src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, title: item.name }) : h(React.Fragment, { key: index }, part);
+  }));
+}
+
+function FormattedMessage({ html, client, onImage, emojiFiles }) {
+  const [nodes, setNodes] = useState([]);
+  useEffect(() => {
+    try { const doc = new DOMParser().parseFromString(String(html || ""), "text/html"); setNodes([...doc.body.childNodes]); } catch { setNodes([]); }
+  }, [html]);
+  const renderText = (value, key) => String(value || "").split(/(https?:\/\/[^\s<]+|www\.[^\s<]+)/gi).map((part, index) => {
+    const rawUrl = /^https?:\/\//i.test(part) ? part : /^www\./i.test(part) ? `https://${part}` : "";
+    if (!rawUrl) return h(React.Fragment, { key: `${key}-${index}` }, part);
+    const trailing = rawUrl.match(/[),.!?;:，。！？；：]+$/)?.[0] || "";
+    const href = trailing ? rawUrl.slice(0, -trailing.length) : rawUrl;
+    return h(React.Fragment, { key: `${key}-${index}` }, h("a", { className: "message-link", href, target: "_blank", rel: "noreferrer noopener" }, href), trailing);
+  });
+  const renderNode = (node, key) => {
+    if (node.nodeType === Node.TEXT_NODE) return renderText(node.nodeValue || "", key);
+    if (node.nodeType !== Node.ELEMENT_NODE) return null;
+    if (node.tagName === "BR") return h("br", { key });
+    const children = [...node.childNodes].map((child, index) => renderNode(child, `${key}-${index}`));
+    if (node.tagName === "A") { const href = node.getAttribute("href") || "#"; return h("a", { key, className: "message-link", href, target: "_blank", rel: "noreferrer noopener" }, children); }
+    if (node.tagName === "IMG") { const alt = node.getAttribute("alt") || "图片"; return h(InlineMatrixImage, { key, client, mxcUrl: node.getAttribute("src"), alt, encryptedFile: emojiFiles?.[alt] || null, onOpen: onImage }); }
+    const tags = { STRONG: "strong", B: "strong", EM: "em", I: "em", U: "u", DEL: "del", S: "s", CODE: "code", PRE: "pre", BLOCKQUOTE: "blockquote", UL: "ul", OL: "ol", LI: "li", H1: "h1", H2: "h2", H3: "h3", SPAN: "span" };
+    const tag = tags[node.tagName];
+    if (tag === "PRE") return h("pre", { key, className: "message-code-block" }, children);
+    if (tag === "BLOCKQUOTE") return h("blockquote", { key, className: "message-quote-block" }, children);
+    return tag ? h(tag, { key }, children) : h(React.Fragment, { key }, children);
+  };
+  return h(React.Fragment, null, nodes.map((node, index) => renderNode(node, index)));
+}
+
+function InlineMatrixImage({ client, mxcUrl, alt, encryptedFile, onOpen }) {
+  const resolvedEncryptedFile = encryptedFile || window.orbitEncryptedEmojiFiles?.[alt] || null;
+  const asset = useMatrixAsset(client, mxcUrl, undefined, undefined, undefined, resolvedEncryptedFile);
+  if (!asset.src) return h("span", { className: "inline-media-placeholder" }, "⌛");
+  return h("img", { className: "inline-message-image", src: asset.src, alt, onClick: () => onOpen?.(asset.src, alt), onError: () => {} });
+}
+
+// Keep the timeline light: show the server thumbnail first and promote it to
+// the original only after the browser has decoded the full image.  This is
+// also used when the original is fetched through the authenticated proxy.
+function ProgressiveImage({ thumbSrc, src, alt, className = "", onClick, onRequestOriginal }) {
+  const [originalReady, setOriginalReady] = useState(false);
+  const [thumbFailed, setThumbFailed] = useState(false);
+  useEffect(() => {
+    setOriginalReady(false);
+    setThumbFailed(false);
+    if (!src || src === thumbSrc) return undefined;
+    const image = new Image();
+    image.onload = () => setOriginalReady(true);
+    image.onerror = () => setOriginalReady(false);
+    image.src = src;
+    return () => { image.onload = null; image.onerror = null; };
+  }, [src, thumbSrc]);
+  const displaySrc = originalReady && src ? src : (!thumbFailed && thumbSrc ? thumbSrc : src);
+  if (!displaySrc) return h("div", { className: `${className} media-image-placeholder`, role: "status" }, "正在加载图片…");
+  return h("img", {
+    className: `${className} ${originalReady ? "is-original" : "is-thumbnail"}`,
+    src: displaySrc,
+    alt,
+    loading: "lazy",
+    onError: () => { if (displaySrc === thumbSrc && src && src !== thumbSrc) { setThumbFailed(true); onRequestOriginal?.(); } },
+    onClick: () => { onRequestOriginal?.(); onClick?.(displaySrc); }
+  });
+}
+
+function MediaLightbox({ viewer, onClose }) {
+  const [rotation, setRotation] = useState(0); const [scale, setScale] = useState(1); const [offset, setOffset] = useState({ x: 0, y: 0 }); const [dragging, setDragging] = useState(false); const dragRef = useRef(null);
+  const close = event => { event?.preventDefault?.(); event?.stopPropagation?.(); onClose?.(); };
+  const navigate = delta => {
+    const gallery = viewer?.gallery || [];
+    if (gallery.length < 2) return;
+    const nextIndex = (Number(viewer.index) + delta + gallery.length) % gallery.length;
+    const next = gallery[nextIndex];
+    if (next) viewer.onNavigate?.(next, nextIndex);
+  };
+  useEffect(() => { setRotation(0); setScale(1); setOffset({ x: 0, y: 0 }); }, [viewer?.src]);
+  useEffect(() => { if (scale <= 1) setOffset({ x: 0, y: 0 }); }, [scale]);
+  useEffect(() => {
+    if (!viewer) return;
+    const onKey = event => {
+      if (event.key === "Escape") close(event);
+      if (event.key === "ArrowLeft") navigate(-1);
+      if (event.key === "ArrowRight") navigate(1);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [viewer, onClose]);
+  if (!viewer) return null;
+  const adjustScale = delta => setScale(value => Math.min(4, Math.max(0.35, Number((value + delta).toFixed(2)))));
+  const beginDrag = event => { if (scale <= 1) return; event.preventDefault(); dragRef.current = { x: event.clientX, y: event.clientY, offset }; setDragging(true); };
+  const moveDrag = event => { if (!dragRef.current) return; const start = dragRef.current; setOffset({ x: start.offset.x + event.clientX - start.x, y: start.offset.y + event.clientY - start.y }); };
+  const endDrag = () => { dragRef.current = null; setDragging(false); };
+  return createPortal(h("div", { className: "media-lightbox", role: "dialog", "aria-modal": "true", onMouseDown: event => event.target === event.currentTarget && close(event) },
+    h("div", { className: "media-lightbox-toolbar", onMouseDown: event => event.stopPropagation(), onClick: event => event.stopPropagation() }, h("span", null, viewer.gallery?.length > 1 ? `${Number(viewer.index) + 1}/${viewer.gallery.length} · ` : "", viewer.alt || "图片预览"), h("div", { className: "media-lightbox-actions" }, h(UiButton, { size: "small", htmlType: "button", title: "缩小", onClick: () => adjustScale(-0.2) }, "−"), h("span", { className: "media-zoom-value" }, `${Math.round(scale * 100)}%`), h(UiButton, { size: "small", htmlType: "button", title: "放大", onClick: () => adjustScale(0.2) }, "+"), h(UiButton, { size: "small", htmlType: "button", title: "重置缩放", onClick: () => setScale(1) }, "1:1"), h(UiButton, { size: "small", htmlType: "button", onClick: () => setRotation(value => value - 90) }, "↶"), h(UiButton, { size: "small", htmlType: "button", onClick: () => setRotation(value => value + 90) }, "↷"), h(UiButton, { size: "small", htmlType: "button", className: "media-lightbox-close", onClick: close }, "关闭"))),
+    viewer.gallery?.length > 1 && h(React.Fragment, null, h("div", { className: "media-lightbox-edge media-lightbox-edge-prev" }, h("button", { type: "button", onClick: () => navigate(-1), "aria-label": "上一张", title: "上一张" }, "‹")), h("div", { className: "media-lightbox-edge media-lightbox-edge-next" }, h("button", { type: "button", onClick: () => navigate(1), "aria-label": "下一张", title: "下一张" }, "›"))),
+    h("div", { className: `media-lightbox-stage ${dragging ? "is-dragging" : ""}`, onWheel: event => { event.preventDefault(); adjustScale(event.deltaY > 0 ? -0.1 : 0.1); }, onMouseDown: event => event.target === event.currentTarget ? close(event) : beginDrag(event), onMouseMove: moveDrag, onMouseUp: endDrag, onMouseLeave: endDrag }, h("img", { className: "media-lightbox-image", src: viewer.src, alt: viewer.alt || "图片预览", draggable: false, style: { transform: `translate(${offset.x}px, ${offset.y}px) rotate(${rotation}deg) scale(${scale})` } }))), document.body);
+}
+
+function EmojiPicker({ onSelect, onInsert }) {
+  const [items, setItems] = useState([]); const [packs, setPacks] = useState([]); const [pack, setPack] = useState("all"); const [query, setQuery] = useState(""); const [loading, setLoading] = useState(false); const [hovered, setHovered] = useState(null); const [mode, setMode] = useState("emoji");
+  useEffect(() => { const move = event => { const target = event.target?.closest?.(".emoji-item-wrap"); if (!target) return; const rect = target.getBoundingClientRect(); const width = 164; const height = 180; const gap = 10; const x = window.innerWidth - rect.right >= width + gap ? rect.right + gap : Math.max(8, rect.left - width - gap); const y = rect.top >= height + gap ? rect.top - height - gap : Math.min(window.innerHeight - height - 8, rect.bottom + gap); document.documentElement.style.setProperty("--orbit-picker-preview-x", `${x}px`); document.documentElement.style.setProperty("--orbit-picker-preview-y", `${y}px`); }; document.addEventListener("mousemove", move); return () => document.removeEventListener("mousemove", move); }, []);
+  useEffect(() => { let active = true; setLoading(true); ensureEmojiCatalog().then(nextItems => { if (active) { setItems(nextItems); setPacks(window.orbitEmojiPacks || []); } }).finally(() => active && setLoading(false)); return () => { active = false; }; }, []);
+  const normalizedQuery = query.trim().toLowerCase();
+  const shown = items.filter(item => (pack === "all" || item.packId === pack) && (!normalizedQuery || `${item.name} ${(item.keywords || []).join(" ")}`.toLowerCase().includes(normalizedQuery)));
+  const categoryNav = h("nav", { className: "emoji-category-nav", "aria-label": "表情分类" },
+    h("button", { type: "button", className: `emoji-category ${pack === "all" ? "active" : ""}`, onClick: () => setPack("all") }, "全部", h("small", null, items.length)),
+    packs.map(item => h("button", { type: "button", className: `emoji-category ${pack === item.id ? "active" : ""}`, key: item.id, title: item.description || item.name, onClick: () => setPack(item.id) }, h("span", null, item.name), h("small", null, item.itemCount || items.filter(entry => entry.packId === item.id).length)))
+  );
+  const emojiGrid = loading ? h("div", { className: "emoji-loading" }, "正在加载表情…") : h("div", { className: "emoji-grid" }, shown.map(item => h("div", { className: "emoji-item-wrap", key: item.id, onMouseEnter: event => { const rect = event.currentTarget.getBoundingClientRect(); const previewWidth = 148; const previewHeight = 174; const gap = 10; const x = window.innerWidth - rect.right >= previewWidth + gap ? rect.right + gap : Math.max(8, rect.left - previewWidth - gap); const y = rect.top >= previewHeight + gap ? rect.top - previewHeight - gap : Math.min(window.innerHeight - previewHeight - 8, rect.bottom + gap); document.documentElement.style.setProperty("--orbit-picker-preview-x", `${x}px`); document.documentElement.style.setProperty("--orbit-picker-preview-y", `${y}px`); setHovered(item); }, onMouseLeave: () => setHovered(null) }, h("button", { type: "button", className: "emoji-item", title: mode === "emoji" ? `${item.name}：插入表情` : `${item.name}：发送贴纸`, onClick: () => { setHovered(null); if (mode === "sticker") setQuery(""); (mode === "emoji" ? onInsert : onSelect)?.(item); } }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" })) )));
+  const modeTabs = h("div", { className: "emoji-mode-tabs", role: "tablist" }, h("button", { type: "button", className: mode === "emoji" ? "active" : "", role: "tab", onClick: () => setMode("emoji") }, "表情", h("small", null, "插入文本")), h("button", { type: "button", className: mode === "sticker" ? "active" : "", role: "tab", onClick: () => setMode("sticker") }, "贴纸", h("small", null, "发送大图")));
+  const hoverPreview = hovered ? createPortal(h("div", { className: "emoji-hover-preview", role: "tooltip" }, h("img", { src: assetRequestUrl(hovered.url || hovered.thumbUrl), alt: hovered.name }), h("strong", null, hovered.name)), document.body) : null;
+  const content = h(React.Fragment, null, h("div", { className: "emoji-popover", onMouseDown: event => event.stopPropagation() }, modeTabs, h(Input, { size: "small", autoFocus: true, value: query, onChange: setQuery, onMouseDown: event => event.stopPropagation(), placeholder: mode === "emoji" ? "搜索表情名称" : "搜索贴纸名称" }), h("div", { className: "emoji-browser" }, categoryNav, h("section", { className: "emoji-category-content" }, h("div", { className: "emoji-category-title" }, pack === "all" ? (mode === "emoji" ? "全部表情" : "全部贴纸") : packs.find(item => item.id === pack)?.name || "表情"), emojiGrid))), hoverPreview);
+  return h(AntPopover, { trigger: "click", placement: "top", arrow: false, autoAdjustOverflow: true, getPopupContainer: node => node.closest?.(".composer-wrap") || document.body, content }, h("button", { type: "button", className: "tool-button composer-emoji-button", title: "表情包", "aria-label": "表情包" }, h(Icon, { name: "smile", size: 17 })));
+}
+
+function emojiItemForToken(token) {
+  const name = String(token || "").trim().replace(/^:+|:+$/g, "").trim().toLowerCase();
+  return (window.orbitEmojiItems || []).find(item => String(item.name || "").trim().toLowerCase() === name || String(item.shortcode || "").replace(/^:+|:+$/g, "").trim().toLowerCase() === name) || null;
+}
+
+function ReactionLabel({ keyValue }) {
+  const [item, setItem] = useState(() => emojiItemForToken(keyValue));
+  useEffect(() => { let active = true; const current = emojiItemForToken(keyValue); if (current) { setItem(current); return () => { active = false; }; } ensureEmojiCatalog().then(items => { if (!active) return; const name = String(keyValue || "").trim().replace(/^:+|:+$/g, "").trim(); const normalized = name.toLowerCase(); setItem((items || []).find(entry => String(entry.name || "").trim().toLowerCase() === normalized || String(entry.shortcode || "").replace(/^:+|:+$/g, "").trim().toLowerCase() === normalized) || null); }); return () => { active = false; }; }, [keyValue]);
+  const mxcKey = /^mxc:\/\//i.test(String(keyValue || "")) ? String(keyValue) : null;
+  const matrixClient = window.orbitMatrixClient;
+  // Do not request a resized thumbnail here: Matrix thumbnail endpoints
+  // commonly flatten animated GIFs to their first frame. Load the original
+  // media and let the reaction CSS constrain its display size instead.
+  const media = useMatrixAsset(matrixClient, mxcKey, null, null, null);
+  if (mxcKey) return media.src ? h("img", { className: "reaction-image", src: media.src, alt: "自定义表情", title: "自定义表情" }) : h("span", { className: "reaction-fallback" }, "表情");
+  return item ? h("img", { className: "reaction-image", src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, title: item.name }) : keyValue;
+}
+function reactionLabel(key) { return h(ReactionLabel, { keyValue: key }); }
+
+function ReactionPopover({ users = [], children }) {
+  const uniqueUsers = users.filter((entry, index, all) => entry && all.findIndex(item => item?.userId === entry.userId) === index);
+  if (!uniqueUsers.length) return children;
+  const anchorRef = useRef(null);
+  const popoverRef = useRef(null);
+  const [popover, setPopover] = useState({ visible: false, left: 8, top: 8 });
+  const title = uniqueUsers.length === 1 ? "1 人添加了回应" : `${uniqueUsers.length} 人添加了回应`;
+  const content = h("div", { ref: popoverRef, className: "reaction-popover reaction-popover-floating", role: "status", style: { left: `${popover.left}px`, top: `${popover.top}px`, opacity: popover.visible ? 1 : 0, visibility: popover.visible ? "visible" : "hidden" } },
+    h("div", { className: "reaction-popover-title" }, title),
+    h("div", { className: "reaction-popover-list" }, uniqueUsers.map(entry => {
+      const fullName = String(entry.name || entry.userId || "未命名用户");
+      const compactName = [...fullName].length > 16 ? `${[...fullName].slice(0, 15).join("")}…` : fullName;
+      return h("div", { className: "reaction-popover-person", key: entry.userId },
+        h("span", { className: "reaction-popover-avatar", style: { background: colorFor(entry.userId) }, "aria-hidden": "true" }, initials(fullName)),
+        h("span", { className: "reaction-popover-name", title: fullName }, compactName)
+      );
+    }))
+  );
+  const label = `${uniqueUsers.map(entry => entry.name).join("、")} 添加了回应`;
+  const updatePosition = () => {
+    const node = anchorRef.current;
+    if (!node) return;
+    const rect = node.getBoundingClientRect();
+    if (!rect.width || !rect.height || !Number.isFinite(rect.left) || !Number.isFinite(rect.top)) return;
+    const width = Math.min(224, Math.max(168, window.innerWidth - 24));
+    const measured = popoverRef.current?.getBoundingClientRect?.();
+    const height = Math.min(236, Math.max(58, measured?.height || (66 + uniqueUsers.length * 27)));
+    const gap = 10;
+    const row = anchorRef.current.closest?.(".message-row");
+    const onRight = row?.classList?.contains("me");
+    // Keep the card beside the reaction whenever there is room. This avoids
+    // covering the preceding message when a reaction has several responders.
+    const sideLeft = onRight ? rect.left - width - gap : rect.right + gap;
+    const sideFits = onRight ? sideLeft >= 8 : sideLeft + width <= window.innerWidth - 8;
+    let left;
+    let top;
+    if (sideFits) {
+      left = sideLeft;
+      top = Math.max(8, Math.min(window.innerHeight - height - 8, rect.top + rect.height / 2 - height / 2));
+    } else {
+      const belowTop = rect.bottom + gap;
+      const aboveTop = rect.top - height - gap;
+      top = belowTop + height <= window.innerHeight - 8 ? belowTop : Math.max(8, aboveTop);
+      left = Math.max(8, Math.min(window.innerWidth - width - 8, rect.left + rect.width / 2 - width / 2));
+    }
+    setPopover({ visible: true, left, top });
+  };
+  const hide = event => {
+    if (event?.type === "blur" && event.relatedTarget && anchorRef.current?.contains(event.relatedTarget)) return;
+    setPopover(current => current.visible ? { ...current, visible: false } : current);
+  };
+  useEffect(() => {
+    if (!popover.visible) return undefined;
+    const reposition = () => updatePosition();
+    window.addEventListener("resize", reposition);
+    window.addEventListener("scroll", reposition, true);
+    return () => { window.removeEventListener("resize", reposition); window.removeEventListener("scroll", reposition, true); };
+  }, [popover.visible, uniqueUsers.length]);
+  return h(React.Fragment, null, h("span", { ref: anchorRef, className: "reaction-popover-anchor", onMouseEnter: updatePosition, onMouseLeave: hide, onFocus: updatePosition, onBlur: hide },
+    React.cloneElement(children, { title: label, "aria-label": label }),
+  ), createPortal(content, document.body));
+}
+
+function readRichEditor(node) {
+  if (!node) return "";
+  const walk = current => [...current.childNodes].map(child => {
+    if (child.nodeType === Node.TEXT_NODE) return child.nodeValue || "";
+    if (child.nodeType !== Node.ELEMENT_NODE) return "";
+    if (child.dataset?.token) return child.dataset.token;
+    if (child.tagName === "BR") return "\n";
+    // Browsers commonly represent pasted/newly-entered lines as DIV/P blocks
+    // instead of BR elements. Preserve those block boundaries when sending.
+    const block = ["DIV", "P", "LI"].includes(child.tagName);
+    const nested = walk(child);
+    return nested + (block && !nested.endsWith("\n") ? "\n" : "");
+  }).join("");
+  return walk(node).replace(/\n+$/, "");
+}
+
+function escapeEditorText(value) {
+  return String(value || "").replace(/[&<>\"]/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[char]));
+}
+
+function renderRichEditor(node, value) {
+  if (!node) return;
+  const text = String(value || "");
+  const parts = text.split(/(:[^:\s]+:)/g);
+  node.innerHTML = parts.map(part => {
+    const item = emojiItemForToken(part);
+    if (item) return `<span class="editor-emoji-chip" data-token=":${escapeEditorText(item.name)}:" contenteditable="false"><img draggable="false" src="${assetRequestUrl(item.thumbUrl || item.url)}" alt="${escapeEditorText(item.name)}"><span>${escapeEditorText(item.name)}</span></span>`;
+    return escapeEditorText(part).replace(/\n/g, "<br>");
+  }).join("");
+}
+
+// Legacy contenteditable helpers are retained only for backward-compatible
+// room drafts; the active composer below is PlainComposer.
+function hasUnexpectedEditorChips() { return false; }
+function richEditorChildren() { return []; }
+
+function clipboardFiles(data) {
+  const direct = [...(data?.files || [])];
+  if (direct.length) return direct;
+  return [...(data?.items || [])].filter(item => item?.kind === "file").map(item => item.getAsFile?.()).filter(Boolean);
+}
+
+const RichEditor = React.forwardRef(function RichEditor({ value, onChange, onKeyDown, onFiles, placeholder, onFocus, onBlur }, ref) {
+  const nodeRef = useRef(null);
+  const [editable, setEditable] = useState(false);
+  // Keep a stable copy of the React draft for reconciliation.  Chromium can
+  // restore a contenteditable's old DOM after a reload/navigation even when
+  // React rendered an empty value, which is what caused the stray K歌 chips.
+  const valueRef = useRef(String(value || ""));
+  valueRef.current = String(value || "");
+  const inputReadyRef = useRef(false);
+  React.useImperativeHandle(ref, () => ({
+    focus: () => nodeRef.current?.focus(),
+    format: (command, value = null) => { const node = nodeRef.current; if (!node) return; inputReadyRef.current = true; node.setAttribute("contenteditable", "true"); setEditable(true); node.focus(); document.execCommand(command, false, value); const next = readRichEditor(node); valueRef.current = next; onChange?.(next, node.innerHTML); },
+    insertText: text => {
+      const node = nodeRef.current;
+      if (!node) return;
+      // Programmatic edits (toolbar, voice input, paste helpers) are explicit
+      // user actions.  Opt in before focusing so a browser-restored input
+      // event can never be mistaken for the user's current draft.
+      inputReadyRef.current = true;
+      node.setAttribute("contenteditable", "true");
+      setEditable(true);
+      node.focus();
+      const selection = window.getSelection?.();
+      if (!selection || !selection.rangeCount || !node.contains(selection.anchorNode)) {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        range.collapse(false);
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+      }
+      document.execCommand("insertText", false, String(text || ""));
+      const next = readRichEditor(node);
+      valueRef.current = next;
+      onChange?.(next, node.innerHTML);
+    },
+    clear: () => {
+      const node = nodeRef.current;
+      if (!node) return;
+      // Clearing after send/room change starts a new draft. Keep the editor
+      // gated until the next real pointer/keyboard edit so Chromium cannot
+      // replay the previous content into React as an input event.
+      inputReadyRef.current = false;
+      setEditable(false);
+      node.removeAttribute("contenteditable");
+      node.innerHTML = "";
+      valueRef.current = "";
+      onChange?.("", "");
+    },
+  }));
+  useEffect(() => {
+    const node = nodeRef.current;
+    if (!node) return;
+    const reconcile = () => {
+      const expected = valueRef.current;
+      const actual = readRichEditor(node);
+      // An empty contenteditable is often represented as a transient <br>
+      // (or an empty DIV/P) when it receives focus. Treat that placeholder as
+      // equivalent to an empty draft; otherwise the observer would clear it,
+      // the browser would add it back, and the two could loop until the tab
+      // crashes when the editor is clicked.
+      const onlyEmptyBlocks = !expected && !node.querySelector(".editor-emoji-chip") && !node.textContent?.trim() && [...node.childNodes].every(child => child.nodeType === Node.TEXT_NODE ? !child.nodeValue?.trim() : child.nodeType === Node.ELEMENT_NODE && ["BR", "DIV", "P"].includes(child.tagName) && !child.textContent?.trim());
+      if (actual !== expected && !onlyEmptyBlocks) renderRichEditor(node, expected);
+    };
+    reconcile();
+    // Run after browser autofill/session restoration as well as after the
+    // first paint. Also watch only for unexpected emoji chips: Chromium can
+    // restore a stale editor subtree without firing input, but watching every
+    // mutation would loop on the transient <br> inserted when focusing.
+    const timers = [0, 80, 300, 800, 1600, 3000, 5000, 8000, 12000].map(delay => setTimeout(reconcile, delay));
+    let correcting = false;
+    const observer = new MutationObserver(() => {
+      if (correcting) return;
+      const expected = valueRef.current;
+      if (!hasUnexpectedEditorChips(node, expected)) return;
+      correcting = true;
+      observer.disconnect();
+      renderRichEditor(node, expected);
+      queueMicrotask(() => {
+        correcting = false;
+        observer.observe(node, { childList: true, subtree: true });
+      });
+    });
+    observer.observe(node, { childList: true, subtree: true });
+    const poll = setInterval(() => {
+      if (correcting || !hasUnexpectedEditorChips(node, valueRef.current)) return;
+      correcting = true;
+      observer.disconnect();
+      renderRichEditor(node, valueRef.current);
+      queueMicrotask(() => {
+        correcting = false;
+        observer.observe(node, { childList: true, subtree: true });
+      });
+    }, 100);
+    const stopPoll = setTimeout(() => clearInterval(poll), 15000);
+    return () => { timers.forEach(clearTimeout); observer.disconnect(); clearInterval(poll); clearTimeout(stopPoll); };
+  }, [value]);
+  return h("div", { ref: nodeRef, className: "rich-editor", contentEditable: editable ? true : undefined, role: "textbox", "aria-label": placeholder, "data-placeholder": placeholder, "data-draft": String(value || ""), autoComplete: "off", spellCheck: false, autoCorrect: false, autoCapitalize: "off", suppressContentEditableWarning: true,
+    onInput: event => { const expected = valueRef.current; const next = readRichEditor(event.currentTarget); if (!inputReadyRef.current || hasUnexpectedEditorChips(event.currentTarget, expected)) { renderRichEditor(event.currentTarget, expected); return; } valueRef.current = next; onChange?.(next, event.currentTarget.innerHTML); },
+    onKeyDown: event => { inputReadyRef.current = true; onKeyDown?.(event); },
+    // Focus can be generated by Chromium while it restores a form control;
+    // do not treat focus alone as proof that the user edited the draft.
+    // Focus alone is not an edit. Chromium may focus and restore a previous
+    // contenteditable snapshot while the page is booting; keep input gated
+    // until a real key/paste/tool action opts in below.
+    onFocus: event => { event.currentTarget.setAttribute("contenteditable", "true"); setEditable(true); onFocus?.(event); },
+    onPointerDown: event => { inputReadyRef.current = false; if (!editable) { setEditable(true); setTimeout(() => nodeRef.current?.focus?.(), 0); } },
+    // Leaving the editor (for example to open the emoji picker) starts a
+    // guarded period. Any contenteditable restoration that happens while the
+    // picker owns focus is synthetic and must not overwrite the React draft.
+    onBlur: event => { inputReadyRef.current = false; event.currentTarget.removeAttribute("contenteditable"); setEditable(false); onBlur?.(event); },
+    onPaste: event => { inputReadyRef.current = true; const files = clipboardFiles(event.clipboardData); if (files.length) { event.preventDefault(); event.stopPropagation(); onFiles?.(files); return; } event.preventDefault(); const text = event.clipboardData?.getData("text/plain") || ""; document.execCommand("insertText", false, text); },
+    onDragOver: event => { event.preventDefault(); event.currentTarget.classList.add("drag-active"); },
+    onDragLeave: event => event.currentTarget.classList.remove("drag-active"),
+    onDrop: event => { event.preventDefault(); event.stopPropagation(); event.currentTarget.classList.remove("drag-active"); const files = [...(event.dataTransfer?.files || [])]; if (files.length) onFiles?.(files); },
+  }, richEditorChildren(value));
+});
+
+// Native composer keeps the input stable while preserving Matrix emoji/sticker
+// sending. A TipTap-style toolbar shell can be layered on after selection.
+const LegacyPlainComposer = React.forwardRef(function LegacyPlainComposer({ value, onChange, onKeyDown, onFiles, placeholder }, ref) {
+  const nodeRef = useRef(null);
+  React.useImperativeHandle(ref, () => ({
+    focus: () => nodeRef.current?.focus(),
+    insertText: text => {
+      const node = nodeRef.current;
+      if (!node) return;
+      const start = node.selectionStart ?? node.value.length;
+      const end = node.selectionEnd ?? start;
+      const next = `${node.value.slice(0, start)}${String(text || "")}${node.value.slice(end)}`;
+      onChange?.(next);
+      requestAnimationFrame(() => { node.focus(); const position = start + String(text || "").length; node.setSelectionRange(position, position); });
+    },
+    clear: () => onChange?.(""),
+  }));
+  return h("textarea", { ref: nodeRef, className: "rich-editor plain-composer", value: String(value || ""), placeholder, "aria-label": placeholder, rows: 1, autoComplete: "off", spellCheck: false, onChange: event => onChange?.(event.currentTarget.value), onKeyDown, onPaste: event => { const files = clipboardFiles(event.clipboardData); if (files.length) { event.preventDefault(); event.stopPropagation(); onFiles?.(files); } }, onDragOver: event => { event.preventDefault(); event.currentTarget.classList.add("drag-active"); }, onDragLeave: event => event.currentTarget.classList.remove("drag-active"), onDrop: event => { event.preventDefault(); event.stopPropagation(); event.currentTarget.classList.remove("drag-active"); const files = [...(event.dataTransfer?.files || [])]; if (files.length) onFiles?.(files); } });
+});
+
+const LegacyHaloComposer = React.forwardRef(function LegacyHaloComposer({ value, onChange, onKeyDown, onFiles, placeholder, toolbarExtra }, ref) {
+  const hostRef = useRef(null);
+  const editorRef = useRef(null);
+  const [, setEditorVersion] = useState(0);
+  const [ready, setReady] = useState(false);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const [{ Editor }, { StarterKit }, { Placeholder }, { Underline }, { Link }] = await Promise.all([
+          import("https://cdn.jsdelivr.net/npm/@tiptap/core@2.11.5/+esm"),
+          import("https://cdn.jsdelivr.net/npm/@tiptap/starter-kit@2.11.5/+esm"),
+          import("https://cdn.jsdelivr.net/npm/@tiptap/extension-placeholder@2.11.5/+esm"),
+          import("https://cdn.jsdelivr.net/npm/@tiptap/extension-underline@2.11.5/+esm"),
+          import("https://cdn.jsdelivr.net/npm/@tiptap/extension-link@2.11.5/+esm"),
+        ]);
+        if (!active || !hostRef.current) return;
+        const editor = new Editor({ element: hostRef.current, content: String(value || ""), extensions: [StarterKit.configure({ heading: false, codeBlock: true }), Underline, Link.configure({ openOnClick: false, defaultProtocol: "https" }), Placeholder.configure({ placeholder: placeholder || "输入消息…" })], onUpdate: ({ editor: current }) => { setEditorVersion(version => version + 1); onChange?.(current.getText(), current.getHTML()); }, onSelectionUpdate: () => setEditorVersion(version => version + 1) });
+        editorRef.current = editor; setReady(true);
+      } catch (error) { window.__haloEditorError = String(error?.stack || error?.message || error); setFailed(true); }
+    })();
+    return () => { active = false; editorRef.current?.destroy?.(); editorRef.current = null; };
+  }, []);
+  useEffect(() => { const editor = editorRef.current; if (editor && String(value || "") !== editor.getText()) editor.commands.setContent(String(value || ""), false); }, [value]);
+  React.useImperativeHandle(ref, () => ({
+    focus: () => editorRef.current?.chain().focus().run() || hostRef.current?.focus(),
+    format: command => { const editor = editorRef.current; if (editor && typeof editor.chain?.()[command] === "function") editor.chain().focus()[command]().run(); },
+    insertText: text => { const editor = editorRef.current; if (editor) editor.chain().focus().insertContent(String(text || "")).run(); else onChange?.(`${String(value || "")}${String(text || "")}`, ""); },
+    clear: () => { editorRef.current?.commands.clearContent(); onChange?.("", ""); },
+  }));
+  if (failed) return h(LegacyPlainComposer, { ref, value, onChange, onKeyDown, onFiles, placeholder });
+  const actions = [["粗体", "toggleBold", "bold"], ["斜体", "toggleItalic", "italic"], ["下划线", "toggleUnderline", "underline"], ["删除线", "toggleStrike", "strike"], ["代码", "toggleCode", "code"], ["引用", "toggleBlockquote", "blockquote"], ["代码块", "toggleCodeBlock", "codeBlock"]];
+  const actionIcons = { bold: "bold", italic: "italic", underline: "underline", strike: "strike", code: "code", blockquote: "quoteMark", codeBlock: "codeBlock" };
+  const runFormat = (command) => { const editor = editorRef.current; if (!editor) return; const chain = editor.chain().focus(); if (typeof chain[command] !== "function") return; chain[command]().run(); setEditorVersion(version => version + 1); };
+  return h("div", { className: "halo-composer-shell", onClick: () => editorRef.current?.chain().focus().run() },
+    h("div", { ref: hostRef, className: "halo-editor-surface", onKeyDown, onPaste: event => { const files = clipboardFiles(event.clipboardData); if (files.length) { event.preventDefault(); event.stopPropagation(); onFiles?.(files); } } }),
+    h("div", { className: "halo-editor-toolbar" },
+      h("div", { className: "halo-editor-format-actions" }, actions.map(([title, command, mark], index) => {
+        const button = h("button", { type: "button", className: editorRef.current?.isActive?.(mark) ? "is-active" : "", title, "aria-label": title, onMouseDown: event => event.preventDefault(), onClick: () => runFormat(command) }, h(Icon, { name: actionIcons[mark], size: 18 }));
+        return h(React.Fragment, { key: command }, index === 5 ? h("span", { className: "toolbar-divider", "aria-hidden": "true" }) : null, button);
+      })),
+      toolbarExtra && h("div", { className: "halo-editor-extra-actions" }, toolbarExtra)
+    )
+  );
+});
+
+function normalizeHomeserverInput(value) {
+  const raw = String(value || "").trim();
+  if (!raw) throw new Error("请输入 Homeserver 或域名");
+  const candidate = /^[a-z][a-z\d+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`;
+  let url;
+  try {
+    url = new URL(candidate);
+  } catch {
+    throw new Error("请输入有效的 Matrix 域名");
+  }
+  if (!["http:", "https:"].includes(url.protocol) || !url.hostname || url.username || url.password || url.search || url.hash) {
+    throw new Error("请输入有效的 Matrix 域名");
+  }
+  return `${url.origin}${url.pathname}`.replace(/\/+$/, "");
+}
+
+async function fetchWithTimeout(input, init = {}, timeoutMs = 6000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("请求超时");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function promiseWithTimeout(promise, timeoutMs = 15000) {
+  let timer;
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Matrix 登录请求超时，请检查服务器或网络")), timeoutMs); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+const MATRIX_SESSION_STORAGE_KEY = "orbit.matrix.session";
+
+function readMatrixSession() {
+  try {
+    const raw = localStorage.getItem(MATRIX_SESSION_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveMatrixSession(session) {
+  if (!session?.homeserver || !session?.userId || !session?.accessToken || !session?.deviceId) return;
+  localStorage.setItem(MATRIX_SESSION_STORAGE_KEY, JSON.stringify({
+    homeserver: session.homeserver,
+    userId: session.userId,
+    accessToken: session.accessToken,
+    deviceId: session.deviceId,
+    ...(session.refreshToken ? { refreshToken: session.refreshToken } : {}),
+    ...(session.accessTokenExpiresAt ? { accessTokenExpiresAt: session.accessTokenExpiresAt } : {}),
+  }));
+}
+
+function matrixSessionFromLogin(homeserver, result) {
+  return {
+    homeserver,
+    userId: result.user_id,
+    accessToken: result.access_token,
+    deviceId: result.device_id,
+    ...(result.refresh_token ? { refreshToken: result.refresh_token } : {}),
+    ...(result.expires_in_ms ? { accessTokenExpiresAt: Date.now() + result.expires_in_ms } : {}),
+  };
+}
+
+async function refreshMatrixSession(baseUrl, session) {
+  if (!session?.refreshToken) throw new Error("当前会话没有 refresh token，无法续期");
+  const response = await fetchWithTimeout(`${baseUrl}/_matrix/client/v3/refresh`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refresh_token: session.refreshToken }),
+  }, 15000);
+  const refreshed = await response.json().catch(() => null);
+  if (!response.ok || !refreshed?.access_token) {
+    throw new Error(refreshed?.error || `Matrix 令牌刷新失败（HTTP ${response.status}）`);
+  }
+  session.accessToken = refreshed.access_token;
+  session.refreshToken = refreshed.refresh_token || session.refreshToken;
+  if (refreshed.expires_in_ms) session.accessTokenExpiresAt = Date.now() + refreshed.expires_in_ms;
+  return session;
+}
+
+function createAuthenticatedMatrixClient(baseUrl, session) {
+  let client;
+  let refreshPromise = null;
+  const options = {
+    baseUrl,
+    userId: session.userId,
+    accessToken: session.accessToken,
+    deviceId: session.deviceId,
+    cryptoCallbacks: orbitCryptoCallbacks,
+    fallbackICEServerAllowed: true,
+  };
+  if (session.refreshToken) {
+    options.refreshToken = session.refreshToken;
+    options.tokenRefreshFunction = async currentRefreshToken => {
+      // The SDK can receive several 401s at once (sync, history, media). A
+      // refresh token may rotate on every successful request, so concurrent
+      // refresh calls would invalidate each other. Serialize them and persist
+      // the newest token before releasing the lock.
+      if (!refreshPromise) {
+        refreshPromise = (async () => {
+          const previousRefreshToken = session.refreshToken;
+          session.refreshToken = currentRefreshToken || previousRefreshToken;
+          await refreshMatrixSession(baseUrl, session);
+          const stored = readMatrixSession();
+          if (stored?.userId === session.userId && stored?.deviceId === session.deviceId) saveMatrixSession({ ...stored, ...session });
+          return {
+            accessToken: session.accessToken,
+            refreshToken: session.refreshToken,
+            ...(session.accessTokenExpiresAt ? { expiry: new Date(session.accessTokenExpiresAt) } : {}),
+          };
+        })().finally(() => { refreshPromise = null; });
+      }
+      return refreshPromise;
+    };
+  }
+  client = MatrixSDK.createClient(options);
+  // Keep the session available to targeted history/media retries without
+  // exposing credentials in the DOM.
+  client.__orbitSession = session;
+  client.__orbitBaseUrl = baseUrl;
+  client.__orbitRefresh = options.tokenRefreshFunction || null;
+  return client;
+}
+
+async function ensureMatrixAccessToken(client) {
+  const session = client?.__orbitSession;
+  const expiresAt = Number(session?.accessTokenExpiresAt || 0);
+  if (!session?.refreshToken || !expiresAt || expiresAt - Date.now() > 60_000) return true;
+  const refresh = client?.getRefreshToken?.() || session.refreshToken;
+  try {
+    const result = await client.__orbitRefresh?.(refresh);
+    if (result?.accessToken) return true;
+  } catch (error) {
+    // Let the caller present a focused authentication error; crypto state is
+    // independent and should not be reset when only the access token expired.
+    throw error;
+  }
+  return false;
+}
+
+async function getMatrixLoginFlows(baseUrl) {
+  const response = await fetchWithTimeout(`${baseUrl}/_matrix/client/v3/login`, {}, 5000);
+  const body = await response.json().catch(() => null);
+  if (!response.ok || !Array.isArray(body?.flows)) throw new Error("无法读取 Matrix 登录方式");
+  return body.flows.map(flow => flow?.type).filter(Boolean);
+}
+
+async function loginWithMatrixToken(homeserver, token) {
+  const resolved = await resolveHomeserver(homeserver);
+  const loginClient = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, cryptoCallbacks: orbitCryptoCallbacks });
+  const result = await promiseWithTimeout(loginClient.login("m.login.token", { token, refresh_token: true }));
+  const session = matrixSessionFromLogin(resolved.homeserver, result);
+  const client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, session);
+  await initCryptoSafely(client);
+  return { resolved, result, session, client };
+}
+
+async function resolveHomeserver(input, { detect = true } = {}) {
+  let homeserver = normalizeHomeserverInput(input);
+  const localProxy = ["localhost", "127.0.0.1"].includes(window.location.hostname)
+    ? `${window.location.origin}/__matrix_proxy/${encodeURIComponent(homeserver)}`
+    : homeserver;
+  try {
+    const discovery = await fetchWithTimeout(`${localProxy}/.well-known/matrix/client`, {}, 2500);
+    if (discovery.ok) {
+      const config = await discovery.json();
+      const discovered = config?.["m.homeserver"]?.base_url;
+      if (discovered) homeserver = normalizeHomeserverInput(discovered);
+    }
+  } catch {}
+  let clientBaseUrl = homeserver;
+  if (!detect) {
+    const local = ["localhost", "127.0.0.1"].includes(window.location.hostname);
+    if (local) clientBaseUrl = `${window.location.origin}/__matrix_proxy/${encodeURIComponent(homeserver)}`;
+    return { homeserver, clientBaseUrl, slidingSync: false, detectionPending: true };
+  }
+  let versions = null;
+  try {
+    const probe = await fetchWithTimeout(`${homeserver}/_matrix/client/versions`);
+    versions = await probe.json();
+    if (!probe.ok || !Array.isArray(versions?.versions)) throw new Error("Matrix API invalid");
+  } catch (error) {
+    const local = ["localhost", "127.0.0.1"].includes(window.location.hostname);
+    if (!local) throw new Error(`无法连接 Matrix homeserver：${error?.message || "网络错误"}`);
+    clientBaseUrl = `${window.location.origin}/__matrix_proxy/${encodeURIComponent(homeserver)}`;
+    const probe = await fetchWithTimeout(`${clientBaseUrl}/_matrix/client/versions`);
+    versions = await probe.json().catch(() => null);
+    if (!probe.ok || !Array.isArray(versions?.versions)) throw new Error("Invalid Matrix homeserver");
+  }
+  const unstable = versions?.unstable_features || {};
+  const slidingSync = unstable["org.matrix.simplified_msc3575"] === true || unstable["org.matrix.msc3575"] === true;
+  return { homeserver, clientBaseUrl, slidingSync };
+}
+
+// Use MSC3575 when the homeserver advertises it; otherwise retain /sync.
+async function startOrbitSync(client, { clientBaseUrl, slidingSync = false } = {}) {
+  const startRtc = () => { try { client.matrixRTC?.start?.(); } catch {} };
+  const fallback = () => {
+    const result = client.startClient({ initialSyncLimit: 30 });
+    startRtc();
+    return result;
+  };
+  if (!slidingSync || typeof SlidingSync !== "function") return fallback();
+  try {
+    const lists = new Map([
+      ["all", { ranges: [[0, 500]], sort: ["by_recency"], filters: { is_invite: false }, required_state: [["m.room.create", ""], ["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["org.matrix.msc3401.call.member", "*"], ["m.call.member", "*"], ["m.rtc.member", "*"], ["m.room.topic", ""], ["m.space.child", "*"], ["m.space.parent", "*"]], timeline_limit: 30 }],
+      ["invites", { ranges: [[0, 20]], sort: ["by_recency"], filters: { is_invite: true }, required_state: [["m.room.create", ""], ["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["org.matrix.msc3401.call.member", "*"], ["m.call.member", "*"], ["m.rtc.member", "*"], ["m.room.topic", ""], ["m.space.child", "*"], ["m.space.parent", "*"]], timeline_limit: 30 }]
+    ]);
+    const roomSubscriptionInfo = { required_state: [["m.room.create", ""], ["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["org.matrix.msc3401.call.member", "*"], ["m.call.member", "*"], ["m.rtc.member", "*"], ["m.room.topic", ""], ["m.space.child", "*"], ["m.space.parent", "*"]], timeline_limit: 30 };
+    const slidingClient = new SlidingSync(clientBaseUrl, lists, roomSubscriptionInfo, client, 30000);
+    client.startClient({ initialSyncLimit: 30, slidingSync: slidingClient });
+    client.__orbitSlidingSync = slidingClient;
+    startRtc();
+  } catch (error) {
+    console.warn("Unable to start Sliding Sync; using regular sync", error);
+    fallback();
+  }
+}
+
+async function initCryptoSafely(client) {
+  if (typeof client?.initRustCrypto !== "function") return false;
+  const identity = `${client.getUserId?.() || "anonymous"}:${client.getDeviceId?.() || "unknown"}`;
+  let storageKey;
+  try { storageKey = new Uint8Array(await window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity))); } catch {}
+  const init = () => Promise.race([
+    client.initRustCrypto({ useIndexedDB: true, ...(storageKey ? { storageKey } : {}) }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("加密模块初始化超时")), 20000)),
+  ]);
+  try {
+    await init();
+    return true;
+  } catch (error) {
+    const mismatch = /account in the store doesn't match|doesn't match the account|unknown deviceId|failed to be decrypted while unpickling|unpickling|store.*decrypt|decrypt.*store/i.test(error?.message || "");
+    if (mismatch && typeof client.clearStores === "function") {
+      try { await client.clearStores(); await init(); return true; } catch (retryError) { console.warn("清理旧设备加密存储后仍无法初始化", retryError); }
+    }
+    console.warn("E2EE 初始化未完成，将先连接并显示加密占位消息", error);
+    return false;
+  }
+}
+
+const orbitCryptoCallbacks = {
+  getSecretStorageKey: async ({ keys }) => {
+    const recoveryKey = window.orbitRecoveryKeyBytes;
+    if (!recoveryKey) return null;
+    const keyId = Object.keys(keys || {})[0];
+    return keyId ? [keyId, recoveryKey] : null;
+  },
+};
+
+function localVerificationKey(client) {
+  const userId = client?.getUserId?.() || "anonymous";
+  const deviceId = client?.getDeviceId?.() || "unknown";
+  return `orbit.matrix.device-verified:${userId}:${deviceId}`;
+}
+
+function roomToView(room, client) {
+  const last = room.getLastLiveEvent?.();
+  const name = room.name || room.getCanonicalAlias?.() || room.roomId;
+  const lastContent = last?.getClearContent?.() || last?.getContent?.() || {};
+  const isEncrypted = last?.getType?.() === "m.room.encrypted";
+  const joinedMembers = room.getJoinedMembers?.() || [];
+  const myUserId = client?.getUserId?.();
+  const otherMember = joinedMembers.find(member => member.userId !== myUserId);
+  const directMap = client?.getAccountData?.("m.direct")?.getContent?.() || {};
+  const directRoom = Object.values(directMap).some(ids => Array.isArray(ids) && ids.includes(room.roomId));
+  // Only mark a room as a DM when Matrix explicitly identifies it as direct
+  // (or it is present in m.direct). Small group rooms must remain groups.
+  const directUserId = directRoom ? otherMember?.userId : (room.isDirect?.() ? otherMember?.userId : null);
+  const directMember = directUserId && room.getMember?.(directUserId);
+  const unread = Number(room.getUnreadNotificationCount?.("total") || 0);
+  return {
+    id: room.roomId,
+    name,
+    initials: initials(name),
+    color: colorFor(room.roomId),
+    preview: lastContent?.body || (isEncrypted ? "🔒 加密消息" : "暂无消息"),
+    time: last?.getTs?.() ? new Date(last.getTs()).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" }) : "",
+    lastTs: last?.getTs?.() || 0,
+    unread,
+    hasUnread: unread > 0,
+    members: room.getJoinedMemberCount?.() || room.getJoinedMembers?.().length || 0,
+    desc: room.getCanonicalAlias?.() || room.roomId,
+    avatarUrl: room.getAvatarUrl?.(client?.getHomeserverUrl?.() || "", 64, 64, "crop", false, true, true) || null,
+    avatarMxc: roomAvatarMxc(room) || (joinedMembers.length <= 2 ? memberAvatarMxc(directMember) : null),
+    directUserId: joinedMembers.length <= 2 ? directUserId : null,
+    pinnedEventIds: (() => { const event = room.currentState?.getStateEvents?.("m.room.pinned_events", ""); const content = Array.isArray(event) ? event[0]?.getContent?.() : event?.getContent?.(); return Array.isArray(content?.pinned) ? content.pinned : []; })(),
+    isDirect: Boolean(directUserId),
+    isGroup: !isMatrixSpace(room) && !directUserId,
+    isSpace: isMatrixSpace(room),
+    matrixRoom: room,
+    hidden: Boolean(window.orbitExcludedRooms?.has(room.roomId)),
+  };
+}
+
+function spaceChildIds(space) {
+  if (!space) return [];
+  if (typeof space.getSpaceChildren === "function") {
+    try {
+      const children = space.getSpaceChildren();
+      if (children && (Array.isArray(children) || typeof children[Symbol.iterator] === "function")) return [...children].map(child => child?.roomId || child?.room_id || child?.id || child).filter(Boolean);
+    } catch {}
+  }
+  const state = space.currentState;
+  let events = [];
+  try { events = state?.getStateEvents?.("m.space.child") || []; } catch {}
+  if (!Array.isArray(events)) events = [events];
+  return events.filter(Boolean).filter(event => {
+    const content = event.getContent?.() || event.content || {};
+    return content.via || content.order || content.suggest || event.getStateKey?.();
+  }).map(event => event.getStateKey?.() || event.stateKey || event.getStateKey).filter(Boolean);
+}
+
+function roomParentSpaceIds(room) {
+  const state = room?.currentState;
+  let events = [];
+  try { events = state?.getStateEvents?.("m.space.parent") || []; } catch {}
+  if (!Array.isArray(events)) events = [events];
+  return events.filter(Boolean).map(event => event.getStateKey?.() || event.stateKey).filter(Boolean);
+}
+
+function formatMentions(text, room) {
+  if (!text || !room) return text || "";
+  return String(text).replace(/@[A-Za-z0-9._=\-/+]+:[A-Za-z0-9.-]+/g, token => room.getMember?.(token)?.name || token);
+}
+
+function stripReplyFallback(text) {
+  return String(text || "").replace(/^\s*(?:in reply to[^\n]*(?:\n|$))?/i, "").replace(/^(?:>[^\n]*(?:\n|$))+\s*/, "").trim();
+}
+
+function stripReplyHtml(html) {
+  return String(html || "").replace(/<mx-reply[\s\S]*?<\/mx-reply>/gi, "").replace(/^\s*(?:in reply to[^<]*(?:<br\s*\/?>|$))/i, "").trim();
+}
+
+function sanitizeFormattedBody(html) {
+  // Keep the Matrix custom HTML subset so formatting survives in Element,
+  // Cinny and other clients. Convert editor-only block wrappers to breaks,
+  // then strip everything outside the interoperable tag set.
+  return String(html || "")
+    // Older editor builds leaked a standalone K歌 shortcode next to the real
+    // image node. It was never user-authored and must not re-enter editing.
+    .replace(/:K歌:/gi, "")
+    .replace(/<br\b[^>]*class\s*=\s*(["'])[^"']*ProseMirror-trailingBreak[^"']*\1[^>]*>/gi, "")
+    .replace(/<span\b[^>]*style\s*=\s*(["'])[^"']*\b(color|font-size)\s*:\s*([^;"']+)[^"']*\1[^>]*>/gi, (_match, quote, property, value) => `<span style="${property.toLowerCase()}:${String(value).trim()}">`)
+    .replace(/<span\b(?![^>]*style\s*=)[^>]*>/gi, "<span>")
+    // Block wrappers from Tiptap and other Matrix clients become exactly one
+    // line break. Remove source indentation around the generated break so a
+    // harmless newline between HTML tags cannot turn into a blank chat line.
+    .replace(/<br\s*\/?>\s*<\s*\/\s*(p|div|tr)\s*>/gi, "</$1>")
+    .replace(/<\s*\/\s*(p|div|tr)\s*>\s*<\s*(p|div|tr)(?:\s[^>]*)?>/gi, "<br>")
+    .replace(/<\s*\/\s*(p|div|tr)\s*>/gi, "")
+    .replace(/<\s*(p|div|tr)(?:\s[^>]*)?>/gi, "")
+    .replace(/javascript:/gi, "")
+    .replace(/\son\w+\s*=\s*(['"]).*?\1/gi, "")
+    .replace(/<(?!\/?(?:strong|b|em|i|u|del|s|code|pre|blockquote|ul|ol|li|h[1-3]|span|img|br|a|font|small|big)\b)[^>]*>/gi, "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/\s*<br\s*\/?>\s*/gi, "<br>")
+    .replace(/(?:<br>\s*)+$/i, "")
+    .trim();
+}
+
+function hasMarkdownSyntax(text) {
+  const value = String(text || "");
+  return /(^|\n)\s{0,3}(?:#{1,3}\s|>\s|[-*+]\s|\d+\.\s|```)/.test(value)
+    || /(?:\*\*[^*]+\*\*|__[^_]+__|~~[^~]+~~|`[^`\n]+`|\[[^\]]+\]\(https?:\/\/[^)]+\))/.test(value);
+}
+
+function markdownInline(value) {
+  let html = escapeEditorText(String(value || ""));
+  html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2">$1</a>');
+  html = html.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  html = html.replace(/\*\*([^*\n]+)\*\*|__([^_\n]+)__/g, (_m, strongA, strongB) => `<strong>${strongA || strongB}</strong>`);
+  html = html.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+  html = html.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, (_m, prefix, content) => `${prefix}<em>${content}</em>`);
+  return html;
+}
+
+function markdownToHtml(text) {
+  const source = String(text || "").replace(/\r\n?/g, "\n");
+  if (!hasMarkdownSyntax(source)) return "";
+  const lines = source.split("\n");
+  const output = []; let inFence = false; let fenceLines = [];
+  const closeFence = () => { if (!inFence) return; output.push(`<pre><code>${escapeEditorText(fenceLines.join("\n"))}</code></pre>`); inFence = false; fenceLines = []; };
+  for (const line of lines) {
+    if (/^\s*```/.test(line)) { if (inFence) closeFence(); else inFence = true; continue; }
+    if (inFence) { fenceLines.push(line); continue; }
+    if (!line.trim()) { output.push("<br>"); continue; }
+    const heading = line.match(/^\s{0,3}(#{1,3})\s+(.+)$/);
+    if (heading) { output.push(`<h${heading[1].length}>${markdownInline(heading[2])}</h${heading[1].length}>`); continue; }
+    const quote = line.match(/^\s{0,3}>\s?(.*)$/);
+    if (quote) { output.push(`<blockquote>${markdownInline(quote[1])}</blockquote>`); continue; }
+    const bullet = line.match(/^\s{0,3}[-*+]\s+(.+)$/);
+    if (bullet) { output.push(`<ul><li>${markdownInline(bullet[1])}</li></ul>`); continue; }
+    const ordered = line.match(/^\s{0,3}\d+\.\s+(.+)$/);
+    if (ordered) { output.push(`<ol><li>${markdownInline(ordered[1])}</li></ol>`); continue; }
+    output.push(markdownInline(line));
+    output.push("<br>");
+  }
+  closeFence();
+  return sanitizeFormattedBody(output.join("").replace(/(?:<br>)+$/i, ""));
+}
+
+function mentionHtml(text, mentions = []) {
+  let html = String(text || "").replace(/[&<>\"]/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[char])).replace(/\n/g, "<br>");
+  for (const mention of mentions || []) {
+    const name = String(mention?.name || "").replace(/^@/, "").trim();
+    const userId = String(mention?.userId || "").trim();
+    if (!name || !userId) continue;
+    const safeName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const matrixTarget = encodeURIComponent(userId).replace(/%40/gi, "@").replace(/%3A/gi, ":");
+    html = html.replace(new RegExp(`@${safeName}(?=\\s|$)`, "g"), `<a href="https://matrix.to/#/${matrixTarget}">@${name}</a>`);
+  }
+  return html;
+}
+
+function eventToMessage(event, room, userId) {
+  const eventType = event.getClearType?.() || event.getType?.();
+  const encrypted = event.getType?.() === "m.room.encrypted" || event.isEncrypted?.();
+  const content = event.getClearContent?.() || event.getContent?.() || {};
+  const stickerEvent = eventType === "m.sticker";
+  if (eventType !== "m.room.message" && !stickerEvent && !encrypted) return null;
+  if (encrypted && eventType === "m.room.encrypted") {
+    const sender = event.getSender?.() || "";
+    const member = room.getMember?.(sender);
+    const displayName = member?.name || sender;
+    const failed = event.isDecryptionFailure?.() || !event.getClearContent?.();
+    return {
+      id: event.getId?.() || `${sender}-${event.getTs?.()}`, event, encrypted: true,
+      decryptFailed: failed, needsKeyBackup: failed,
+      decryptReason: event.decryptionFailureReason?.() || "缺少会话密钥",
+      author: sender === userId ? "你" : displayName, handle: sender,
+      avatar: initials(displayName), avatarMxc: memberAvatarMxc(member), color: colorFor(sender),
+      time: event.getTs?.() ? new Date(event.getTs()).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) : "",
+      text: failed ? "此消息已加密，正在等待解密" : (content.body || ""), isMe: sender === userId,
+    };
+  }
+  const msgtype = stickerEvent ? "m.sticker" : content.msgtype;
+  if (!["m.text", "m.notice", "m.emote", "m.image", "m.file", "m.video", "m.audio", "m.sticker"].includes(msgtype)) return null;
+  const sender = event.getSender?.() || "";
+  const member = room.getMember?.(sender);
+  const displayName = member?.name || sender;
+  const avatarMxc = memberAvatarMxc(member);
+  const reply = content["m.relates_to"]?.["m.in_reply_to"]?.event_id;
+  const threadRoot = content["m.relates_to"]?.rel_type === "m.thread" ? content["m.relates_to"]?.event_id : null;
+  const replacement = content["m.relates_to"]?.rel_type === "m.replace";
+  const body = replacement ? (content["m.new_content"]?.body || content.body || "") : (content.body || "");
+  const cleanBody = reply ? stripReplyFallback(body) : body;
+  const emojiNames = [...String(cleanBody || "").matchAll(/:([^:\s]+):/g)].map(match => match[1]);
+  const emojiFiles = content["org.orbit.emoji_files"] || (content.file && emojiNames.length ? Object.fromEntries(emojiNames.map(name => [name, content.file])) : null);
+  if (emojiFiles && typeof emojiFiles === "object") window.orbitEncryptedEmojiFiles = { ...(window.orbitEncryptedEmojiFiles || {}), ...emojiFiles };
+  const wireFormatted = content.format === "org.matrix.custom.html" && content.formatted_body ? sanitizeFormattedBody(reply ? stripReplyHtml(content.formatted_body) : content.formatted_body) : "";
+  // Matrix has no native Markdown field. For plain messages that contain
+  // common Markdown markers, render a safe local preview while keeping body
+  // as the interoperable source of truth for clients that ignore HTML.
+  const formatted = wireFormatted || (!content.formatted_body && hasMarkdownSyntax(cleanBody) ? markdownToHtml(cleanBody) : null);
+  // A few clients send a formatted body without any block markers while the
+  // plain Matrix body still contains the authoritative line breaks.  Prefer
+  // that plain body in this case so copied multi-line messages stay readable.
+  const formattedHasBreaks = /<br\b/i.test(String(formatted || content.formatted_body || "")) || /<\/(?:p|div|li|h[1-6]|blockquote|pre)>/i.test(String(formatted || content.formatted_body || ""));
+  const editorText = editorTextFromFormattedBody(formatted);
+  const emojiRefs = emojiRefsFromFormattedBody(formatted);
+  const updatedMeta = content["org.orbit.updated"] || null;
+  const updatedMember = updatedMeta?.user_id ? room.getMember?.(updatedMeta.user_id) : null;
+  return {
+    id: event.getId?.() || `${sender}-${event.getTs?.()}`, roomId: room.roomId,
+    event,
+    author: sender === userId ? "你" : displayName,
+    handle: sender,
+    avatar: initials(displayName),
+    avatarMxc,
+    color: colorFor(sender),
+    time: event.getTs?.() ? new Date(event.getTs()).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) : "",
+    text: formatMentions(cleanBody, room),
+    editorText,
+    emojiRefs,
+    formattedBody: formatted && (!String(cleanBody || "").includes("\n") || formattedHasBreaks) ? formatted : null,
+    emojiFiles: content["org.orbit.emoji_files"] || null,
+    emojiItems: Array.isArray(content["org.orbit.emoji_items"]) ? content["org.orbit.emoji_items"] : null,
+    updatedBy: updatedMember?.name || updatedMeta?.user_id || null,
+    updatedAt: Number(updatedMeta?.ts) || 0,
+    isMe: sender === userId,
+    replyTo: reply,
+    threadRoot,
+    edited: replacement,
+    attachment: ["m.image", "m.file", "m.video", "m.audio", "m.sticker"].includes(msgtype) ? { name: content.body, url: content.url || content.file?.url, file: content.file ? { ...content.file, mimetype: content.info?.mimetype, size: content.info?.size } : null, info: content.info || null, emoji: msgtype === "m.image" && (Array.isArray(content["org.orbit.emoji_items"]) || (content.body === "表情" && Number(content.info?.w || 0) <= 96 && Number(content.info?.h || 0) <= 96)), sticker: msgtype === "m.sticker" || content["org.orbit.sticker"] === true, type: msgtype === "m.sticker" ? "m.image" : msgtype } : null,
+  };
+}
+
+async function retryLoadedRoomDecryption(client) {
+  if (!client?.decryptEventIfNeeded) return 0;
+  const encryptedEvents = [];
+  for (const room of client.getRooms?.() || []) {
+    for (const event of room.getLiveTimeline?.().getEvents?.() || []) {
+      if (event?.getType?.() === "m.room.encrypted" || event?.isEncrypted?.()) encryptedEvents.push(event);
+    }
+  }
+  await Promise.all(encryptedEvents.map(event => Promise.resolve(client.decryptEventIfNeeded(event)).catch(() => {})));
+  return encryptedEvents.length;
+}
+
+async function roomMessages(room, userId, client) {
+  const events = room?.getLiveTimeline?.().getEvents?.() || [];
+  // Ask Rust Crypto to retry every encrypted event whenever a room is rebuilt.
+  // This is important after restoring Secret Storage: the SDK may receive the
+  // event before the backup key finishes loading and otherwise leave a stale
+  // "missing key" placeholder rendered forever.
+  if (client?.decryptEventIfNeeded) {
+    await Promise.all(events.filter(event => event?.getType?.() === "m.room.encrypted" || event?.isEncrypted?.()).map(event => Promise.resolve(client.decryptEventIfNeeded(event)).catch(() => {})));
+  }
+  const redacted = new Set(); const reactions = new Map(); const edits = new Map(); const replacements = new Map(); const updates = new Map(); const byId = new Map();
+  events.forEach(event => {
+    if (event.getType?.() === "m.room.redaction") { const id = event.getRedacts?.() || event.getContent?.()?.redacts; if (id) redacted.add(id); return; }
+    if (event.getType?.() === "m.reaction") { const content = event.getContent?.() || {}; const relation = content["m.relates_to"]; if (relation?.event_id) { const list = reactions.get(relation.event_id) || []; list.push({ id: event.getId?.(), key: relation.key || "👍", sender: event.getSender?.() }); reactions.set(relation.event_id, list); } return; }
+    const clearType = event.getClearType?.() || event.getType?.();
+    if (clearType !== "m.room.message" && clearType !== "m.sticker" && event.getType?.() !== "m.room.encrypted") return;
+    const eventContent = event.getClearContent?.() || event.getContent?.() || {};
+    const relation = eventContent["m.relates_to"];
+    if (relation?.rel_type === "m.replace" && relation.event_id) { const nextContent = eventContent?.["m.new_content"] || eventContent; edits.set(relation.event_id, nextContent?.body || eventContent?.body || ""); replacements.set(relation.event_id, nextContent); const updated = eventContent?.["org.orbit.updated"] || nextContent?.["org.orbit.updated"]; if (updated) updates.set(relation.event_id, updated); return; }
+    const message = eventToMessage(event, room, userId); if (message) byId.set(message.id, message);
+  });
+  const members = room?.getJoinedMembers?.() || [];
+  byId.forEach((message, id) => {
+    if (redacted.has(id)) { byId.delete(id); return; }
+    const replacement = replacements.get(id);
+    if (replacement) {
+      // Replace every rendered field, not only `text`. Otherwise an older
+      // formatted_body can continue to win in the renderer after an edit.
+      const nextBody = replacement.body || edits.get(id) || "";
+      message.text = formatMentions(nextBody, room);
+      message.edited = true;
+      message.formattedBody = replacement.format === "org.matrix.custom.html" && replacement.formatted_body
+        ? sanitizeFormattedBody(replacement.formatted_body)
+        : null;
+      message.editorText = editorTextFromFormattedBody(message.formattedBody);
+      message.emojiRefs = emojiRefsFromFormattedBody(message.formattedBody);
+    }
+    const reactionCounts = {}; const reactionUsers = {};
+    (reactions.get(id) || []).forEach(reaction => {
+      if (!reaction.id || redacted.has(reaction.id)) return;
+      const key = String(reaction.key || "👍");
+      reactionCounts[key] = (reactionCounts[key] || 0) + 1;
+      const sender = String(reaction.sender || "");
+      const member = sender ? room.getMember?.(sender) : null;
+      const name = member?.name || member?.rawDisplayName || sender || "未知用户";
+      const users = reactionUsers[key] || (reactionUsers[key] = []);
+      if (!users.some(entry => entry.userId === sender)) users.push({ userId: sender || name, name });
+    });
+    message.reactions = reactionCounts;
+    message.reactionUsers = reactionUsers;
+    const reply = message.replyTo ? byId.get(message.replyTo) : null;
+    if (reply) { message.replyPreview = reply.text; message.replyAuthor = reply.author; message.replyAvatarMxc = reply.avatarMxc; message.replyIsMe = reply.handle === userId; }
+    const thread = message.threadRoot ? byId.get(message.threadRoot) : null;
+    if (thread) { message.threadPreview = thread.text || thread.attachment?.name || "消息"; message.threadAuthor = thread.author; message.threadAvatarMxc = thread.avatarMxc; }
+  });
+  replacements.forEach((replacement, id) => { const message = byId.get(id); if (!message || !replacement) return; if (message.attachment && ["m.image", "m.file", "m.video", "m.audio"].includes(replacement.msgtype)) { message.attachment = { ...message.attachment, name: replacement.body || message.attachment.name, url: replacement.url || replacement.file?.url || message.attachment.url, file: replacement.file || message.attachment.file, info: replacement.info || message.attachment.info, type: replacement.msgtype }; } });
+  updates.forEach((updated, id) => { const message = byId.get(id); if (!message) return; message.updatedAt = Number(updated.ts) || 0; const member = room.getMember?.(updated.user_id); message.updatedBy = member?.name || updated.user_id || null; });
+  // A receipt is a moving marker, not a badge that belongs on every message.
+  // Find the latest event read by each member, then render that member only
+  // beneath the corresponding message (as mature Matrix clients do).
+  if (room?.hasUserReadEvent) {
+    const ordered = [...byId.values()];
+    const latestByUser = new Map();
+    members.filter(member => member.userId !== userId).forEach(member => {
+      const receiptTarget = room.getEventReadUpTo?.(member.userId, true);
+      const receiptIndex = receiptTarget ? ordered.findIndex(candidate => candidate.id === receiptTarget) : -1;
+      const startIndex = receiptIndex >= 0 ? receiptIndex : ordered.length - 1;
+      for (let index = startIndex; index >= 0; index -= 1) {
+        const candidate = ordered[index];
+        if (receiptIndex >= 0 || room.hasUserReadEvent(member.userId, candidate.id)) {
+          latestByUser.set(member.userId, candidate.id);
+          break;
+        }
+      }
+    });
+    latestByUser.forEach((messageId, memberId) => {
+      const message = byId.get(messageId);
+      const member = members.find(item => item.userId === memberId);
+      if (!message || !member) return;
+      const receipt = room.getLastUnthreadedReceiptFor?.(memberId);
+      const wrappedReceipt = room.getReadReceiptForUserId?.(memberId, true);
+      const entry = { userId: memberId, name: member.name || memberId, ts: receipt?.ts || wrappedReceipt?.data?.ts || null };
+      message.readBy = [...(message.readBy || []), entry].sort((a, b) => (Number(b.ts) || 0) - (Number(a.ts) || 0));
+    });
+  }
+  // Keep a generous window so “加载更早的消息” can prepend a page while
+  // still avoiding an unbounded DOM for very large rooms.
+   const result = [...byId.values()].slice(-1000);
+  return result.length ? result : [{ type: "empty", label: "这个房间还没有消息，发一条问候吧" }];
+}
+
+function LoginDialog({ onConnected, onClose }) {
+  const [homeserver, setHomeserver] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [loginFlows, setLoginFlows] = useState([]);
+  const [checkingFlows, setCheckingFlows] = useState(false);
+  const checkLoginFlows = async () => {
+    if (!homeserver.trim()) return;
+    setCheckingFlows(true);
+    try {
+      const resolved = await resolveHomeserver(homeserver, { detect: false });
+      setLoginFlows(await getMatrixLoginFlows(resolved.clientBaseUrl));
+    } catch { setLoginFlows([]); }
+    finally { setCheckingFlows(false); }
+  };
+  const startSsoLogin = async () => {
+    setLoading(true);
+    try {
+      const resolved = await resolveHomeserver(homeserver, { detect: false });
+      const flows = await getMatrixLoginFlows(resolved.clientBaseUrl);
+      if (!flows.includes("m.login.sso")) throw new Error("当前 homeserver 未启用 SSO 登录");
+      const redirectUrl = `${window.location.origin}${window.location.pathname}?matrix_sso=1`;
+      localStorage.setItem("orbit.matrix.sso.pending", JSON.stringify({ homeserver: resolved.homeserver }));
+      window.location.assign(`${resolved.clientBaseUrl}/_matrix/client/v3/login/sso/redirect?redirectUrl=${encodeURIComponent(redirectUrl)}`);
+    } catch (error) { setLoading(false); Toast.error(`SSO 登录失败：${error?.message || "无法启动单点登录"}`); }
+  };
+  const submit = async e => {
+    e.preventDefault(); setLoading(true);
+    try {
+      const input = normalizeHomeserverInput(homeserver);
+      const resolved = await resolveHomeserver(input, { detect: false });
+      let detectedResolved = null;
+      const detectionPromise = resolveHomeserver(input).then(value => { detectedResolved = value; return value; }).catch(() => null);
+      const loginClient = MatrixSDK.createClient({ baseUrl: resolved.clientBaseUrl, cryptoCallbacks: orbitCryptoCallbacks });
+      const result = await promiseWithTimeout(loginClient.login("m.login.password", { identifier: { type: "m.id.user", user: username.trim() }, password, refresh_token: true }));
+      const session = matrixSessionFromLogin(resolved.homeserver, result);
+      const client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, session);
+      await initCryptoSafely(client);
+      saveMatrixSession(session);
+      window.orbitMatrixClient = client;
+      const syncResolved = detectedResolved || resolved;
+      onConnected({ client, userId: result.user_id, homeserver: syncResolved.homeserver });
+      startOrbitSync(client, syncResolved);
+      detectionPromise.then(detected => {
+        if (detected?.slidingSync && !syncResolved.slidingSync) Toast.info("已检测到 Sliding Sync，下次登录时启用");
+      });
+      Toast.success("登录成功，正在同步房间");
+    } catch (error) { Toast.error(`登录失败：${error?.message || "请检查地址、账号和密码"}`); }
+    finally { setLoading(false); }
+  };
+  return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card" },
+    h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "连接 Matrix 账户"), h("div", { className: "modal-copy" }, "支持直接填写域名，Orbit 会自动补全 HTTPS；服务能力在后台检测，不影响登录。")), h(UiButton, { className: "icon-button", type: "text", "aria-label": "关闭", onClick: onClose }, "×")),
+    h("form", { className: "modal-form", onSubmit: submit },
+      h("label", { className: "form-label" }, "Homeserver 或域名", h(Input, { value: homeserver, onChange: setHomeserver, onBlur: checkLoginFlows, required: true, placeholder: "mtx01.cc、matrix.example.com 或 https://matrix.example.com" })),
+      h("label", { className: "form-label" }, "用户名", h(Input, { value: username, onChange: setUsername, required: true, placeholder: "alice 或 @alice:example.com" })),
+      h("label", { className: "form-label" }, "密码", h(AntInput.Password, { value: password, onChange: event => setPassword(event.target.value), required: true, placeholder: "请输入 Matrix 密码", visibilityToggle: true })),
+      h("div", { className: "modal-actions" }, h(UiButton, { htmlType: "button", className: "ghost-btn", onClick: onClose }, "取消"), loginFlows.includes("m.login.sso") && h(UiButton, { htmlType: "button", className: "ghost-btn", disabled: loading || checkingFlows, onClick: startSsoLogin }, "使用 SSO 登录"), h(UiButton, { htmlType: "submit", variant: "primary", className: "primary-btn", disabled: loading }, loading ? "登录中…" : "登录并同步"))
+    )
+  ));
+}
+
+function UserPicker({ client, value, onChange, placeholder }) {
+  const [options, setOptions] = useState([]); const [focused, setFocused] = useState(false); const timer = useRef(null);
+  const search = next => { onChange(next); clearTimeout(timer.current); if (!next.trim()) { setOptions([]); return; } timer.current = setTimeout(async () => { try { const result = await client.searchUserDirectory?.({ term: next.trim(), limit: 20 }); setOptions(result?.results || []); } catch { setOptions([]); } }, 220); };
+  useEffect(() => () => clearTimeout(timer.current), []);
+  const select = user => { onChange(user.user_id); setOptions([]); setFocused(false); };
+  return h("div", { className: "user-picker" },
+    h(Input, { value, onChange: search, onFocus: () => setFocused(true), showClear: true, placeholder }),
+    focused && options.length > 0 && h("div", { className: "user-picker-menu" }, options.map(user =>
+      h("button", { type: "button", className: "user-option", key: user.user_id, onMouseDown: e => e.preventDefault(), onClick: () => select(user) },
+        h(MatrixAvatar, { client, mxcUrl: user.avatar_url, size: 32, className: "user-option-avatar", fallback: initials(user.display_name || user.user_id), alt: user.display_name || user.user_id }),
+        h("span", { className: "user-option-copy" }, h("strong", null, user.display_name || user.user_id), h("small", null, user.user_id))
+      )
+    ))
+  );
+}
+
+function RoomDialog({ client, onClose, onCreated, space }) {
+  const [name, setName] = useState(""); const [invite, setInvite] = useState(""); const [encrypted, setEncrypted] = useState(true); const [loading, setLoading] = useState(false);
+  const submit = async e => { e.preventDefault(); setLoading(true); try { const invites = invite.split(/[\s,]+/).map(s => s.trim()).filter(Boolean); const result = await client.createRoom({ name: name.trim(), invite: invites, ...(encrypted ? { initial_state: [{ type: "m.room.encryption", state_key: "", content: { algorithm: "m.megolm.v1.aes-sha2" } }] } : {}) }); if (space?.id) { const via = [new URL(client.getHomeserverUrl?.() || location.origin).host]; await client.sendStateEvent(space.id, "m.space.child", { via, order: String(Date.now()) }, result.room_id); await client.sendStateEvent(result.room_id, "m.space.parent", { via, canonical: true }, space.id); } Toast.success(space?.id ? "房间已创建并加入空间" : "房间创建成功"); onCreated(result.room_id); onClose(); } catch (error) { Toast.error(`创建房间失败：${error?.message || "未知错误"}`); } finally { setLoading(false); } };
+  return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card" }, h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, space?.id ? "在空间中创建房间" : "创建 Matrix 房间"), h("div", { className: "modal-copy" }, space?.id ? `创建后会自动加入「${space.name}」` : "创建后会自动加入房间。输入昵称或 Matrix ID 选择成员。")), h("button", { className: "icon-button", onClick: onClose }, "×")), h("form", { className: "modal-form", onSubmit: submit }, h("label", { className: "form-label" }, "房间名称", h(Input, { value: name, onChange: setName, required: true, placeholder: "例如：产品设计组" })), h("label", { className: "form-label" }, "邀请成员（可选）", h(UserPicker, { client, value: invite, onChange: setInvite, placeholder: "输入昵称或 @user:server" })), h("label", { className: "encryption-choice" }, h(AntCheckbox, { checked: encrypted, onChange: event => setEncrypted(event.target.checked) }), h("span", null, h("strong", null, "启用端到端加密"), h("small", null, "使用 Matrix Megolm；创建后无法关闭"))), h("div", { className: "modal-actions" }, h("button", { type: "button", className: "ghost-btn", onClick: onClose }, "取消"), h("button", { className: "primary-btn", disabled: loading }, loading ? "创建中…" : "创建房间")))));
+}
+
+function InviteDialog({ client, room, onClose }) {
+  const [userId, setUserId] = useState(""); const [loading, setLoading] = useState(false);
+  const submit = async e => { e.preventDefault(); setLoading(true); try { const targetUserId = userId.trim(); const crypto = client.getCrypto?.(); if (room.matrixRoom?.hasEncryptionStateEvent?.() && crypto?.shareRoomHistoryWithUser && targetUserId) { try { await crypto.shareRoomHistoryWithUser(room.id, targetUserId); } catch (error) { console.warn("Unable to share encrypted history", error); } } await client.invite(room.id, targetUserId); Toast.success(room.matrixRoom?.hasEncryptionStateEvent?.() ? "邀请已发送，并共享可用的加密历史" : "邀请已发送"); onClose(); } catch (error) { Toast.error(`邀请失败：${error?.message || "请确认 Matrix ID"}`); } finally { setLoading(false); } };
+  return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card" }, h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "邀请成员"), h("div", { className: "modal-copy" }, `邀请成员加入「${room.name}」`)), h("button", { className: "icon-button", onClick: onClose }, "×")), h("form", { className: "modal-form", onSubmit: submit }, h("label", { className: "form-label" }, "成员", h(UserPicker, { client, value: userId, onChange: setUserId, placeholder: "输入昵称或 @user:server" })), h("div", { className: "modal-actions" }, h("button", { type: "button", className: "ghost-btn", onClick: onClose }, "取消"), h("button", { className: "primary-btn", disabled: loading }, loading ? "邀请中…" : "发送邀请")))));
+}
+
+function LegacyAccountDialog({ client, onClose, onBack, cryptoState, onRestore }) {
+  const [devices, setDevices] = useState([]); const [loading, setLoading] = useState(true); const [displayName, setDisplayName] = useState(() => client.getUser?.(client.getUserId?.())?.displayName || ""); const [profileSaving, setProfileSaving] = useState(false);
+  const [recoveryKey, setRecoveryKey] = useState(""); const [passphrase, setPassphrase] = useState(""); const [verification, setVerification] = useState(null);
+  const [deviceStatuses, setDeviceStatuses] = useState({});
+  const [notificationPermission, setNotificationPermission] = useState(() => typeof Notification === "undefined" ? "unsupported" : Notification.permission);
+  React.useEffect(() => { Promise.resolve(client.getDevices ? client.getDevices() : { devices: [] }).then(async data => { const list = data?.devices || []; setDevices(list); const crypto = client.getCrypto?.(); if (crypto?.getDeviceVerificationStatus) { const statuses = {}; await Promise.all(list.map(async device => { try { statuses[device.device_id] = await crypto.getDeviceVerificationStatus(client.getUserId(), device.device_id); } catch {} })); setDeviceStatuses(statuses); } }).catch(() => {}).finally(() => setLoading(false)); }, [client]);
+  React.useEffect(() => { const crypto = client.getCrypto?.(); const currentUserId = client.getUserId?.(); const existing = crypto?.getVerificationRequestsToDeviceInProgress?.(currentUserId)?.[0]; if (existing) setVerification({ request: existing, deviceId: existing.otherDeviceId, status: existing.initiatedByMe ? "waiting" : "incoming" }); const onRequest = request => { if (request) setVerification({ request, deviceId: request.otherDeviceId, status: request.initiatedByMe ? "waiting" : "incoming" }); }; const eventName = MatrixSDK.CryptoEvent?.VerificationRequestReceived || "crypto.verificationRequestReceived"; client.on?.(eventName, onRequest); crypto?.on?.(eventName, onRequest); return () => { client.off?.(eventName, onRequest); crypto?.off?.(eventName, onRequest); }; }, [client]);
+  const runVerification = async (request, deviceId) => { if (!request) return; setVerification({ request, deviceId, status: request.initiatedByMe ? "waiting" : "incoming" }); let started = false; const start = async () => { if (started || request.phase < 3) return; started = true; try { const verifier = request.verifier || await request.startVerification?.("m.sas.v1"); if (!verifier) throw new Error("当前设备不支持 SAS 验证"); const onSas = sasCallbacks => setVerification(value => ({ ...value, verifier, sas: sasCallbacks, status: "confirm" })); verifier.on?.("show_sas", onSas); verifier.on?.("cancel", error => setVerification(value => ({ ...value, verifier, status: "error", error: error?.message || "验证已取消" }))); setVerification(value => ({ ...value, verifier, status: "verifying" })); const existingSas = verifier.getShowSasCallbacks?.(); if (existingSas) onSas(existingSas); await verifier.verify(); const crypto = client.getCrypto?.(); if (crypto?.crossSignDevice && deviceId && deviceId !== client.getDeviceId?.()) await crypto.crossSignDevice(deviceId); await crypto?.setDeviceVerified?.(client.getUserId?.(), deviceId, true); try { localStorage.setItem(localVerificationKey(client), "1"); } catch {} const nextStatus = await Promise.resolve(crypto?.getDeviceVerificationStatus?.(client.getUserId?.(), deviceId)).catch(() => null); if (nextStatus) setDeviceStatuses(current => ({ ...current, [deviceId]: nextStatus })); setVerification(value => ({ ...value, verifier, status: "done" })); Toast.success("设备验证完成，已发布跨签名信任"); } catch (error) { setVerification(value => ({ ...value, status: "error", error: error?.message || "设备验证失败" })); } }; request.on?.("change", start); if (!request.initiatedByMe) { await request.accept?.(); } await start(); };
+  const verify = async deviceId => { try { const crypto = client.getCrypto?.(); if (!crypto?.requestDeviceVerification) throw new Error("加密模块尚未就绪，请重新登录后再试"); const request = await crypto.requestDeviceVerification(client.getUserId(), deviceId); await runVerification(request, deviceId); Toast.info("验证请求已发送，请在另一台设备上接受"); } catch (error) { Toast.error(`无法发起设备验证：${error?.message || "请检查加密配置"}`); } };
+  const confirmSas = async () => { try { await verification?.sas?.confirm?.(); setVerification(value => ({ ...value, status: "verifying" })); } catch (error) { setVerification(value => ({ ...value, status: "error", error: error?.message || "确认验证失败" })); } };
+  const mismatchSas = () => { try { verification?.sas?.mismatch?.(); } catch {} setVerification(value => ({ ...value, status: "error", error: "安全码不匹配，验证已取消" })); };
+  const cancelVerification = () => { try { if (verification?.status === "confirm") { verification?.sas?.mismatch?.(); setVerification(value => ({ ...value, status: "error", error: "安全码不匹配，验证已取消" })); return; } else { verification?.verifier?.cancel?.(new Error("用户取消验证")); verification?.request?.cancel?.(); } } catch {} setVerification(null); };
+  const enableNotifications = async () => { if (typeof Notification === "undefined") { setNotificationPermission("unsupported"); return Toast.error("当前浏览器不支持桌面通知"); } const result = await Notification.requestPermission(); setNotificationPermission(result); Toast[result === "granted" ? "success" : "warning"](result === "granted" ? "桌面通知已开启" : "桌面通知未授权"); };
+  const saveProfile = async () => { const value = displayName.trim(); if (!value) return; setProfileSaving(true); try { await client.setDisplayName?.(value); Toast.success("昵称已更新"); } catch (error) { Toast.error(`昵称更新失败：${error?.message || "请检查账户权限"}`); } finally { setProfileSaving(false); } };
+  const backup = cryptoState?.backupInfo; const generatedSas = verification?.sas?.sas || verification?.sas || {}; const sasText = generatedSas?.emoji?.map(item => item[0]).join(" ") || generatedSas?.decimal?.join(" · ") || "";
+  const localDeviceId = client.getDeviceId?.();
+  const renderDevice = device => { const status = deviceStatuses[device.device_id]; const verified = Boolean(status?.crossSigningVerified); const locallyTrusted = Boolean(status?.localVerified); return h("div", { className: `device-row ${verified ? "device-row-verified" : locallyTrusted ? "device-row-local-trusted" : ""}`, key: device.device_id }, h("div", { className: "device-icon" }, verified ? "✓" : locallyTrusted ? "•" : "▣"), h("div", { className: "device-copy" }, h("div", null, device.display_name || "未命名设备", device.device_id === localDeviceId && h("span", { className: "device-current" }, "本机"), verified && h("span", { className: "device-verified-mini" }, "跨设备已验证"), !verified && locallyTrusted && h("span", { className: "device-local-mini" }, "本地信任")), h("div", { className: "device-id" }, device.device_id)), verified ? h("span", { className: "device-state" }, "可信设备") : h(UiButton, { className: "ghost-btn", onClick: () => verify(device.device_id) }, locallyTrusted ? "发布验证" : "验证")); };
+   return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card security-card" }, h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "设备与安全"), h("div", { className: "modal-copy" }, "恢复密钥、设备验证和端到端加密。")), h("div", { className: "modal-head-actions" }, h(UiButton, { className: "ghost-btn settings-back-button", onClick: onBack }, "返回设置"), h(UiButton, { className: `ghost-btn notification-toggle ${notificationPermission === "granted" ? "notification-enabled" : ""}`, onClick: enableNotifications }, notificationPermission === "granted" ? "通知已开启" : "开启桌面通知"), h(UiButton, { className: "icon-button", type: "text", "aria-label": "关闭", onClick: onClose }, "×"))),
+    h("div", { className: "settings-overview" }, h("div", { className: "settings-section-label" }, "我的账户"), h("div", { className: "settings-profile-row" }, h("div", { className: "settings-profile-copy" }, h("strong", null, client.getUser?.(client.getUserId?.())?.displayName || client.getUserId?.()), h("span", null, client.getUserId?.())), h("span", { className: "profile-online" }, "在线")), h("div", { className: "settings-profile-edit" }, h(Input, { value: displayName, onChange: setDisplayName, placeholder: "修改显示昵称" }), h(UiButton, { size: "small", variant: "primary", disabled: profileSaving || !displayName.trim(), onClick: saveProfile }, profileSaving ? "保存中…" : "保存昵称")), h("div", { className: "settings-section-label" }, "偏好设置"), h("div", { className: "settings-preference-grid" }, h("div", { className: "settings-preference-card" }, h("strong", null, "桌面通知"), h("span", null, notificationPermission === "granted" ? "已开启新消息提醒" : "新消息到达时提醒"), h(UiButton, { size: "small", onClick: enableNotifications }, notificationPermission === "granted" ? "已开启" : "开启")), h("div", { className: "settings-preference-card" }, h("strong", null, "界面主题"), h("span", null, "当前为浅色企业主题"), h(UiButton, { size: "small", onClick: () => Toast.info("主题设置已使用当前企业浅色方案") }, "浅色")), h("div", { className: "settings-preference-card" }, h("strong", null, "会话"), h("span", null, "此设备的 Matrix 登录会话"), h(UiButton, { size: "small", danger: true, onClick: onClose }, "关闭设置")))),
+    h("section", { className: "backup-section" }, h("div", { className: "backup-title" }, "加密消息恢复"),
+      h("div", { className: "backup-status" }, !cryptoState?.available ? "正在初始化加密模块…" : backup ? `服务器备份：${backup.version ? `版本 ${backup.version}` : "已启用"}${backup.count != null ? ` · ${backup.count} 个会话` : ""}` : "未发现服务器密钥备份", cryptoState?.activeVersion && h("span", null, ` · 当前版本 ${cryptoState.activeVersion}`), cryptoState?.keyRestored && h("span", { className: "verified-badge" }, "密钥已恢复"), cryptoState?.verified && h("span", { className: "verified-badge" }, "跨设备已验证"), !cryptoState?.verified && cryptoState?.localTrusted && h("span", { className: "local-trusted-badge" }, "本机已信任")),
+      h("div", { className: "security-status-grid" },
+        h("div", { className: "security-status-card" }, h("span", null, "加密验证状态"), h("strong", { className: cryptoState?.verified ? "status-ok" : "status-pending" }, cryptoState?.verified ? "已验证" : "未验证")),
+        h("div", { className: "security-status-card" }, h("span", null, "本机设备状态"), h("strong", { className: cryptoState?.verified || cryptoState?.localTrusted ? "status-ok" : "status-pending" }, cryptoState?.verified ? "跨设备可信" : cryptoState?.localTrusted ? "本机已信任" : "待验证")),
+        h("div", { className: "security-status-card" }, h("span", null, "密钥状态"), h("strong", { className: cryptoState?.keyRestored || backup ? "status-ok" : "status-pending" }, cryptoState?.keyRestored ? "已恢复" : backup ? "服务器备份可用" : "未发现备份"))
+      ),
+      h("label", { className: "form-label" }, "恢复密钥", h(TextArea, { value: recoveryKey, onChange: e => setRecoveryKey(e.target.value), autoSize: { minRows: 2, maxRows: 4 }, placeholder: "粘贴 Matrix 恢复密钥（推荐）" })),
+      h(UiButton, { variant: "primary", className: "primary-btn full-btn", disabled: !cryptoState.available || cryptoState.restoring || !recoveryKey.trim() || !backup?.version, onClick: () => { try { const key = decodeRecoveryKey(recoveryKey.trim()); onRestore({ type: "key", key, version: backup.version }); setRecoveryKey(""); } catch { Toast.error("恢复密钥格式无效，请粘贴完整的 Matrix 恢复密钥"); } } }, cryptoState.restoring ? (cryptoState.restoreStage === "fetch" ? `正在下载服务器备份（${backup?.count || "大量"} 个会话）…` : cryptoState.restoreStage === "prepare" ? "正在准备解密…" : `恢复中 ${cryptoState.restoreProgress || 0}%…`) : "使用恢复密钥解密历史"),
+      h("label", { className: "form-label" }, "备份密码短语（兼容方式）", h(Input, { type: "password", value: passphrase, onChange: setPassphrase, placeholder: "如果你的备份使用密码短语" })),
+      h(UiButton, { className: "ghost-btn full-btn", disabled: !cryptoState.available || cryptoState.restoring || !backup?.version, onClick: () => onRestore({ type: "secret", version: backup.version }) }, cryptoState?.keyRestored ? "再次解密历史消息" : "从密钥存储恢复"),
+      h(UiButton, { className: "ghost-btn full-btn", disabled: !cryptoState.available || cryptoState.restoring || !passphrase.trim() || !backup?.version, onClick: () => { onRestore({ type: "passphrase", passphrase: passphrase.trim(), version: backup.version }); setPassphrase(""); } }, "使用密码短语恢复"),
+      h("div", { className: "backup-hint" }, "恢复密钥只在当前浏览器内使用，不会发送给 Orbit。恢复完成后会自动重新解密历史消息。"), cryptoState.error && h("div", { className: "backup-error" }, cryptoState.error)
+    ), h("div", { className: `local-device-status ${cryptoState?.verified ? "verified" : ""}` }, h("span", { className: "local-device-dot" }), h("span", null, "本机设备 · ", localDeviceId || "当前设备"), cryptoState?.verified ? h("span", { className: "verified-badge" }, "跨设备已验证") : cryptoState?.localTrusted ? h("span", { className: "device-state-pending" }, "本机已信任 · 其他客户端未同步") : h("span", { className: "device-state-pending" }, cryptoState?.keyRestored ? "密钥已恢复 · 待设备验证" : "待设备验证")), h("div", { className: "device-list-heading" }, h("strong", null, "设备列表"), h("span", null, "验证后会发布跨签名信任，其他客户端也会同步状态")), loading ? h("div", { className: "dialog-loading" }, "正在读取设备…") : h("div", { className: "device-list" }, devices.length ? devices.map(renderDevice) : h("div", { className: "dialog-empty" }, "服务器没有返回设备列表")), verification && h("section", { className: "verification-panel" }, h("div", { className: "verification-head" }, h("div", { className: "verification-title" }, "设备验证"), h(UiButton, { className: "verification-close", type: "text", onClick: cancelVerification }, "取消")), h("div", { className: "verification-copy" }, verification.status === "incoming" ? `收到来自 ${verification.deviceId || "其他设备"} 的验证请求` : verification.status === "waiting" ? "验证请求已发送，等待另一台设备接受" : verification.status === "verifying" ? "正在交换验证信息…" : verification.status === "confirm" ? "请核对两台设备上的安全码是否一致" : verification.status === "done" ? "两台设备已建立跨设备信任，其他客户端同步后会显示已验证" : verification.error || "验证准备中"), verification.status === "confirm" && h("div", { className: "sas-code" }, sasText), verification.status === "incoming" && h(UiButton, { variant: "primary", className: "primary-btn full-btn", onClick: () => runVerification(verification.request, verification.deviceId) }, "接受并开始验证"), verification.status === "confirm" && h("div", { className: "verification-actions" }, h(UiButton, { variant: "primary", className: "primary-btn", onClick: confirmSas }, "匹配，完成验证"), h(UiButton, { className: "ghost-btn", onClick: cancelVerification }, "不匹配")), verification.status === "done" && h("div", { className: "verification-success" }, "验证完成，已发布跨签名信任。"), verification.status === "error" && h("div", { className: "backup-error" }, verification.error || "验证失败"))));
+}
+
+function ForwardDialog({ client, rooms, items, onClose }) {
+  const [targets, setTargets] = useState([]); const [loading, setLoading] = useState(false); const [query, setQuery] = useState(""); const [note, setNote] = useState("");
+  const available = rooms.filter(room => !room.isSpace);
+  const filtered = available.filter(room => `${room.name} ${room.id}`.toLowerCase().includes(query.trim().toLowerCase()));
+  const selectedRooms = targets.map(id => available.find(room => room.id === id)).filter(Boolean);
+  const toggle = id => setTargets(current => current.includes(id) ? current.filter(value => value !== id) : [...current, id]);
+  const forward = async () => { if (!targets.length || !items.length) return; setLoading(true); try { for (const targetId of targets) { for (const item of items) { const eventContent = item.event?.getClearContent?.() || item.event?.getContent?.() || { msgtype: "m.text", body: item.text || "" }; const content = { ...eventContent }; delete content.event_id; delete content.room_id; delete content.sender; delete content.origin_server_ts; delete content["m.relates_to"]; await client.sendMessage(targetId, content); } if (note.trim()) await client.sendMessage(targetId, { msgtype: "m.text", body: note.trim() }); } Toast.success(`已转发 ${items.length} 条消息到 ${targets.length} 个房间`); onClose(); } catch (error) { Toast.error(`转发失败：${error?.message || "未知错误"}`); } finally { setLoading(false); } };
+  return h("div", { className: "modal-backdrop forward-backdrop", onMouseDown: event => event.target === event.currentTarget && onClose() },
+    h("div", { className: "modal-card forward-card forward-dialog" },
+      h("div", { className: "forward-dialog-head" }, h("div", null, h("div", { className: "modal-title" }, "转发消息"), h("div", { className: "modal-copy" }, `共 ${items.length} 条消息`)), h(UiButton, { className: "icon-button", type: "text", title: "关闭", onClick: onClose }, "×")),
+      h("div", { className: "forward-dialog-body" },
+        h("section", { className: "forward-picker" },
+          h(Input, { className: "forward-search", value: query, onChange: setQuery, placeholder: "搜索会话", prefix: "⌕", allowClear: true }),
+          h("div", { className: "forward-section-title" }, query.trim() ? "搜索结果" : "最近聊天"),
+          h("div", { className: "forward-room-list" }, filtered.length ? filtered.map(room => h("label", { className: `forward-room ${targets.includes(room.id) ? "selected" : ""}`, key: room.id }, h(AntCheckbox, { checked: targets.includes(room.id), onChange: () => toggle(room.id) }), h(MatrixAvatar, { client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 36, style: { background: room.color }, fallback: room.initials, alt: room.name }), h("span", { className: "forward-room-name", title: room.name }, room.name))) : h("div", { className: "dialog-empty" }, "没有匹配的会话"))
+        ),
+        h("section", { className: "forward-selection" },
+          h("div", { className: "forward-selection-head" }, h("strong", null, "分别发送给："), h("span", null, `已选 ${targets.length} 个会话`)),
+          h("div", { className: "forward-selected-list" }, selectedRooms.length ? selectedRooms.map(room => h("div", { className: "forward-selected-room", key: room.id }, h(MatrixAvatar, { client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 34, style: { background: room.color }, fallback: room.initials, alt: room.name }), h("span", { title: room.name }, room.name), h("button", { type: "button", title: `移除 ${room.name}`, "aria-label": `移除 ${room.name}`, onClick: () => toggle(room.id) }, "×"))) : h("div", { className: "forward-selection-empty" }, "从左侧选择要转发到的会话")),
+          h("div", { className: "forward-compose" }, h(TextArea, { value: note, onChange: event => setNote(event.target.value), rows: 2, maxLength: 500, placeholder: "留言（可选）" }), h("div", { className: "forward-dialog-actions" }, h(UiButton, { variant: "primary", className: "primary-btn", disabled: !targets.length || loading, onClick: forward }, loading ? "转发中…" : "确定"), h(UiButton, { className: "ghost-btn", disabled: loading, onClick: onClose }, "取消")))
+        )
+      )
+    )
+  );
+}
+
+function SearchDialog({ client, room, onClose, onJumpTo }) {
+  const [query, setQuery] = useState(""); const [results, setResults] = useState([]); const [loading, setLoading] = useState(false);
+  onJumpTo ||= (eventId => window.orbitNavigateToMessage?.(room?.id, eventId));
+  const scoreResult = (entry, term) => {
+    const result = entry?.result || entry || {}; const content = result.content || {}; const haystack = `${content.body || ""} ${content.formatted_body || ""}`.toLowerCase(); const needle = term.toLowerCase();
+    let cursor = 0; for (const char of needle) { const found = haystack.indexOf(char, cursor); if (found < 0) return 0; cursor = found + 1; }
+    const exact = String(content.body || "").toLowerCase() === needle ? 100 : 0;
+    const starts = String(content.body || "").toLowerCase().startsWith(needle) ? 30 : 0;
+    const occurrences = haystack.split(needle).length - 1;
+    return Number(entry?.rank || 0) + exact + starts + occurrences * 4;
+  };
+  const decorateResults = (raw, term) => raw.filter(item => !item.result?.room_id || item.result.room_id === room.id).map(item => {
+    const result = item.result || item; const sender = result.sender || result.user_id; const member = sender && room.matrixRoom?.getMember?.(sender); const user = sender && client?.getUser?.(sender); return { ...item, result: { ...result, senderName: member?.name || user?.displayName || sender || "未知用户", sender } };
+  }).filter(item => scoreResult(item, term) > 0).sort((a, b) => scoreResult(b, term) - scoreResult(a, term));
+  const search = async e => { e.preventDefault(); const term = query.trim(); if (!term) return; setLoading(true); try {
+    let response;
+    if (typeof client.searchRoomEvents === "function") response = await client.searchRoomEvents({ term, filter: { rooms: [room.id] } });
+    else if (typeof client.searchMessageText === "function") response = await client.searchMessageText({ query: term });
+    else throw new Error("当前 homeserver 不支持搜索接口");
+    const raw = response?.results || response?.search_categories?.room_events?.results || [];
+    const remote = decorateResults(raw, term);
+    if (remote.length) { setResults(remote); return; }
+    const matrixRoom = room.matrixRoom || room;
+    const localEvents = matrixRoom.getLiveTimeline?.().getEvents?.() || [];
+    const local = decorateResults(localEvents.map(event => ({ result: { room_id: room.id, event_id: event.getId?.(), sender: event.getSender?.(), origin_server_ts: event.getTs?.(), content: event.getClearContent?.() || event.getContent?.() || {} } })).filter(item => scoreResult(item, term) > 0), term);
+    setResults(local);
+  } catch (error) {
+    try {
+      const response = await client.searchMessageText?.({ query: term });
+      const raw = response?.search_categories?.room_events?.results || response?.results || [];
+      const remote = decorateResults(raw, term);
+      if (remote.length) { setResults(remote); return; }
+    } catch {}
+    const localEvents = (room.matrixRoom || room).getLiveTimeline?.().getEvents?.() || [];
+    const local = decorateResults(localEvents.map(event => ({ result: { room_id: room.id, sender: event.getSender?.(), origin_server_ts: event.getTs?.(), content: event.getClearContent?.() || event.getContent?.() || {} } })).filter(item => scoreResult(item, term) > 0), term);
+    setResults(local);
+    if (!local.length) Toast.warning("服务器搜索不可用，仅搜索当前已加载的消息");
+  } finally { setLoading(false); } };
+  return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card search-card" }, h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "搜索房间消息"), h("div", { className: "modal-copy" }, room.name)), h("button", { className: "icon-button", onClick: onClose }, "×")), h("form", { className: "search-form", onSubmit: search }, h("input", { value: query, onChange: e => setQuery(e.target.value), placeholder: "输入关键词", autoFocus: true }), h("button", { className: "primary-btn", disabled: loading }, loading ? "搜索中…" : "搜索")), h("div", { className: "search-results" }, !results.length && query && !loading && h("div", { className: "dialog-empty" }, "没有找到匹配的消息"), results.map((item, i) => h("button", { type: "button", className: "search-result", key: item.result?.event_id || item.rank || i, onClick: () => { onClose(); onJumpTo?.(item.result?.event_id); } }, h("div", { className: "search-result-author" }, item.result?.senderName || item.result?.sender || "未知用户", h("span", { className: "message-time" }, item.result?.origin_server_ts ? new Date(item.result.origin_server_ts).toLocaleString("zh-CN") : "")), h("div", { className: "search-result-body" }, item.result?.content?.body || ""))))));
+}
+
+function Sidebar({ rooms, allRooms: roomUniverse = rooms, invites = [], spaces, selectedId, connected, presence, viewMode, activeSpaceId, onViewMode, onSpaceSelect, onSelect, onCreate, onCreateSpace, onManageSpace, onLeaveSpace = window.orbitLeaveSpace, onAcceptInvite, onDeclineInvite, onAccount, onLogout }) {
+  const [query, setQuery] = useState("");
+  const [directSort, setDirectSort] = useState("active");
+  const [directPresenceByUser, setDirectPresenceByUser] = useState({});
+  const scopedRooms = rooms;
+  const filtered = scopedRooms.filter(room => !room.hidden && `${room.name} ${room.id}`.toLowerCase().includes(query.toLowerCase()));
+  const currentUser = connected.client?.getUser?.(connected.userId); spaces = spaces.filter(space => !space.hidden);
+  const directUserIds = [...new Set(rooms.map(room => room.directUserId).filter(Boolean))];
+  const directUserIdsKey = [...directUserIds].sort().join("|");
+  useEffect(() => {
+    const client = connected.client;
+    let active = true;
+    const commit = (userId, value) => {
+      if (!active || !userId) return;
+      const normalized = String(value || "unknown").toLowerCase();
+      const user = client?.getUser?.(userId);
+      if (user) user.presence = normalized;
+      setDirectPresenceByUser(current => current[userId] === normalized ? current : { ...current, [userId]: normalized });
+    };
+    const onPresence = (_event, user) => commit(user?.userId, user?.presence);
+    client?.on?.("User.presence", onPresence);
+    Promise.all(directUserIds.map(async userId => {
+      try {
+        const result = await client?.getPresence?.(userId);
+        commit(userId, result?.presence || matrixPresence(client, userId));
+      } catch {
+        commit(userId, matrixPresence(client, userId));
+      }
+    })).catch(() => {});
+    return () => { active = false; client?.off?.("User.presence", onPresence); };
+  }, [connected.client, directUserIdsKey]);
+  const directPresence = userId => directPresenceByUser[userId] || matrixPresence(connected.client, userId);
+  // Badge totals must come from this committed render's props.
+  const allRooms = roomUniverse;
+  const totalUnread = allRooms.filter(room => room.id !== selectedId && room.isDirect).reduce((sum, room) => sum + (Number(room.unread) || 0), 0);
+  const groupUnread = allRooms.filter(room => room.id !== selectedId && room.isGroup).reduce((sum, room) => sum + (Number(room.unread) || 0), 0);
+  const unreadBadge = count => count > 0 ? h("span", { className: "nav-unread-badge", title: `${count} 条未读消息` }, count > 99 ? "99+" : count) : null;
+  const sortedRooms = viewMode !== "messages" ? filtered : [...filtered].sort((a, b) => {
+    if (directSort === "online") {
+      const rank = { online: 0, busy: 1, unavailable: 2, unknown: 3, offline: 4 };
+      const aRank = rank[directPresence(a.directUserId)] ?? 3;
+      const bRank = rank[directPresence(b.directUserId)] ?? 3;
+      if (aRank !== bRank) return aRank - bRank;
+    }
+    return (b.lastTs || 0) - (a.lastTs || 0);
+  });
+  const inviteNotice = invites.length ? h("section", { className: "invite-section", "aria-label": "房间邀请" },
+    h("div", { className: "section-label invite-section-label" }, h("span", null, "房间邀请"), h("span", { className: "invite-count" }, invites.length)),
+    invites.map(invite => h("div", { className: "invite-card", key: invite.id },
+      h(MatrixAvatar, { client: connected.client, mxcUrl: invite.avatarMxc, httpUrl: invite.avatarUrl, size: 34, style: { background: invite.color }, fallback: invite.initials, alt: invite.name }),
+      h("div", { className: "invite-copy" }, h("strong", null, invite.name), h("span", null, "有人邀请你加入此房间")),
+      h("div", { className: "invite-actions" }, h("button", { type: "button", className: "invite-accept", onClick: () => onAcceptInvite?.(invite) }, "接受"), h("button", { type: "button", className: "invite-decline", onClick: () => onDeclineInvite?.(invite) }, "忽略"))
+    ))
+  ) : null;
+  return h("aside", { className: "sidebar" }, h("div", { className: "brand-row" }, h("div", { className: "brand" }, h("div", { className: "brand-mark" }, "O"), h("div", null, "Orbit", h("div", { className: "workspace-pill" }, "Matrix 工作台"))), h("button", { className: "icon-button", title: viewMode === "spaces" && activeSpaceId ? "在当前空间创建房间" : "创建房间", onClick: onCreate }, "+")), h("button", { className: "user-card", onClick: onAccount, title: "打开我的设置" }, h(MatrixAvatar, { client: connected.client, mxcUrl: memberAvatarMxc(currentUser), size: 32, className: "user-avatar", style: { background: colorFor(connected.userId) }, fallback: initials(connected.userId), alt: connected.userId }), h("div", { className: "user-meta" }, h("div", { className: "user-name" }, connected.client?.getUser?.(connected.userId)?.displayName || connected.userId), h("div", { className: "user-id" }, "我的设置")), h("span", { className: `online-dot ${presence === "offline" ? "offline-dot" : ""}`, title: presence || "online" })), h("div", { className: "sidebar-nav" }, h("button", { className: `nav-item ${viewMode === "messages" ? "active" : ""}`, onClick: () => onViewMode("messages") }, "私聊", unreadBadge(totalUnread)), h("button", { className: `nav-item ${viewMode === "groups" ? "active" : ""}`, onClick: () => onViewMode("groups") }, "群聊", unreadBadge(groupUnread), invites.length > 0 && h("span", { className: "nav-unread-dot", title: `${invites.length} 个房间邀请` })), h("button", { className: `nav-item ${viewMode === "spaces" ? "active" : ""}`, onClick: () => onViewMode("spaces") }, "空间")), inviteNotice, viewMode === "spaces" && h("div", { className: "space-list" }, h("div", { className: "section-label" }, h("span", null, "我的空间"), h("span", { className: "space-actions" }, h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onCreateSpace?.(); }, title: "创建空间" }, "+"), activeSpaceId && h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onCreate?.(); }, title: "在当前空间创建房间" }, "新房间"), activeSpaceId && h("button", { className: "mini-link danger-mini-link", onClick: event => { event.stopPropagation(); onLeaveSpace?.(); }, title: "退出当前空间" }, "退出"), h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onManageSpace?.(); }, title: "管理空间房间" }, "⋯"))), spaces.length ? spaces.map(space => h("div", { className: `space-row ${space.id === activeSpaceId ? "active" : ""}`, key: space.id, onClick: () => onSpaceSelect(space.id) }, h("div", { className: "space-icon", style: { background: space.color } }, space.initials), h("span", null, space.name))) : h("div", { className: "empty-sidebar" }, "服务器没有返回 Space 房间")), h("div", { className: "room-tools" }, h(Input, { prefix: "⌕", placeholder: viewMode === "spaces" ? "搜索空间内房间" : viewMode === "groups" ? "搜索群聊" : "搜索私聊", value: query, onChange: setQuery, showClear: true })), h("div", { className: "section-label" }, h("span", null, viewMode === "spaces" ? "空间内房间" : viewMode === "groups" ? "群聊" : "私聊"), h("span", null, filtered.length), viewMode === "messages" && h("span", { className: "sort-switch", role: "group", "aria-label": "私聊排序" }, h("button", { type: "button", className: directSort === "active" ? "active" : "", onClick: () => setDirectSort("active") }, "活跃优先"), h("button", { type: "button", className: directSort === "online" ? "active" : "", onClick: () => setDirectSort("online") }, "在线优先"))), h("div", { className: "room-list" }, sortedRooms.length ? sortedRooms.map(room => { const directPresence = room.directUserId ? connected.client?.getUser?.(room.directUserId)?.presence : null; const showUnread = room.id !== selectedId && room.unread > 0; return h("div", { key: room.id, className: `room-row ${room.id === selectedId ? "active" : ""}`, onClick: () => onSelect(room.id) }, h(MatrixAvatar, { client: connected.client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 38, style: { background: room.color }, fallback: room.initials, alt: room.name }), h("div", { className: "room-copy" }, h("div", { className: "room-name-line" }, h("span", { className: "room-name" }, room.name), directPresence && h("span", { className: `room-presence-dot ${directPresence === "online" ? "online" : ""}`, title: directPresence === "online" ? "在线" : "离线" })), h("div", { className: "room-preview" }, room.preview)), h("div", { className: "room-trailing" }, h("span", { className: "room-time" }, room.time), showUnread ? h("span", { className: `room-unread-badge ${room.unread === 1 ? "dot" : ""}`, title: `${room.unread} 条未读消息` }, room.unread > 1 ? room.unread : null) : null)); }) : h("div", { className: "empty-sidebar" }, viewMode === "spaces" ? "请选择一个空间，或该空间还没有子房间" : "暂无房间")), h("div", { className: "sidebar-footer" }, h("div", { className: "connection-state" }, h("span", { className: `online-dot ${presence === "offline" ? "offline-dot" : ""}` }), presence === "offline" ? "离线" : "Matrix 已连接"), h("button", { className: "icon-button", title: "退出登录", onClick: onLogout }, "↪")));
+}
+
+function SpaceDialog({ client, onClose, onCreated }) {
+  const [name, setName] = useState(""); const [loading, setLoading] = useState(false);
+  const submit = async e => { e.preventDefault(); setLoading(true); try { const result = await client.createRoom({ name: name.trim(), creation_content: { type: "m.space" }, initial_state: [] }); Toast.success("空间创建成功"); onCreated?.(result.room_id); onClose(); } catch (error) { Toast.error(`空间创建失败：${error?.message || "当前 homeserver 不支持 Space"}`); } finally { setLoading(false); } };
+  return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card" }, h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "创建空间"), h("div", { className: "modal-copy" }, "Space 是房间的组织容器。")), h(UiButton, { className: "icon-button", type: "text", onClick: onClose }, "×")), h("form", { className: "modal-form", onSubmit: submit }, h("label", { className: "form-label" }, "空间名称", h(Input, { value: name, onChange: setName, required: true, placeholder: "例如：产品与研发" })), h("div", { className: "modal-actions" }, h(UiButton, { htmlType: "button", className: "ghost-btn", onClick: onClose }, "取消"), h(UiButton, { htmlType: "submit", variant: "primary", disabled: loading }, loading ? "创建中…" : "创建空间")))));
+}
+
+function SpaceRoomsDialog({ client, space, rooms, onClose, onChanged }) {
+  const [query, setQuery] = useState(""); const [selected, setSelected] = useState(() => new Set(spaceChildIds(space.matrixRoom))); const [loading, setLoading] = useState(false);
+  const candidates = rooms.filter(room => !room.isSpace && `${room.name} ${room.id}`.toLowerCase().includes(query.toLowerCase()));
+  const toggle = id => setSelected(current => { const next = new Set(current); next.has(id) ? next.delete(id) : next.add(id); return next; });
+  const save = async () => { setLoading(true); try { const existing = new Set(spaceChildIds(space.matrixRoom)); const via = [new URL(client.getHomeserverUrl?.() || location.origin).host]; for (const room of rooms.filter(item => selected.has(item.id) && !existing.has(item.id))) { await client.sendStateEvent(space.id, "m.space.child", { via, order: String(Date.now()) }, room.id); try { await client.sendStateEvent(room.id, "m.space.parent", { via, canonical: false }, space.id); } catch {} } await onChanged?.(); Toast.success("空间房间已更新"); onClose(); } catch (error) { Toast.error(`添加房间失败：${error?.message || "请检查空间权限"}`); } finally { setLoading(false); } };
+  return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card forward-card" }, h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "管理空间房间"), h("div", { className: "modal-copy" }, space.name)), h(UiButton, { className: "icon-button", type: "text", onClick: onClose }, "×")), h(Input, { value: query, onChange: setQuery, placeholder: "搜索已有房间", prefix: "⌕" }), h("div", { className: "forward-room-list" }, candidates.map(room => h("label", { className: "forward-room", key: room.id }, h(AntCheckbox, { checked: selected.has(room.id), onChange: () => toggle(room.id) }), h(MatrixAvatar, { client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 30, style: { background: room.color }, fallback: room.initials, alt: room.name }), h("span", null, room.name)))), h("div", { className: "modal-actions" }, h(UiButton, { className: "ghost-btn", onClick: onClose }, "取消"), h(UiButton, { variant: "primary", disabled: loading, onClick: save }, loading ? "保存中…" : "保存"))));
+}
+
+function ReactionPicker({ client, onSelect }) {
+  const [items, setItems] = useState([]); const [packs, setPacks] = useState([]); const [pack, setPack] = useState("all"); const [open, setOpen] = useState(false); const [custom, setCustom] = useState(""); const [popupStyle, setPopupStyle] = useState(null);
+  useEffect(() => { if (!open || items.length) return; ensureEmojiCatalog().then(next => { setItems(next); setPacks(window.orbitEmojiPacks || []); }).catch(() => {}); }, [open]);
+  useEffect(() => {
+    if (!open) return undefined;
+    const close = event => { if (!event.target?.closest?.(".reaction-picker, .message-action-reaction")) setOpen(false); };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [open]);
+  const shown = items.filter(item => pack === "all" || item.packId === pack).slice(0, 240);
+  const submitCustom = () => { const value = custom.trim(); if (!value) return; onSelect(value); setCustom(""); setOpen(false); };
+  const content = h("div", { className: "reaction-picker" }, h("div", { className: "reaction-picker-title" }, "选择回应"), h("div", { className: "reaction-custom" }, h(Input, { size: "small", value: custom, onChange: setCustom, placeholder: "输入文字回应" }), h(UiButton, { size: "small", variant: "primary", disabled: !custom.trim(), onClick: submitCustom }, "回应")), h("div", { className: "emoji-packs reaction-packs" }, h("button", { type: "button", className: `emoji-pack ${pack === "all" ? "active" : ""}`, onClick: () => setPack("all") }, "全部"), packs.map(item => h("button", { type: "button", className: `emoji-pack ${pack === item.id ? "active" : ""}`, key: item.id, onClick: () => setPack(item.id) }, item.name))), items.length > 0 && h("div", { className: "reaction-sticker-grid" }, shown.map(item => h("button", { type: "button", key: item.id, title: `回应：${item.name}`, onClick: () => { onSelect(`:${item.name}:`); setOpen(false); } }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" })))));
+   const faceIcon = h("svg", { viewBox: "0 0 24 24", "aria-hidden": "true", focusable: "false" },
+     h("circle", { cx: "12", cy: "12", r: "8.5" }),
+     h("circle", { cx: "9", cy: "10", r: "0.8", fill: "currentColor", stroke: "none" }),
+     h("circle", { cx: "15", cy: "10", r: "0.8", fill: "currentColor", stroke: "none" }),
+     h("path", { d: "M8.5 14c.9 1.2 2.1 1.8 3.5 1.8s2.6-.6 3.5-1.8" })
+   );
+   const toggle = event => {
+     event.stopPropagation();
+     const rect = event.currentTarget.getBoundingClientRect();
+     const width = 300;
+     const height = 350;
+     const gap = 8;
+     const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+     const below = rect.bottom + gap;
+     const top = below + height <= window.innerHeight - 8
+       ? below
+       : Math.max(8, rect.top - height - gap);
+     setPopupStyle({ left: `${left}px`, top: `${top}px` });
+     setOpen(value => !value);
+   };
+   return h(React.Fragment, null,
+     h("button", { type: "button", className: "message-action-reaction", title: "选择回应", "aria-label": "选择回应", onClick: toggle }, faceIcon),
+     open && createPortal(h("div", { className: "reaction-picker reaction-picker-floating", style: popupStyle, onMouseDown: event => event.stopPropagation() }, content), document.body)
+   );
+}
+
+
+function editorHtmlHasUserFormatting(html) {
+  const value = String(html || "");
+  return /<(?:strong|b|em|i|u|del|s|code|pre|blockquote|ul|ol|li|h[1-3]|a)\b/i.test(value)
+    || /style\s*=\s*["'][^"']*(?:color|font-size)/i.test(value)
+    || /<br\b(?![^>]*ProseMirror-trailingBreak)/i.test(value);
+}
+
+function sanitizeOutgoingEditorHtml(html, plainText) {
+  let source = String(html || "");
+  // Extra TipTap paragraphs are not user line breaks. Only keep <br> when the
+  // serialized composer text actually contains a newline (Shift+Enter / paste).
+  if (!String(plainText || "").includes("\n")) {
+    source = source.replace(/<\/p>\s*<p(?:\s[^>]*)?>/gi, "");
+  }
+  return sanitizeFormattedBody(source);
+}
+
+function normalizeComposerText(value, html) {
+  const text = String(value || "");
+  if (!html || typeof DOMParser === "undefined") return text;
+  // The editor's plain text is authoritative for line boundaries. In
+  // particular, do not reconstruct breaks from <p> wrappers: TipTap can
+  // leave adjacent paragraph nodes after an in-line deletion even though the
+  // user never pressed Enter. Explicit user line breaks are already present
+  // in `text` and are preserved unchanged.
+  if (!text.includes("\n")) return text;
+  return text;
+  // Some contenteditable engines expose adjacent paragraphs as one plain
+  // string while the HTML still contains the real line boundaries. Recover
+  // those boundaries before the Matrix event is created.
+  if (!/<\/(?:p|div|li|h[1-6]|blockquote|pre)>/i.test(String(html))) return text;
+  try {
+    const doc = new DOMParser().parseFromString(String(html), "text/html");
+    const blockTags = new Set(["P", "DIV", "LI", "H1", "H2", "H3", "H4", "H5", "H6", "BLOCKQUOTE", "PRE"]);
+    const walk = node => [...node.childNodes].map(child => {
+      if (child.nodeType === Node.TEXT_NODE) return child.nodeValue || "";
+      if (child.nodeType !== Node.ELEMENT_NODE) return "";
+      if (child.tagName === "BR") return "\n";
+      const nested = walk(child);
+      return nested + (blockTags.has(child.tagName) && !nested.endsWith("\n") ? "\n" : "");
+    }).join("");
+    const recovered = walk(doc.body).replace(/\n+$/, "");
+    return recovered || text;
+  } catch {
+    return text;
+  }
+}
+
+// Rebuild the editor's token representation from Matrix HTML. Matrix clients
+// intentionally omit custom emoji from the plain `body` fallback, so editing
+// an emoji message must read the emoticon image back from `formatted_body`.
+function editorTextFromFormattedBody(html) {
+  if (!html || typeof DOMParser === "undefined" || !/<img\b/i.test(String(html))) return null;
+  try {
+    const doc = new DOMParser().parseFromString(String(html), "text/html");
+    let foundEmoji = false;
+    const blockTags = new Set(["P", "DIV", "LI", "H1", "H2", "H3", "H4", "H5", "H6", "BLOCKQUOTE", "PRE"]);
+    const walk = node => [...node.childNodes].map(child => {
+      if (child.nodeType === Node.TEXT_NODE) return child.nodeValue || "";
+      if (child.nodeType !== Node.ELEMENT_NODE) return "";
+      const element = child;
+      if (element.tagName === "BR") return "\n";
+      if (element.tagName === "IMG" && (element.hasAttribute("data-mx-emoticon") || element.hasAttribute("data-emoji-token"))) {
+        const alt = String(element.getAttribute("alt") || element.getAttribute("title") || "表情").replace(/^:+|:+$/g, "").trim() || "表情";
+        if (/^k歌$/i.test(alt)) return "";
+        foundEmoji = true;
+        return `:${alt}:`;
+      }
+      // Some clients wrap the image with a span and repeat its label as text.
+      // Treat the image as the authoritative editor token and skip that label.
+      const nestedImage = element.querySelector?.("img[data-mx-emoticon], img[data-emoji-token]");
+      if (nestedImage) {
+        const alt = String(nestedImage.getAttribute("alt") || nestedImage.getAttribute("title") || "表情").replace(/^:+|:+$/g, "").trim() || "表情";
+        if (/^k歌$/i.test(alt)) return blockTags.has(element.tagName) ? "\n" : "";
+        foundEmoji = true;
+        return `:${alt}:` + (blockTags.has(element.tagName) ? "\n" : "");
+      }
+      const nested = walk(element);
+      return nested + (blockTags.has(element.tagName) && !nested.endsWith("\n") ? "\n" : "");
+    }).join("");
+    const result = walk(doc.body).replace(/:K歌:/gi, "").replace(/\n+$/, "");
+    return foundEmoji ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+function emojiRefsFromFormattedBody(html) {
+  if (!html || typeof DOMParser === "undefined") return [];
+  try {
+    const doc = new DOMParser().parseFromString(String(html), "text/html");
+    return [...doc.querySelectorAll("img[data-mx-emoticon], img[data-emoji-token]")].map(image => {
+      const shortcode = String(image.getAttribute("alt") || image.getAttribute("title") || "表情").replace(/^:+|:+$/g, "").trim();
+      const mxc = String(image.getAttribute("src") || "");
+      return shortcode && !/^k歌$/i.test(shortcode) && mxc.startsWith("mxc://") ? { shortcode, mxc } : null;
+    }).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function emojiRefsFromEditorHtml(html) {
+  if (!html || typeof DOMParser === "undefined") return [];
+  try {
+    const doc = new DOMParser().parseFromString(String(html), "text/html");
+    return [...doc.querySelectorAll("[data-emoji-token]")].map(node => {
+      const token = String(node.getAttribute("data-emoji-token") || "");
+      const shortcode = token.replace(/^:+|:+$/g, "").trim();
+      const mxc = String(node.getAttribute("data-mxc") || "");
+      return shortcode && !/^k歌$/i.test(shortcode) && mxc.startsWith("mxc://") ? { shortcode, mxc } : null;
+    }).filter(Boolean);
+  } catch { return []; }
+}
+
+function ReadReceipt({ readBy = [], client }) {
+  client = client || window.orbitMatrixClient;
+  const content = h("div", { className: "read-popover" },
+    h("div", { className: "read-popover-title" }, readBy.length ? `已读 ${readBy.length} 人` : "暂未收到已读回执"),
+    readBy.length ? h("div", { className: "read-people-grid" }, readBy.map(entry => { const user = client?.getUser?.(entry.userId); const fullTime = entry.ts ? new Date(entry.ts).toLocaleString("zh-CN") : "已读"; const readTime = entry.ts ? new Date(entry.ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }) : "已读"; const label = `${entry.name || entry.userId} · ${fullTime}`; return h("div", { className: "read-person", key: entry.userId, title: label, "aria-label": label },
+      h(MatrixAvatar, { client, mxcUrl: memberAvatarMxc(user), size: 28, className: "read-person-avatar", style: { background: colorFor(entry.userId), color: "#fff" }, fallback: initials(entry.name || entry.userId), alt: entry.name || entry.userId }),
+      h("span", { className: "read-person-name" }, entry.name || user?.displayName || "未命名用户"),
+      h("time", { className: "read-person-time" }, readTime)); })) :
+      h("div", { className: "read-empty" }, "对方打开房间后会显示读取时间"));
+  const avatars = readBy.slice(0, 4).map(entry => { const user = client?.getUser?.(entry.userId); return h(MatrixAvatar, { key: entry.userId, client, mxcUrl: memberAvatarMxc(user), size: 20, className: "read-stack-avatar", style: { background: colorFor(entry.userId), color: "#fff" }, fallback: initials(entry.name || entry.userId), alt: entry.name || entry.userId }); });
+  return h(AntPopover, { content, trigger: "click", placement: "topRight" },
+    h("button", { className: "read-status read-status-avatars", type: "button", title: `${readBy.length} 人已读`, "aria-label": `${readBy.length} 人已读` }, h("span", { className: "read-stack" }, avatars)));
+}
+
+function RelationContext({ item, client, onJumpTo, onThread }) {
+  const isThread = Boolean(item.threadRoot);
+  const targetId = item.replyTo || item.threadRoot;
+  const author = isThread ? item.threadAuthor : item.replyAuthor;
+  const snippet = isThread ? item.threadPreview : item.replyPreview;
+  if (!targetId) return null;
+  return h("button", { type: "button", className: `relation-context ${isThread ? "relation-thread" : "relation-quote"}`, onClick: event => { event.stopPropagation(); (isThread ? onThread : onJumpTo)?.(isThread ? item : targetId); }, title: isThread ? "打开线程" : "跳转到原消息", "aria-label": isThread ? `打开 ${author || "消息"} 的线程` : `跳转到 ${author || "消息"} 的原消息` },
+    h("span", { className: "relation-context-rail" }),
+    h("span", { className: "relation-context-copy" },
+      h("span", { className: "relation-context-label" }, h("b", { className: "relation-context-kind" }, isThread ? "线程" : "回复"), h("span", { className: "relation-context-author" }, author || "消息")),
+      h("span", { className: "relation-context-snippet" }, String(snippet || "消息内容不可用").replace(/\s+/g, " ").trim())
+    ),
+    h("span", { className: "relation-context-arrow", "aria-hidden": "true" }, "↟")
+  );
+}
+
+function attachmentKind(name = "") {
+  const ext = String(name).split(".").pop()?.toLowerCase() || "file";
+  if (["txt", "log", "md", "json", "xml"].includes(ext)) return { ext, label: ext.toUpperCase(), icon: "T", className: "file" };
+  if (["doc", "docx", "odt", "rtf"].includes(ext)) return { ext, label: "DOCX", icon: "W", className: "doc" };
+  if (["ppt", "pptx", "odp"].includes(ext)) return { ext, label: "PPTX", icon: "P", className: "ppt" };
+  if (["xls", "xlsx", "ods", "csv"].includes(ext)) return { ext, label: ext === "csv" ? "CSV" : "XLSX", icon: "X", className: "xls" };
+  if (ext === "pdf") return { ext, label: "PDF", icon: "P", className: "pdf" };
+  return { ext, label: ext.toUpperCase().slice(0, 5) || "FILE", icon: "↗", className: "file" };
+}
+
+function formatAttachmentSize(size) {
+  const bytes = Number(size);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+async function decodeTextAttachment(blob) {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder("utf-16le").decode(bytes.subarray(2));
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder("utf-16be").decode(bytes.subarray(2));
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return new TextDecoder("utf-8").decode(bytes.subarray(3));
+  const sample = bytes.subarray(0, Math.min(bytes.length, 4096));
+  const zeroCount = sample.reduce((count, byte) => count + (byte === 0 ? 1 : 0), 0);
+  if (zeroCount > sample.length * 0.18) {
+    try { return new TextDecoder("utf-16le").decode(bytes); } catch {}
+  }
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch {}
+  for (const encoding of ["gb18030", "gbk", "big5", "shift_jis", "windows-1252"]) {
+    try { return new TextDecoder(encoding).decode(bytes); } catch {}
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function shortenAttachmentName(name, maxLength = 30) {
+  const original = String(name || "附件");
+  if (original.length <= maxLength) return original;
+  const dot = original.lastIndexOf(".");
+  const ext = dot > 0 && dot < original.length - 1 ? original.slice(dot).toLowerCase() : "";
+  if (/^\.(?:png|jpe?g|gif|webp|svg|bmp|avif)$/i.test(ext)) return `image${ext}`;
+  const keep = Math.max(8, maxLength - ext.length - 1);
+  return `${original.slice(0, keep)}…${ext}`;
+}
+
+async function saveEditedAttachment(client, item, buffer, fileName, mimeType) {
+  if (!client || !item?.roomId || !item?.id || !buffer) throw new Error("无法保存文件：缺少房间或文件信息");
+  const name = fileName || item.attachment?.name || "document";
+  const type = mimeType || item.attachment?.info?.mimetype || "application/octet-stream";
+  const file = new File([buffer], name, { type });
+  const encrypted = Boolean(item.attachment?.file?.key?.k && item.attachment?.file?.iv);
+  const { uploaded, fileInfo } = await uploadMatrixMedia(client, file, encrypted);
+  const msgtype = item.attachment?.type || "m.file";
+  const info = { ...(item.attachment?.info || {}), mimetype: type, size: file.size };
+  const updated = { user_id: client.getUserId?.() || "", ts: Date.now(), from_event_id: item.id, mode: item.isMe ? "replace" : "copy" };
+  const content = { msgtype, body: name, info, "org.orbit.updated": updated };
+  if (item.isMe) {
+    content["m.relates_to"] = { rel_type: "m.replace", event_id: item.id };
+    content["m.new_content"] = { msgtype, body: name, info, "org.orbit.updated": updated };
+  }
+  if (fileInfo) {
+    content.file = { ...fileInfo, url: uploaded.content_uri };
+    if (content["m.new_content"]) content["m.new_content"].file = content.file;
+  } else {
+    content.url = uploaded.content_uri;
+    if (content["m.new_content"]) content["m.new_content"].url = uploaded.content_uri;
+  }
+  await client.sendMessage(item.roomId, content);
+}
+
+let orbitOfficeCryptoPromise;
+async function decryptOfficeForEditor(buffer, fileName) {
+  if (!buffer) return buffer;
+  orbitOfficeCryptoPromise ||= import("https://esm.sh/officecrypto-tool@0.0.19?bundle");
+  let crypto;
+  try { crypto = await orbitOfficeCryptoPromise; } catch (error) { console.warn("Office 解密模块加载失败", error); return buffer; }
+  let encrypted = false;
+  try { encrypted = Boolean(crypto?.isEncrypted?.(buffer)); } catch (error) { console.warn("Office 加密检测失败", error); return buffer; }
+  if (!encrypted) return buffer;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const password = window.prompt(`文件“${fileName || "Office 文件"}”已加密，请输入密码：`, "");
+    if (password == null) throw new Error("已取消密码输入");
+    try {
+      const plain = await crypto.decrypt(buffer, { password });
+      const bytes = plain instanceof Uint8Array ? plain : new Uint8Array(plain);
+      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    } catch (error) {
+      if (attempt === 2) throw new Error("Office 文件密码错误或解密失败");
+    }
+  }
+  throw new Error("Office 文件解密失败");
+}
+
+function EmojiRowMedia({ items = [], client, onOpen, fallback }) {
+  const [failed, setFailed] = useState(0);
+  if (failed >= items.length && fallback) return h("img", { className: "message-image message-emoji-image", src: fallback, alt: "表情", onClick: () => onOpen?.(fallback, "表情") });
+  return h("div", { className: "message-emoji-row-media", role: "img", "aria-label": "表情" }, items.map((emoji, index) => {
+    const source = emoji?.thumbUrl || emoji?.url;
+    const src = assetRequestUrl(source);
+    return h("img", { key: emoji?.id || `${emoji?.name || "emoji"}-${index}`, className: "message-emoji-tile", src, alt: emoji?.name || "表情", loading: "lazy", onError: () => setFailed(value => value + 1), onClick: () => src && onOpen?.(src, emoji?.name || "表情") });
+  }));
+}
+
+function VideoMessagePlayer({ src, poster, className = "", label = "视频文件", size = 0 }) {
+  const ref = useRef(null);
+  const [playing, setPlaying] = useState(false);
+  const [duration, setDuration] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [rate, setRate] = useState(1);
+  const [error, setError] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
+  useEffect(() => {
+    const video = ref.current;
+    if (!video) return undefined;
+    const loaded = () => { setDuration(Number.isFinite(video.duration) ? video.duration : 0); setError(false); };
+    const time = () => setCurrentTime(video.currentTime || 0);
+    const play = () => setPlaying(true); const pause = () => setPlaying(false); const failed = () => { setPlaying(false); setError(true); };
+    const onFullscreenChange = () => setFullscreen(Boolean(document.fullscreenElement));
+    video.addEventListener("loadedmetadata", loaded); video.addEventListener("timeupdate", time); video.addEventListener("play", play); video.addEventListener("pause", pause); video.addEventListener("ended", pause); video.addEventListener("error", failed); document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => { video.pause(); video.removeEventListener("loadedmetadata", loaded); video.removeEventListener("timeupdate", time); video.removeEventListener("play", play); video.removeEventListener("pause", pause); video.removeEventListener("ended", pause); video.removeEventListener("error", failed); document.removeEventListener("fullscreenchange", onFullscreenChange); };
+  }, [src]);
+  const toggle = async () => { const video = ref.current; if (!video || error) return; try { if (video.paused) await video.play(); else video.pause(); } catch { setError(true); } };
+  const seek = event => { const next = Number(event.target.value) || 0; if (ref.current) ref.current.currentTime = next; setCurrentTime(next); };
+  const progress = duration ? Math.min(100, Math.max(0, currentTime / duration * 100)) : 0;
+  const changeRate = event => { const next = Number(event.target.value) || 1; setRate(next); if (ref.current) ref.current.playbackRate = next; };
+  const toggleFullscreen = async event => { event.stopPropagation(); const host = ref.current?.closest?.(".media-player-video"); try { if (document.fullscreenElement) await document.exitFullscreen?.(); else if (host?.requestFullscreen) await host.requestFullscreen(); else await ref.current?.webkitEnterFullscreen?.(); } catch {} };
+  return h("div", { className: `media-player media-player-video ${className} ${playing ? "is-playing" : ""} ${error ? "has-error" : ""}` },
+    h("video", { ref, className: "media-native", src, poster: poster || undefined, preload: "none", playsInline: true, onClick: toggle, "aria-label": label }),
+    h("input", { className: "video-progress", type: "range", min: 0, max: duration || 0, step: 0.1, value: Math.min(currentTime, duration || 0), onChange: seek, onClick: event => event.stopPropagation(), style: { "--video-progress": `${progress}%` }, "aria-label": "视频进度" }),
+    h("button", { type: "button", className: "video-center-play", onClick: toggle, disabled: error, "aria-label": playing ? "暂停视频" : "播放视频" }, h(Icon, { name: playing ? "pause" : "play", size: 25 })),
+    h("div", { className: "video-top-controls" }, h("select", { className: "video-rate", value: rate, onChange: event => { event.stopPropagation(); changeRate(event); }, onClick: event => event.stopPropagation(), "aria-label": "播放速度" }, [0.75, 1, 1.25, 1.5, 2].map(value => h("option", { key: value, value }, `${value}×`))), h("button", { type: "button", className: "video-fullscreen", onClick: toggleFullscreen, "aria-label": fullscreen ? "退出全屏" : "全屏", title: fullscreen ? "退出全屏" : "全屏" }, h(Icon, { name: fullscreen ? "fullscreen" : "fullscreen", size: 16 }))),
+    h("div", { className: "media-video-meta", "aria-hidden": "true" }, h("span", { className: "media-file-label", title: label }, label), size > 0 && h("span", { className: "media-file-size" }, formatFileSize(size))),
+    error && h("div", { className: "media-player-error", role: "status" }, "媒体加载失败", h("button", { type: "button", className: "media-retry-button", onClick: event => { event.stopPropagation(); setError(false); try { ref.current?.load?.(); } catch {} } }, "重试"))
+  );
+}
+
+function MediaPlayer({ src, poster, type = "video", className = "", label = "媒体文件", size = 0 }) {
+  if (type === "audio") return h(AudioMessagePlayer, { src, className, label });
+  if (type === "video") return h(VideoMessagePlayer, { src, poster, className, label, size });
+  const ref = useRef(null);
+  const playerRef = useRef(null);
+  const [playing, setPlaying] = useState(false);
+  const [error, setError] = useState(false);
+  useEffect(() => {
+    const media = ref.current;
+    if (!media) return;
+    const player = new Plyr(media, {
+      fullscreen: { enabled: true, fallback: true, iosNative: false },
+      controls: ["play", "progress", "current-time", "mute", "volume", "settings", "fullscreen"],
+      settings: ["speed"],
+      speed: { selected: 1, options: [0.75, 1, 1.25, 1.5, 2] },
+      tooltips: { controls: true, seek: true },
+      keyboard: { focused: true, global: false },
+      i18n: { play: "播放", pause: "暂停", seek: "跳转", seekLabel: "跳转 { seektime } 秒", played: "已播放", buffered: "已缓冲", currentTime: "当前时间", duration: "总时长", volume: "音量", mute: "静音", unmute: "取消静音", settings: "设置", speed: "倍速", normal: "正常", enterFullscreen: "全屏", exitFullscreen: "退出全屏", download: "下载" }
+    });
+    playerRef.current = player;
+    const loaded = () => setError(false);
+    const play = () => setPlaying(true);
+    const pause = () => setPlaying(false);
+    const failed = () => { setPlaying(false); setError(true); };
+    let fullscreenElement = null;
+    const clearFullscreenStyles = element => {
+      if (!element) return;
+      element.classList.remove("orbit-native-fullscreen");
+      ["width", "height", "max-width", "max-height", "object-fit"].forEach(name => element.style.removeProperty(name));
+    };
+    const fullscreenChanged = () => {
+      clearFullscreenStyles(fullscreenElement);
+      fullscreenElement = document.fullscreenElement || null;
+      if (!fullscreenElement) return;
+      fullscreenElement.classList.add("orbit-native-fullscreen");
+      fullscreenElement.style.setProperty("width", "100vw", "important");
+      fullscreenElement.style.setProperty("height", "100vh", "important");
+      fullscreenElement.style.setProperty("max-width", "none", "important");
+      fullscreenElement.style.setProperty("max-height", "none", "important");
+      if (fullscreenElement.tagName === "VIDEO") fullscreenElement.style.setProperty("object-fit", "contain", "important");
+    };
+    media.addEventListener("loadedmetadata", loaded);
+    media.addEventListener("play", play);
+    media.addEventListener("pause", pause);
+    media.addEventListener("error", failed);
+    document.addEventListener("fullscreenchange", fullscreenChanged);
+    return () => {
+      media.removeEventListener("loadedmetadata", loaded);
+      media.removeEventListener("play", play);
+      media.removeEventListener("pause", pause);
+      media.removeEventListener("error", failed);
+      document.removeEventListener("fullscreenchange", fullscreenChanged);
+      clearFullscreenStyles(fullscreenElement);
+      player.destroy();
+      playerRef.current = null;
+    };
+  }, [src]);
+  const mediaNode = type === "video"
+    ? h("video", { ref, className: `media-native ${className}`, src, preload: "metadata", playsInline: true })
+    : h("audio", { ref, className: `media-native ${className}`, src, preload: "metadata" });
+  return h("div", { className: `media-player media-player-${type} ${playing ? "is-playing" : ""} ${error ? "has-error" : ""}` },
+    h("div", { className: "media-video-meta", "aria-hidden": "true" }, h("span", { className: "media-file-label", title: label }, label), size > 0 && h("span", { className: "media-file-size" }, formatFileSize(size))),
+    mediaNode,
+    error && h("div", { className: "media-player-error", role: "status" }, "媒体加载失败，请重试或下载原文件")
+  );
+}
+
+function formatMediaTime(value) {
+  const seconds = Number.isFinite(Number(value)) && Number(value) >= 0 ? Math.floor(Number(value)) : 0;
+  const minutes = Math.floor(seconds / 60);
+  return `${String(minutes).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function formatFileSize(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  const power = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const amount = bytes / (1024 ** power);
+  return `${amount >= 10 || power === 0 ? Math.round(amount) : amount.toFixed(1)} ${units[power]}`;
+}
+
+function AudioMessagePlayer({ src, className = "", label = "音频文件" }) {
+  const ref = useRef(null);
+  const [duration, setDuration] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [rate, setRate] = useState(1);
+  const [error, setError] = useState(false);
+  const waveform = [10, 18, 26, 14, 22, 32, 20, 13, 28, 36, 18, 24, 31, 16, 12, 23, 34, 20, 15, 27, 37, 22, 14, 25, 31, 18, 12, 21, 29, 16, 24, 34, 19, 13, 27, 35, 23, 17, 28, 20];
+
+  useEffect(() => {
+    const audio = ref.current;
+    if (!audio) return undefined;
+    const loaded = () => { setDuration(Number.isFinite(audio.duration) ? audio.duration : 0); setError(false); };
+    const time = () => setCurrentTime(audio.currentTime || 0);
+    const play = () => setPlaying(true);
+    const pause = () => setPlaying(false);
+    const failed = () => { setPlaying(false); setError(true); };
+    audio.addEventListener("loadedmetadata", loaded);
+    audio.addEventListener("timeupdate", time);
+    audio.addEventListener("play", play);
+    audio.addEventListener("pause", pause);
+    audio.addEventListener("ended", pause);
+    audio.addEventListener("error", failed);
+    audio.load();
+    return () => {
+      audio.pause();
+      audio.removeEventListener("loadedmetadata", loaded);
+      audio.removeEventListener("timeupdate", time);
+      audio.removeEventListener("play", play);
+      audio.removeEventListener("pause", pause);
+      audio.removeEventListener("ended", pause);
+      audio.removeEventListener("error", failed);
+    };
+  }, [src]);
+
+  const togglePlayback = async () => {
+    const audio = ref.current;
+    if (!audio || error) return;
+    try {
+      if (audio.paused) await audio.play();
+      else audio.pause();
+    } catch { setError(true); setPlaying(false); }
+  };
+  const seek = event => {
+    const next = Number(event.target.value) || 0;
+    if (ref.current) ref.current.currentTime = next;
+    setCurrentTime(next);
+  };
+  const seekWaveform = event => {
+    const audio = ref.current;
+    if (!audio || !Number.isFinite(audio.duration) || audio.duration <= 0) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const ratio = rect.width > 0 ? Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)) : 0;
+    const next = ratio * audio.duration;
+    audio.currentTime = next;
+    setCurrentTime(next);
+  };
+  const changeRate = event => {
+    const next = Number(event.target.value) || 1;
+    setRate(next);
+    if (ref.current) ref.current.playbackRate = next;
+  };
+  const progress = duration ? Math.min(100, Math.max(0, currentTime / duration * 100)) : 0;
+  const playedBars = Math.round(progress / 100 * waveform.length);
+  return h("div", { className: `media-player media-player-audio ${className} ${playing ? "is-playing" : ""} ${error ? "has-error" : ""}`, role: "group", "aria-label": label },
+    h("audio", { ref, className: "media-native audio-native", src, preload: "metadata" }),
+    h("div", { className: "audio-player-main" },
+      h("button", { type: "button", className: "audio-play-button", onClick: togglePlayback, disabled: error, "aria-label": playing ? "暂停音频" : "播放音频" }, h(Icon, { name: playing ? "pause" : "play", size: 17 })),
+      h("div", { className: "audio-player-body" },
+        h("div", { className: "audio-player-meta" }, h("span", { className: "audio-player-title", title: label }, label), h("span", { className: "audio-player-time" }, duration ? `${Math.ceil(duration)}″` : "--″")),
+        h("div", { className: "audio-waveform", "aria-hidden": "true", onClick: seekWaveform, title: "点击波形跳转播放" }, waveform.map((height, index) => h("i", { key: index, className: index < playedBars ? "is-played" : "", style: { height: `${height}px`, animationDelay: `${(index % 7) * -0.1}s` } }))),
+        h("input", { className: "audio-progress", type: "range", min: 0, max: duration || 0, step: 0.1, value: Math.min(currentTime, duration || 0), onChange: seek, style: { "--audio-progress": `${progress}%` }, "aria-label": "音频进度" })
+      ),
+      h("select", { className: "audio-rate", value: rate, onChange: changeRate, "aria-label": "播放速度" }, [0.75, 1, 1.25, 1.5, 2].map(value => h("option", { key: value, value }, `${value}×`)))
+    ),
+    error && h("div", { className: "media-player-error", role: "status" }, "媒体加载失败，请重试或下载原文件")
+  );
+}
+
+function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onMention, onTogglePinMessage, pinnedEventIds = [], selecting, selected, onSelect, grouped = item?.grouped || false }) {
+  const [contextMenu, setContextMenu] = useState(null);
+  const [viewer, setViewer] = useState(null);
+  const [documentModal, setDocumentModal] = useState(null);
+  const [documentPreview, setDocumentPreview] = useState({ status: "idle", html: "", text: "", url: "", error: "" });
+  const [officeDirty, setOfficeDirty] = useState(false);
+  const [officeSaving, setOfficeSaving] = useState(false);
+  const officeFrameRef = useRef(null);
+  const officeRequestIdRef = useRef("");
+  const officeSaveIdRef = useRef("");
+  const officeDirtyRef = useRef(false);
+  const officeSavingRef = useRef(false);
+  const closeAfterOfficeSaveRef = useRef(false);
+  useEffect(() => { officeDirtyRef.current = officeDirty; }, [officeDirty]);
+  useEffect(() => { officeSavingRef.current = officeSaving; }, [officeSaving]);
+  const requestOfficeSave = () => {
+    const frame = officeFrameRef.current;
+    if (!frame?.contentWindow || !officeRequestIdRef.current || officeSavingRef.current || !officeDirtyRef.current) return false;
+    const saveId = `save-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    officeSaveIdRef.current = saveId;
+    officeSavingRef.current = true;
+    setOfficeSaving(true);
+    const message = { type: "xinghuo-office-save", requestId: officeRequestIdRef.current, saveId };
+    try { frame.contentWindow.postMessage(message, new URL(orbitOfficeEditorUrl, location.href).origin); } catch { try { frame.contentWindow.postMessage(message, "*"); } catch { setOfficeSaving(false); Toast.error("Office 编辑器连接失败"); } }
+    return true;
+  };
+  const closeDocument = () => {
+    if (officeDirtyRef.current) {
+      if (window.confirm("文件有未保存的修改。点击“确定”先保存，点击“取消”放弃修改并关闭。")) { closeAfterOfficeSaveRef.current = true; if (!requestOfficeSave()) closeAfterOfficeSaveRef.current = false; return; }
+      officeDirtyRef.current = false;
+      officeSavingRef.current = false;
+      closeAfterOfficeSaveRef.current = false;
+      setOfficeDirty(false);
+      setOfficeSaving(false);
+    }
+    setDocumentModal(null);
+  };
+  useEffect(() => { if (!contextMenu) { document.querySelector(".context-reaction-picker")?.remove(); document.querySelector(".context-reaction-preview")?.remove(); return; } const close = event => { if (event.target?.closest?.(".context-reaction-picker, .message-context-reactions")) return; setContextMenu(null); }; document.addEventListener("click", close); return () => document.removeEventListener("click", close); }, [contextMenu]);
+  // Right-clicking another message should replace the current menu instead of
+  // leaving several fixed menus stacked over the timeline.
+  useEffect(() => {
+    const closeOnSecondaryPress = event => { if (event.button === 2) setContextMenu(null); };
+    document.addEventListener("mousedown", closeOnSecondaryPress);
+    return () => document.removeEventListener("mousedown", closeOnSecondaryPress);
+  }, []);
+  // Polish the context menu after it mounts so the actions stay in the same
+  // order on every message, while keeping the message row itself uncluttered.
+  useEffect(() => {
+    if (!contextMenu || !item.id) return;
+    const row = document.getElementById(`event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`);
+    const menu = row?.querySelector(".message-context-menu");
+    if (!menu || menu.dataset.orbitActionsReady === "1") return;
+    const buttons = [...menu.querySelectorAll(":scope > button")];
+    const find = text => buttons.find(button => String(button.textContent || "").trim() === text);
+    const copy = find("复制消息"); const forward = find("转发"); const thread = find("在线程中回复"); const quote = find("回复");
+    const pin = buttons.find(button => /置顶消息|取消置顶消息/.test(String(button.textContent || "")));
+    const edit = find("编辑"); const redact = find("撤回");
+    buttons.find(button => String(button.textContent || "").includes("查看回应详情"))?.remove();
+    const rename = (button, text, action) => { if (!button) return; button.textContent = text; button.dataset.action = action; };
+    rename(copy, "复制", "copy"); rename(edit, "编辑", "edit"); rename(forward, "转发", "forward"); rename(thread, "子消息", "thread"); rename(quote, "回复", "quote"); rename(pin, /取消/.test(pin?.textContent || "") ? "取消置顶" : "置顶", "pin"); rename(redact, "撤回", "redact");
+    const multi = document.createElement("button"); multi.type = "button"; multi.textContent = "多选"; multi.dataset.action = "select";
+      multi.addEventListener("click", event => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("orbit:start-message-selecting")); setContextMenu(null); });
+    // Keep the context actions in the same order as the product menu:
+    // copy, edit, forward, reply, multi-select, child messages, pin, redact.
+    menu.append(...[copy, edit, forward, quote, multi, thread, pin, redact].filter(Boolean));
+    // Use the light, single-stroke glyphs from the reference menu.  These are
+    // deliberately inline SVGs so they stay crisp at every display scale and
+    // do not depend on an icon font being installed on the host machine.
+    const paths = {
+      copy: "M8 8h11v11H8zM5 16H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v1",
+      edit: "M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z",
+      // Curved send/forward arrow (the same silhouette used by the reference).
+      forward: "M4 17c0-5 3-8 8-8h5m-4-4 4 4-4 4",
+      // Speech bubble with two text strokes for a reply action.
+      quote: "M12 3a9 9 0 1 0 9 9 9 9 0 0 0-9-9ZM7 10h10M7 14h6",
+      thread: "M4 6h16M4 12h11M4 18h7",
+      // A compact list/check glyph reads as multi-select at 16–18 px.
+      select: "M4 6h2M4 12h2M4 18h2M9 6h11M9 12h8M9 18h6",
+      pin: "M9 3h6l-1 6 4 3v2h-5v7h-2v-7H6v-2l4-3z",
+      redact: "M6 7h12M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v6m4-6v6"
+    };
+    [...menu.querySelectorAll(":scope > button[data-action]")].forEach(button => { const d = paths[button.dataset.action]; if (!d) return; const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg"); svg.classList.add("context-menu-icon"); svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("aria-hidden", "true"); const path = document.createElementNS("http://www.w3.org/2000/svg", "path"); path.setAttribute("d", d); svg.append(path); button.prepend(svg); });
+    if (!row.querySelector(".message-context-reactions")) {
+      const bar = document.createElement("div"); bar.className = "message-context-reactions"; ["👍", "😂", "❤️", "😮", "😢", "👏"].forEach(key => { const button = document.createElement("button"); button.type = "button"; button.textContent = key; button.title = `回应：${key}`; button.addEventListener("click", event => { event.stopPropagation(); onReact?.(item, key); setContextMenu(null); }); bar.append(button); });
+      const more = document.createElement("button"); more.type = "button"; more.className = "context-reaction-more"; more.textContent = "+"; more.title = "更多表情或文字回应";
+      more.addEventListener("click", async event => { event.stopPropagation(); let panel = document.querySelector(".context-reaction-picker"); if (panel) { panel.remove(); return; }
+        panel = document.createElement("div"); panel.className = "context-reaction-picker"; panel.innerHTML = '<input class="context-reaction-input" placeholder="搜索表情包或输入文字回应" /><div class="context-reaction-grid">正在加载表情…</div>'; panel.addEventListener("click", e => e.stopPropagation()); panel.addEventListener("mousedown", e => e.stopPropagation()); document.body.append(panel);
+        const rect = bar.getBoundingClientRect(); panel.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 300))}px`; panel.style.top = `${Math.max(8, rect.bottom + 6)}px`;
+        const input = panel.querySelector(".context-reaction-input"); const grid = panel.querySelector(".context-reaction-grid"); const sendText = () => { const value = input.value.trim(); if (!value) return; onReact?.(item, value); panel.remove(); setContextMenu(null); }; input.addEventListener("keydown", e => { if (e.key === "Enter") sendText(); }); input.focus();
+        try { const items = await ensureEmojiCatalog(); if (!grid || !panel.isConnected) return; const render = () => { const query = input.value.trim().toLowerCase(); grid.textContent = ""; const filtered = (items || []).filter(emoji => !query || `${emoji.name} ${(emoji.keywords || []).join(" ")}`.toLowerCase().includes(query)); if (!filtered.length) { grid.textContent = "没有匹配的表情包，按 Enter 发送文字回应"; return; } filtered.forEach(emoji => { const button = document.createElement("button"); button.type = "button"; button.title = `回应：${emoji.name}`; button.innerHTML = `<img src="${assetRequestUrl(emoji.thumbUrl || emoji.url)}" alt="${emoji.name}">`; button.addEventListener("mouseenter", () => { let preview = document.querySelector(".context-reaction-preview"); if (!preview) { preview = document.createElement("div"); preview.className = "context-reaction-preview"; document.body.append(preview); } preview.innerHTML = `<img src="${assetRequestUrl(emoji.url || emoji.thumbUrl)}" alt="${emoji.name}"><strong>${emoji.name}</strong>`; const rect = button.getBoundingClientRect(); const width = 150; const height = 170; preview.style.left = `${Math.max(8, Math.min(rect.right + 8, window.innerWidth - width - 8))}px`; preview.style.top = `${Math.max(8, Math.min(rect.top, window.innerHeight - height - 8))}px`; }); button.addEventListener("mouseleave", () => document.querySelector(".context-reaction-preview")?.remove()); button.addEventListener("click", () => { onReact?.(item, `:${emoji.name}:`); document.querySelector(".context-reaction-preview")?.remove(); panel.remove(); setContextMenu(null); }); grid.append(button); }); }; input.addEventListener("input", render); render(); } catch { if (grid) grid.textContent = "表情加载失败，请直接输入文字回应"; }
+      }); bar.append(more); row.append(bar);
+    }
+    const bar = row.querySelector(".message-context-reactions");
+    if (bar) { bar.style.position = "fixed"; bar.style.zIndex = "2001"; bar.style.left = menu.style.left; bar.style.top = `${Math.max(8, (parseFloat(menu.style.top) || contextMenu.y) - 43)}px`; }
+    menu.dataset.orbitActionsReady = "1";
+  }, [contextMenu, item.id, onReact]);
+  useEffect(() => { if (!item.threadRoot || !item.id) return; const row = document.getElementById(`event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`); const reference = row?.querySelector(".thread-reference"); if (!reference) return; const open = event => { event.stopPropagation(); onThread?.(item); }; reference.setAttribute("role", "button"); reference.setAttribute("tabindex", "0"); reference.addEventListener("click", open); return () => reference.removeEventListener("click", open); }, [item.id, item.threadRoot, onThread]);
+  useEffect(() => {
+    if (!item.id || !item.handle) return;
+    const row = document.getElementById(`event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`);
+    const author = row?.querySelector(".message-author-name");
+    if (!author) return;
+    const rememberMention = () => {
+      const roomId = item.roomId || window.orbitActiveRoomId;
+      const key = roomId || "*";
+      const pending = window.orbitPendingMentions || {};
+      const list = pending[key] || [];
+      if (!list.some(entry => entry.userId === item.handle)) pending[key] = [...list, { userId: item.handle, name: item.author }];
+      window.orbitPendingMentions = pending;
+    };
+    author.addEventListener("click", rememberMention);
+    return () => author.removeEventListener("click", rememberMention);
+  }, [item.id, item.handle, item.author, client]);
+  // Add the two actions that are not part of the static React toolbar. The
+  // remaining controls are identified by semantic classes, never by position.
+  useEffect(() => {
+    if (!item.id) return;
+    const row = document.getElementById(`event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`);
+    const actions = row?.querySelector(".message-actions");
+    if (!actions) return;
+    // Keep the toolbar in the DOM and let the stylesheet reveal it on hover
+    // or keyboard focus.  An inline `display:none !important` here prevents
+    // the hover toolbar from ever becoming visible (and also makes the
+    // controls inaccessible to keyboard users).
+    actions.style.removeProperty("display");
+    const stack = row?.querySelector(".message-content-stack");
+    const positionToolbar = () => {
+      if (!stack || !actions) return;
+      const target = stack.querySelector(".message-bubble, .attachment-wrap") || stack;
+      const stackRect = stack.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      const actionHeight = actions.getBoundingClientRect().height || 25;
+      // Align the toolbar's bottom edge with the main message payload. This
+      // keeps tall image/file messages from placing the controls in mid-air,
+      // while still leaving the reaction row below the payload untouched.
+      const top = Math.max(0, targetRect.bottom - stackRect.top - actionHeight);
+      actions.style.setProperty("--orbit-actions-top", `${top}px`);
+    };
+    const positionFrame = requestAnimationFrame(positionToolbar);
+    const resizeObserver = typeof ResizeObserver === "function" && stack ? new ResizeObserver(positionToolbar) : null;
+    resizeObserver?.observe(stack);
+    const allButtons = [...actions.querySelectorAll("button")];
+    const byText = value => allButtons.find(button => String(button.textContent || "").trim() === value);
+    const reactionButton = actions.querySelector(".message-action-reaction") || allButtons.find(button => /😊|☺/.test(button.textContent || ""));
+    // ReactionPicker now owns a plain button. Keep that button as a direct
+    // child of the toolbar; wrapper based selectors can make the face escape
+    // the pill when React reconciles the action list.
+    const reply = actions.querySelector(".message-reply-action") || byText("回复");
+    const thread = actions.querySelector(".message-thread-action") || byText("线程");
+    const edit = actions.querySelector(".message-edit-action") || byText("编辑");
+    const redact = actions.querySelector(".message-redact-action") || byText("撤回");
+    reactionButton?.classList.add("message-reaction-action"); reactionButton && (reactionButton.title = "选择回应");
+    reply?.classList.add("message-reply-action"); reply && (reply.title = "回复");
+    thread?.classList.add("message-thread-action"); thread && (thread.title = "在线程中回复");
+    edit?.classList.add("message-edit-action"); edit && (edit.title = "编辑");
+    redact?.classList.add("message-redact-action"); redact && (redact.title = "撤回");
+    const iconPaths = {
+      // Forward: clean right-pointing arrow.
+      forward: "M4 12h16M14 7l5 5-5 5",
+       // Reply: compact outlined chat bubble, matching the hover affordance.
+       reply: "M6 5h12a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H11l-5 4v-4H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2ZM8 9h8M8 12h5",
+      thread: "M5 4.5h14A1.5 1.5 0 0 1 20.5 6v10A1.5 1.5 0 0 1 19 17.5H12l-4 3v-3H5A1.5 1.5 0 0 1 3.5 16V6A1.5 1.5 0 0 1 5 4.5ZM12 8v6M9 11h6",
+      edit: "M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z",
+       more: "M5 12h.01M12 12h.01M19 12h.01",
+    };
+    const applyIcon = (button, name) => {
+      if (!button || !iconPaths[name]) return;
+      button.classList.add("message-svg-action");
+      button.textContent = "";
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("aria-hidden", "true");
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", iconPaths[name]); svg.appendChild(path); button.appendChild(svg);
+    };
+    applyIcon(reply, "reply"); applyIcon(thread, "thread"); applyIcon(edit, "edit");
+    // DingTalk-style order: reaction, reply, more. Forwarding remains in the
+    // context menu opened by the more button, matching the requested flow.
+    // The reaction button is already the first JSX child. Only append the
+    // secondary controls so React keeps one stable three-button toolbar.
+    [reply, thread].filter(Boolean).forEach(button => actions.appendChild(button));
+    if (redact) redact.style.display = "none";
+    let more = actions.querySelector(".message-more-action");
+    if (!more) {
+      more = document.createElement("button");
+      more.type = "button";
+      more.className = "message-more-action";
+      more.title = "更多";
+      more.setAttribute("aria-label", "更多");
+      more.textContent = "更多";
+      more.addEventListener("click", event => { event.stopPropagation(); const rect = more.getBoundingClientRect(); setContextMenu({ x: rect.left, y: rect.bottom + 4 }); });
+    }
+    applyIcon(more, "more");
+    // The reference layout keeps edit immediately before the overflow menu.
+    if (edit) actions.appendChild(edit);
+    actions.appendChild(more);
+    return () => { cancelAnimationFrame(positionFrame); resizeObserver?.disconnect(); more?.remove(); if (redact) redact.style.display = ""; };
+  }, [item.id, item.isMe, onForward]);
+  const rawUrl = item.attachment?.url || item.attachment?.file?.url;
+  const attachmentInfo = item.attachment?.info || {};
+  const thumbnailFile = attachmentInfo.thumbnail_file || item.attachment?.file?.thumbnail_file || null;
+  const thumbnailRawUrl = attachmentInfo.thumbnail_url || thumbnailFile?.url || (item.attachment?.type === "m.image" && rawUrl?.startsWith("mxc://") && !item.attachment?.file?.key ? client?.mxcUrlToHttp?.(rawUrl, 800, 600, "scale", false, true, true) : null);
+  const [imageOriginalRequested, setImageOriginalRequested] = useState(false);
+  useEffect(() => setImageOriginalRequested(false), [rawUrl, item.attachment?.type]);
+  const deferImageOriginal = item.attachment?.type === "m.image" && Boolean(thumbnailRawUrl) && !imageOriginalRequested;
+  const deferVideoOriginal = item.attachment?.type === "m.video" && Boolean(rawUrl) && !item.attachment?.file?.key;
+  const asset = useMatrixAsset(client, (deferImageOriginal || deferVideoOriginal) ? null : rawUrl, undefined, undefined, undefined, item.attachment?.file || null);
+  const thumbnailAsset = useMatrixAsset(client, thumbnailRawUrl, 800, 600, "scale", thumbnailFile || null);
+  useEffect(() => {
+    if (item.attachment?.type !== "m.image" || !thumbnailAsset.src || imageOriginalRequested) return undefined;
+    const timer = setTimeout(() => setImageOriginalRequested(true), 80);
+    return () => clearTimeout(timer);
+  }, [item.attachment?.type, thumbnailAsset.src, imageOriginalRequested]);
+  if (item.type === "empty") return h("div", { className: "empty-messages" }, "☁", h("div", null, item.label));
+  const directVideoUrl = deferVideoOriginal ? mediaRequestUrl(client, client?.mxcUrlToHttp?.(rawUrl, undefined, undefined, undefined, false, true, true) || matrixDownloadFallbackUrl(client, rawUrl)) : null;
+  const fileUrl = directVideoUrl || asset.src;
+  const thumbUrl = thumbnailAsset.src;
+  const resolvedAssetUrl = asset.url || (rawUrl ? mediaRequestUrl(client, rawUrl) : null);
+  const openImageViewer = clickedSrc => {
+    const gallery = [...document.querySelectorAll(".message-scroll .message-image")].map(image => ({ src: image.currentSrc || image.src, alt: image.alt || "图片" })).filter(image => image.src);
+    const target = fileUrl || clickedSrc || thumbUrl;
+    const index = Math.max(0, gallery.findIndex(image => image.src === target));
+    setViewer({ src: target, alt: item.attachment?.name || "图片", gallery, index, onNavigate: (next, nextIndex) => setViewer(current => ({ ...current, src: next.src, alt: next.alt, index: nextIndex })) });
+  };
+  const emojiRow = item.emojiItems?.length && fileUrl ? h(EmojiRowMedia, { items: item.emojiItems, client, fallback: fileUrl, onOpen: (src, alt) => setViewer({ src, alt }) }) : null;
+  const reactions = Object.entries(item.reactions || {});
+  const imageMedia = item.attachment?.type === "m.image" && (fileUrl || thumbUrl) ? h("div", { className: "message-image-card" },
+    h(ProgressiveImage, { className: `message-image ${item.attachment.emoji ? "message-emoji-image" : ""} ${item.attachment.sticker ? "message-sticker" : ""}`, thumbSrc: thumbUrl, src: fileUrl, alt: item.attachment.name || "图片", onRequestOriginal: () => setImageOriginalRequested(true), onClick: openImageViewer }),
+    !item.attachment.emoji && !item.attachment.sticker && h("div", { className: "message-image-overlay", "aria-hidden": "true" },
+      h("span", { className: "message-image-name", title: item.attachment.name || "图片" }, shortenAttachmentName(item.attachment.name || "图片", 26)),
+      h("span", { className: "message-image-meta" }, formatAttachmentSize(item.attachment.info?.size || item.attachment.file?.size) || "图片", h("i", null, item.isMe ? "已发送" : "已接收"))
+    )
+  ) : null;
+  const media = item.attachment && (imageMedia || fileUrl) && (imageMedia || item.attachment.type === "m.video" ? imageMedia || h(MediaPlayer, { type: "video", className: "message-video", src: fileUrl, poster: thumbUrl, label: item.attachment.name || "视频", size: item.attachment.info?.size || item.attachment.file?.size || 0 }) : item.attachment.type === "m.audio" ? h(MediaPlayer, { type: "audio", className: "message-audio", src: fileUrl, label: item.attachment.name || "音频" }) : null);
+  const fetchAttachmentBlob = async () => { if (!resolvedAssetUrl && !rawUrl) throw new Error("附件地址不可用"); const token = client?.getAccessToken?.(); const candidates = mediaRequestCandidates(client, rawUrl, resolvedAssetUrl); let lastError = null; for (const candidate of candidates) { try { const response = await fetch(candidate, { cache: "no-store", headers: token ? { Authorization: `Bearer ${token}` } : undefined }); if (response.ok) { const encryptedBuffer = await response.arrayBuffer(); const plainBuffer = await decryptMatrixBuffer(encryptedBuffer, item.attachment?.file); const blob = new Blob([plainBuffer], { type: item.attachment?.file?.mimetype || item.attachment?.info?.mimetype || response.headers.get("content-type") || "application/octet-stream" }); if (blob.size > 0) return blob; } lastError = new Error(`媒体请求失败（${response.status}）`); } catch (error) { lastError = error; } } throw lastError || new Error("媒体请求失败"); };
+  const openOriginal = async e => { e?.preventDefault?.(); if (documentAttachment) return setDocumentModal("preview"); try { const blob = await fetchAttachmentBlob(); const opened = URL.createObjectURL(blob); window.open(opened, "_blank", "noopener,noreferrer"); setTimeout(() => URL.revokeObjectURL(opened), 60000); } catch { Toast.error("原文件打开失败，请稍后重试"); } };
+  const downloadAttachment = async e => { e?.preventDefault?.(); try { const blob = await fetchAttachmentBlob(); const href = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = href; link.download = item.attachment?.name || "附件"; document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(href), 60000); } catch { Toast.error("文件下载失败，请稍后重试"); } };
+  const openOfficeEditor = async e => { e?.preventDefault?.(); setDocumentModal("edit"); };
+  const documentAttachment = item.attachment?.type === "m.file" && item.attachment?.name;
+  const docKind = documentAttachment ? attachmentKind(item.attachment.name) : null;
+  const isTextAttachment = Boolean(documentAttachment && ["txt", "log", "md", "json", "xml", "csv"].includes(docKind?.ext));
+  // All formats handled by the Office bridge use the same iframe protocol.
+  // PDF is preview-only; the editor action remains limited to editable Office
+  // documents so its card never exposes a misleading edit button.
+  const isOfficeAttachment = Boolean(documentAttachment && ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "ods"].includes(docKind?.ext));
+  const isOfficeEditableAttachment = Boolean(isOfficeAttachment && ["doc", "docx", "xls", "xlsx", "ppt", "pptx", "ods"].includes(docKind?.ext));
+  useEffect(() => {
+    if (!documentModal || !documentAttachment || isOfficeAttachment || !asset.url) return;
+    let active = true; let objectUrl = "";
+    const kind = attachmentKind(item.attachment.name);
+    setDocumentPreview({ status: "loading", html: "", text: "", url: "", error: "" });
+    (async () => {
+      try {
+        if (kind.ext === "pdf") {
+          const pdfBlob = await fetchAttachmentBlob();
+          objectUrl = URL.createObjectURL(new Blob([pdfBlob], { type: "application/pdf" }));
+          if (active) setDocumentPreview({ status: "ready", html: "", text: "", url: objectUrl, error: "" });
+          return;
+        }
+        const blob = await fetchAttachmentBlob();
+        if (["txt", "log", "md", "json", "xml", "csv"].includes(kind.ext)) {
+          const bytes = new Uint8Array(await blob.arrayBuffer());
+          // Some servers return an Office ZIP with a misleading .txt name.
+          // Recognise the ZIP signature before decoding so it does not appear
+          // as binary garbage in the text viewer.
+          const looksLikeZip = bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04;
+          if (looksLikeZip) {
+            const mammothModule = await import("https://esm.sh/mammoth@1.8.0?bundle");
+            const mammoth = mammothModule.default || mammothModule;
+            const result = await mammoth.convertToHtml({ arrayBuffer: bytes.buffer });
+            if (active) setDocumentPreview({ status: "ready", html: result.value || "<p>文档没有可显示的文字内容。</p>", text: "", url: "", error: "" });
+          } else if (active) {
+            if (kind.ext === "json") {
+              try { setDocumentPreview({ status: "ready", html: "", text: JSON.stringify(JSON.parse(await decodeTextAttachment(blob)), null, 2), url: "", error: "" }); }
+              catch { setDocumentPreview({ status: "ready", html: "", text: await decodeTextAttachment(blob), url: "", error: "" }); }
+            } else setDocumentPreview({ status: "ready", html: "", text: await decodeTextAttachment(blob), url: "", error: "" });
+          }
+          return;
+        }
+        if (["doc", "docx", "odt", "rtf"].includes(kind.ext)) {
+          const mammothModule = await import("https://esm.sh/mammoth@1.8.0?bundle");
+          const mammoth = mammothModule.default || mammothModule;
+          if (typeof mammoth.convertToHtml !== "function") throw new Error("DOCX 解析模块加载失败");
+          const result = await mammoth.convertToHtml({ arrayBuffer: await blob.arrayBuffer() });
+          if (active) setDocumentPreview({ status: "ready", html: result.value || "<p>文档没有可显示的文字内容。</p>", text: "", url: "", error: "" });
+          return;
+        }
+        // Browser-native rendering is not available for PPTX/XLSX. Keep the
+        // file inside the modal and offer an explicit Office hand-off.
+        objectUrl = URL.createObjectURL(blob);
+        if (active) setDocumentPreview({ status: "unsupported", html: "", text: "", url: objectUrl, error: "当前浏览器无法直接排版此 Office 格式" });
+      } catch (error) { if (active) setDocumentPreview({ status: "error", html: "", text: "", url: "", error: error?.message || "文档解析失败" }); }
+    })();
+    return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [documentModal, documentAttachment, isOfficeAttachment, asset.url]);
+  useEffect(() => {
+    if (!documentModal || !isOfficeAttachment || !asset.url) return;
+    let active = true;
+    let removeOfficeListener = () => {};
+    const requestId = `orbit-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const officeOrigin = new URL(orbitOfficeEditorUrl, location.href).origin;
+    const params = new URLSearchParams({ embed: "1", editing: documentModal === "edit" ? "1" : "0", requestId, parentOrigin: location.origin });
+    const iframeUrl = `${orbitOfficeEditorUrl}?${params.toString()}`;
+    const open = async () => {
+      try {
+        const blob = await fetchAttachmentBlob();
+        // Let the Office bridge handle password-protected documents. It has
+        // the same conversion/decryption pipeline as its standalone editor;
+        // pre-decrypting here caused valid passwords to be rejected before the
+        // bridge ever received the file.
+        const buffer = await blob.arrayBuffer();
+        if (!active) return;
+        const host = document.querySelector(".document-modal");
+        const placeholder = host?.querySelector(".document-modal-loading");
+        if (!placeholder) return;
+        const frame = document.createElement("iframe");
+        frame.className = "document-modal-frame office-editor-frame";
+        frame.title = item.attachment?.name || "Office 在线编辑器";
+        frame.src = iframeUrl;
+        officeFrameRef.current = frame;
+        officeRequestIdRef.current = requestId;
+        officeSaveIdRef.current = "";
+        placeholder.replaceWith(frame);
+        let sent = false;
+        let password = "";
+        let passwordAttempts = 0;
+        const postOfficeMessage = (payload, transfer) => {
+          if (!frame.contentWindow) return false;
+          try { frame.contentWindow?.postMessage(payload, officeOrigin, transfer || []); return true; }
+          catch (error) { try { frame.contentWindow?.postMessage(payload, "*", transfer || []); return true; } catch (fallbackError) { Toast.error(`Office 编辑器连接失败：${fallbackError?.message || error?.message || "目标窗口来源不匹配"}`); return false; } }
+        };
+        const toBase64 = bytes => { let binary = ""; const step = 0x8000; for (let offset = 0; offset < bytes.length; offset += step) binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + step, bytes.length))); return btoa(binary); };
+        const send = (nextPassword = password, force = false) => {
+          if (sent && !force) return;
+          sent = true; password = nextPassword || "";
+          const fileName = item.attachment?.name || "document";
+          const fileType = docKind?.ext || "";
+          const mimeType = item.attachment?.info?.mimetype || blob.type || "application/octet-stream";
+          // The Office bridge supports chunked transfer. Use it for larger
+          // files so browser structured-clone conversion cannot fail or hit
+          // the iframe's memory limit (the direct path remains fastest for
+          // normal documents).
+          if (buffer.byteLength > 8 * 1024 * 1024) {
+            const bytes = new Uint8Array(buffer); const chunkSize = 192 * 1024; const chunkCount = Math.ceil(bytes.byteLength / chunkSize);
+            if (!postOfficeMessage({ type: "xinghuo-office-source-begin", requestId, byteLength: bytes.byteLength, chunkCount, chunkSize, password, fileName, fileType, mimeType })) { sent = false; return; }
+            for (let index = 0; index < chunkCount; index += 1) { const start = index * chunkSize; const chunk = bytes.subarray(start, Math.min(start + chunkSize, bytes.byteLength)); if (!postOfficeMessage({ type: "xinghuo-office-source-chunk", requestId, chunkIndex: index, chunkData: toBase64(chunk) })) { sent = false; return; } }
+            postOfficeMessage({ type: "xinghuo-office-source-end", requestId });
+            return;
+          }
+          const payload = { type: "xinghuo-office-open", requestId, buffer: buffer.slice(0), password, fileName, fileType, mimeType };
+          if (!postOfficeMessage(payload, [payload.buffer])) sent = false;
+        };
+        const onReady = event => {
+          if (event.source !== frame.contentWindow || event.origin !== officeOrigin || event.data?.requestId && event.data.requestId !== requestId) return;
+          if (event.data?.type === "xinghuo-office-ready") send();
+          if (event.data?.type === "xinghuo-office-password-required") { if (passwordAttempts >= 2) return; passwordAttempts += 1; const next = window.prompt("此 Office 文件需要密码，请输入文件密码：", ""); if (next) send(next, true); }
+          if (event.data?.type === "xinghuo-office-dirty") {
+            if (!officeSavingRef.current || !event.data.dirty) { officeDirtyRef.current = Boolean(event.data.dirty); setOfficeDirty(Boolean(event.data.dirty)); }
+            if (!event.data.dirty) { officeSavingRef.current = false; setOfficeSaving(false); }
+          }
+          if (event.data?.type === "xinghuo-office-saving") { officeSavingRef.current = true; setOfficeSaving(true); }
+          if (event.data?.type === "xinghuo-office-saved") {
+            const savedBuffer = event.data.buffer instanceof ArrayBuffer ? event.data.buffer : event.data.buffer?.buffer instanceof ArrayBuffer ? event.data.buffer.buffer : null;
+            if (!savedBuffer) { setOfficeSaving(false); Toast.error("Office 编辑器没有返回可保存的数据"); return; }
+            officeDirtyRef.current = false;
+            setOfficeDirty(false);
+            officeSavingRef.current = true;
+            setOfficeSaving(true);
+            saveEditedAttachment(client, item, savedBuffer, event.data.fileName || item.attachment?.name, event.data.mimeType || item.attachment?.info?.mimetype)
+              .then(() => { if (active) { officeDirtyRef.current = false; officeSavingRef.current = false; setOfficeDirty(false); setOfficeSaving(false); Toast.success(item.isMe ? "文件已更新" : "已作为新文件发送"); if (closeAfterOfficeSaveRef.current) { closeAfterOfficeSaveRef.current = false; setDocumentModal(null); } } })
+              .catch(error => { if (active) { officeDirtyRef.current = true; officeSavingRef.current = false; setOfficeDirty(true); setOfficeSaving(false); closeAfterOfficeSaveRef.current = false; Toast.error(`文件保存失败：${error?.message || "未知错误"}`); } });
+          }
+          if (event.data?.type === "xinghuo-office-error") { const errorText = String(event.data.message || ""); if (/(password|encrypted|decrypt|加密|密码|密碼|打开文件时发生错误)/i.test(errorText) && passwordAttempts < 2) { passwordAttempts += 1; const next = window.prompt("此 Office 文件需要密码，请输入文件密码：", ""); if (next) { sent = false; send(next, true); return; } } setOfficeSaving(false); Toast.error(errorText || "Office 操作失败"); }
+        };
+        window.addEventListener("message", onReady);
+        removeOfficeListener = () => window.removeEventListener("message", onReady);
+        frame.addEventListener("load", send, { once: true });
+        setTimeout(send, 900);
+      } catch (error) {
+        if (active) setDocumentPreview(current => ({ ...current, status: "error", error: `Office 编辑器加载失败：${error?.message || "无法读取文件"}` }));
+      }
+    };
+    open();
+    return () => { active = false; removeOfficeListener(); officeFrameRef.current = null; officeRequestIdRef.current = ""; setOfficeSaving(false); };
+  }, [documentModal, isOfficeAttachment, asset.url]);
+  useEffect(() => {
+    if (!officeDirty || !isOfficeEditableAttachment || !["xls", "xlsx", "ods"].includes(docKind?.ext) || officeSaving) return;
+    const timer = setTimeout(() => requestOfficeSave(), 2500);
+    return () => clearTimeout(timer);
+  }, [officeDirty, officeSaving, isOfficeEditableAttachment, docKind?.ext]);
+  useEffect(() => {
+    if (!documentModal || !isOfficeEditableAttachment) return;
+    const onShortcut = event => {
+      if ((event.ctrlKey || event.metaKey) && String(event.key).toLowerCase() === "s") {
+        event.preventDefault();
+        requestOfficeSave();
+      }
+    };
+    window.addEventListener("keydown", onShortcut);
+    return () => window.removeEventListener("keydown", onShortcut);
+  }, [documentModal, isOfficeEditableAttachment, officeDirty, officeSaving]);
+  useEffect(() => {
+    if (!documentModal || !isTextAttachment || documentPreview.status !== "ready") return;
+    const modal = document.querySelector(".document-modal");
+    const headButton = modal?.querySelector(".document-modal-head-actions > .ant-btn");
+    const actions = modal?.querySelector(".document-modal-actions");
+    if (!actions || actions.querySelector(".document-copy-bottom")) return;
+    if (headButton) headButton.style.display = "none";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "document-copy-bottom";
+    button.textContent = "一键复制";
+    button.addEventListener("click", () => navigator.clipboard?.writeText(documentPreview.text).then(() => Toast.success("文本已复制")));
+    actions.insertBefore(button, actions.firstChild);
+    return () => { button.remove(); if (headButton) headButton.style.display = ""; };
+  }, [documentModal, isTextAttachment, documentPreview.status, documentPreview.text]);
+  useEffect(() => {
+    const modal = document.querySelector(".document-modal");
+    const backdrop = document.querySelector(".document-modal-backdrop");
+    if (!documentModal || !modal || !backdrop) return;
+    const closeButton = modal.querySelector(".document-modal-head button[aria-label='关闭']");
+    const stopAndClose = event => { event.preventDefault(); event.stopPropagation(); closeDocument(); };
+    closeButton?.addEventListener("click", stopAndClose, true);
+    const onBackdrop = event => { if (event.target === backdrop) stopAndClose(event); };
+    backdrop.addEventListener("mousedown", onBackdrop, true);
+    const actions = modal.querySelector(".document-modal-actions");
+    const completeButton = actions?.querySelector("button:last-child");
+    completeButton?.addEventListener("click", stopAndClose, true);
+    let saveButton = null;
+    if (isOfficeEditableAttachment && actions && !actions.querySelector(".office-save-button")) {
+      saveButton = document.createElement("button");
+      saveButton.type = "button";
+      saveButton.className = "office-save-button";
+      actions.insertBefore(saveButton, actions.lastElementChild);
+    }
+    if (saveButton) {
+      saveButton.textContent = officeSaving ? "保存中…" : "保存";
+      saveButton.disabled = !officeDirty || officeSaving;
+      saveButton.addEventListener("click", requestOfficeSave);
+    }
+    return () => { closeButton?.removeEventListener("click", stopAndClose, true); completeButton?.removeEventListener("click", stopAndClose, true); backdrop.removeEventListener("mousedown", onBackdrop, true); saveButton?.removeEventListener("click", requestOfficeSave); saveButton?.remove(); };
+  }, [documentModal, isOfficeEditableAttachment, officeDirty, officeSaving, documentPreview.status]);
+  const displayName = shortenAttachmentName(item.attachment?.name || "附件");
+  const contextMenuStyle = contextMenu ? {
+    left: Math.max(8, Math.min(contextMenu.x, window.innerWidth - 184)),
+    top: Math.max(8, Math.min(contextMenu.y, window.innerHeight - 340))
+  } : null;
+  const updatedHint = item.updatedAt ? h("div", { className: "document-update-hint" }, `由 ${item.updatedBy || "用户"} 更新于 ${new Date(item.updatedAt).toLocaleString("zh-CN")}`) : null;
+  const documentCard = documentAttachment ? h("div", { className: "document-card" }, h("div", { className: `document-icon document-icon-${docKind.className}` }, docKind.icon), h("div", { className: "document-main" }, h("div", { className: "document-name", title: item.attachment.name }, displayName), h("div", { className: "document-meta" }, formatAttachmentSize(item.attachment.info?.size || item.attachment.file?.size) || "文档", " · ", docKind.label), updatedHint), h("div", { className: `document-actions document-actions-${isOfficeEditableAttachment ? "editable" : "compact"}` }, isTextAttachment ? h("button", { type: "button", disabled: !asset.url, onClick: openOriginal }, "打开") : h("button", { type: "button", disabled: !asset.url, onClick: openOriginal }, "在线预览"), isOfficeEditableAttachment && h("button", { type: "button", disabled: !asset.url, onClick: openOfficeEditor }, "在线编辑"), h("button", { type: "button", disabled: !asset.url, onClick: downloadAttachment }, "下载"))) : null;
+  const retryMedia = () => { setImageOriginalRequested(false); setTimeout(() => setImageOriginalRequested(true), 0); };
+  const attachmentFallback = item.attachment && !media && !documentCard ? h("div", { className: "attachment-unavailable" }, asset.failed ? "媒体加载失败" : "正在加载媒体…", asset.url && h("a", { href: asset.url, onClick: openOriginal }, "打开原文件"), asset.failed && h("button", { type: "button", className: "media-retry-button", onClick: retryMedia }, "重试")) : null;
+  const relation = (item.replyTo || item.threadRoot) && h(RelationContext, { item, client, onJumpTo, onThread });
+  const payload = item.attachment ? h("div", { className: "attachment-wrap" }, documentCard || emojiRow || media || attachmentFallback || h("div", { className: "attachment-unavailable" }, "附件地址不可用")) : item.formattedBody ? h("div", { className: "message-bubble formatted-message" }, h(FormattedMessage, { html: item.formattedBody, client, emojiFiles: item.emojiFiles, onImage: (src, alt) => setViewer({ src, alt }) })) : h("div", { className: "message-bubble" }, item.decryptFailed ? `🔒 ${item.text}` : h(MessageText, { text: item.text }));
+  const documentContent = isOfficeAttachment
+    ? h("div", { className: "document-modal-loading" }, documentPreview.error || "正在连接 Office 编辑器…")
+    : documentPreview.status === "loading" ? h("div", { className: "document-modal-loading" }, "正在解析文档…") : documentPreview.status === "error" ? h("div", { className: "document-modal-loading" }, documentPreview.error) : isTextAttachment && documentPreview.status === "ready" ? h("pre", { className: "document-modal-text" }, documentPreview.text) : documentPreview.status === "ready" && documentPreview.html ? h("div", { className: `document-modal-html ${documentModal === "edit" ? "is-editable" : ""}`, contentEditable: documentModal === "edit", suppressContentEditableWarning: true, dangerouslySetInnerHTML: { __html: documentPreview.html } }) : h("div", { className: "document-modal-loading" }, documentPreview.error || "此格式暂不支持浏览器内排版，请使用下载后的 Office 应用打开");
+  return h(React.Fragment, null,
+    h("div", { className: `message-row ${item.isMe ? "me" : ""} ${item.attachment?.emoji ? "emoji-message-row" : ""} ${grouped ? "message-grouped" : ""} ${item.decryptFailed ? "encrypted-message" : ""} ${selecting ? "message-selecting" : ""} ${selected ? "message-selected" : ""}`, id: item.id ? `event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}` : undefined, onClick: selecting ? () => onSelect?.(item) : undefined, onContextMenu: event => { event.preventDefault(); setContextMenu({ x: event.clientX, y: event.clientY }); } },
+      h(MatrixAvatar, { client, mxcUrl: item.avatarMxc, size: 34, className: "message-avatar", style: { background: item.color }, fallback: item.avatar, alt: item.author }),
+      h("div", { className: "message-body" },
+        !grouped && h("div", { className: "message-author" }, h("button", { type: "button", className: "message-author-name", onClick: event => { event.stopPropagation(); onMention?.({ userId: item.handle, name: item.author }); } }, item.author), h("span", { className: "message-time" }, item.time), item.edited && h("span", { className: "message-time" }, "已编辑")),
+         h("div", { className: `message-content-stack ${relation ? "has-relation" : ""}` },
+           relation,
+           payload,
+           item.decryptFailed && h("div", { className: "decrypt-hint" }, "请在“我的设置 → 设备与安全”中恢复密钥"),
+            reactions.length > 0 && h("div", { className: "reaction-row" }, reactions.map(([key, count]) => h(ReactionPopover, { key, users: item.reactionUsers?.[key] || [] }, h("button", { type: "button", className: "reaction", onClick: event => { event.stopPropagation(); onReact(item, key); } }, reactionLabel(key), h("span", { className: "reaction-count" }, count))))),
+           h("div", { className: "message-actions" },
+             h(ReactionPicker, { client, onSelect: key => onReact(item, key) }),
+             h("button", { onClick: event => { event.stopPropagation(); onReply(item); } }, "回复"),
+             h("button", { onClick: event => { event.stopPropagation(); onThread(item); } }, "线程"),
+             item.isMe && h("button", { onClick: event => { event.stopPropagation(); onEdit(item); } }, "编辑"),
+             item.isMe && h("button", { onClick: event => { event.stopPropagation(); onRedact(item); } }, "撤回")
+           )
+         ),
+         item.readBy?.length > 0 && h("div", { className: "message-read-receipt" }, h(ReadReceipt, { readBy: item.readBy || [], client })),
+        contextMenu && h("div", { className: "message-context-menu", style: contextMenuStyle, onClick: event => event.stopPropagation() },
+          // Keep the initial DOM order aligned with the final polished menu.
+          // The effect above adds the multi-select action and SVG glyphs.
+          h("button", { onClick: () => { navigator.clipboard?.writeText(item.text || ""); setContextMenu(null); } }, "复制消息"),
+          item.isMe && h("button", { onClick: () => { setContextMenu(null); onEdit(item); } }, "编辑"),
+          h("button", { onClick: () => { setContextMenu(null); onForward?.(item, false); } }, "转发"),
+          h("button", { onClick: () => { setContextMenu(null); onReply(item); } }, "回复"),
+          h("button", { onClick: () => { setContextMenu(null); onThread(item); } }, "在线程中回复"),
+          h("button", { onClick: () => { setContextMenu(null); onTogglePinMessage?.(item); } }, pinnedEventIds.includes(item.id) ? "取消置顶消息" : "置顶消息"),
+          reactions.length > 0 && h("button", { onClick: () => { setContextMenu(null); Toast.info(`该消息有 ${reactions.reduce((sum, entry) => sum + entry[1], 0)} 个回应`); } }, "查看回应详情"),
+          item.isMe && h("button", { className: "danger", onClick: () => { setContextMenu(null); onRedact(item); } }, "撤回")
+        )
+      )
+    ),
+    documentModal && h("div", { className: "document-modal-backdrop", onMouseDown: event => event.target === event.currentTarget && setDocumentModal(null) },
+      h("div", { className: "document-modal" },
+        h("div", { className: "document-modal-head" }, h("div", null, h("strong", null, documentModal === "edit" ? "在线编辑文档" : "在线预览文档"), h("span", null, item.attachment?.name)), h("div", { className: "document-modal-head-actions" }, isTextAttachment && documentPreview.status === "ready" && h(UiButton, { size: "small", onClick: () => navigator.clipboard?.writeText(documentPreview.text).then(() => Toast.success("文本已复制")) }, "一键复制"), h("button", { type: "button", onClick: () => setDocumentModal(null), "aria-label": "关闭" }, "×"))),
+        documentContent,
+        documentModal === "edit" && h("div", { className: "document-modal-hint" }, docKind?.ext === "docx" || docKind?.ext === "doc" ? "当前为可编辑文本预览，修改内容后请复制保存；如需保留原始 DOCX 排版，请下载后使用 Office。" : "此格式暂不支持浏览器内编辑，建议下载后使用 Office。"),
+        h("div", { className: "document-modal-actions" }, h(UiButton, { className: "ghost-btn", onClick: downloadAttachment }, "下载文件"), h(UiButton, { variant: "primary", onClick: () => setDocumentModal(null) }, "完成"))
+      )
+    ),
+    h(MediaLightbox, { viewer, onClose: () => setViewer(null) })
+  );
+}
+
+function ThreadPanel({ root, replies = [], client, onClose, onJumpTo }) {
+  if (!root) return null;
+  const renderEntry = (item, isRoot = false) => h("div", { className: `thread-entry ${isRoot ? "thread-entry-root" : ""}`, key: item.id || `${item.author}-${item.time}` },
+    h(MatrixAvatar, { client, mxcUrl: item.avatarMxc, size: isRoot ? 34 : 30, className: "thread-avatar", style: { background: item.color }, fallback: item.avatar, alt: item.author }),
+    h("div", { className: "thread-entry-copy" }, h("div", { className: "thread-entry-meta" }, h("strong", null, item.author), h("time", null, item.time)), item.attachment ? h("div", { className: "thread-entry-attachment" }, item.attachment.name || "附件") : h("div", { className: "thread-entry-text" }, item.formattedBody ? h(FormattedMessage, { html: item.formattedBody, client, emojiFiles: item.emojiFiles }) : h(MessageText, { text: item.text })))
+  );
+  return h("aside", { className: "thread-panel", "aria-label": "线程" },
+    h("div", { className: "thread-panel-head" }, h("div", null, h("strong", null, "线程"), h("span", null, `${replies.length} 条回复`)), h(UiButton, { className: "icon-button", type: "text", title: "关闭线程", onClick: onClose }, "×")),
+    h("div", { className: "thread-panel-body" }, h("div", { className: "thread-origin-label" }, "讨论串", h("button", { type: "button", className: "thread-root-jump", onClick: () => onJumpTo?.(root.id) }, "查看原消息 ↗")), h("div", { className: "thread-origin-card" }, renderEntry(root, true)), replies.length ? h("div", { className: "thread-replies" }, h("div", { className: "thread-replies-label" }, `${replies.length} 条回复`), replies.map(item => renderEntry(item))) : h("div", { className: "thread-empty" }, "还没有回复，在下方输入框开始讨论")),
+    h("div", { className: "thread-panel-footer" }, "下方编辑框会发送到此线程")
+  );
+}
+
+function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, onSend, onTyping, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onEmojiSelect, replyTo, threadRoot, editing, onCancelReply, onCancelThread, onCancelEdit, onUpload, detailsCollapsed, onToggleDetails, selecting, forwardItems, onSelectForward, onStartSelecting, pinnedEventIds, onTogglePinMessage, onOpenDetails, onStartCall, activeCall }) {
+  const [draft, setDraft] = useState(""); const [draftHtml, setDraftHtml] = useState(""); const [remoteTyping, setRemoteTyping] = useState([]); const inputRef = useRef(null); const fileRef = useRef(null); const scrollRef = useRef(null); const forceScrollRef = useRef(false); const stickToBottomRef = useRef(true); const previousTailRef = useRef({ roomId: null, eventId: null }); const pendingRoomScrollRef = useRef(null); const loadingEarlierRef = useRef(false); const preparedEmojiRef = useRef(new Map()); const pendingEmojiRef = useRef(new Map()); const emojiInsertGenerationRef = useRef(0); const emojiSearchTextRef = useRef(""); const pendingAttachmentsRef = useRef([]); const dragDepthRef = useRef(0); const sendingRef = useRef(false); const scrollMemoryRef = useRef(new Map()); const restoredRoomRef = useRef(null); const restoreInteractionRef = useRef(false); const restoreTimersRef = useRef([]); const [preparingEmoji, setPreparingEmoji] = useState(""); const [showJump, setShowJump] = useState(false); const [loadingEarlier, setLoadingEarlier] = useState(false); const [historyExhausted, setHistoryExhausted] = useState(false); const [pendingAttachments, setPendingAttachments] = useState([]); const [draggingFiles, setDraggingFiles] = useState(false); const [sending, setSending] = useState(false); const [recording, setRecording] = useState(false); const recorderRef = useRef(null); const recorderStreamRef = useRef(null); const recorderChunksRef = useRef([]);
+  React.useEffect(() => {
+    if (!replyTo && !threadRoot && !editing) return;
+    const timer = requestAnimationFrame(() => inputRef.current?.focus?.());
+    return () => cancelAnimationFrame(timer);
+  }, [replyTo, threadRoot, editing]);
+  useEffect(() => {
+    const enterSelecting = () => onStartSelecting?.(true);
+    window.addEventListener("orbit:start-message-selecting", enterSelecting);
+    return () => window.removeEventListener("orbit:start-message-selecting", enterSelecting);
+  }, [onStartSelecting]);
+  React.useEffect(() => { pendingAttachmentsRef.current = pendingAttachments; }, [pendingAttachments]);
+  React.useEffect(() => () => pendingAttachmentsRef.current.forEach(entry => entry.preview && URL.revokeObjectURL(entry.preview)), [room?.id]);
+  React.useEffect(() => { setPendingAttachments([]); setDraggingFiles(false); }, [room?.id]);
+  React.useEffect(() => {
+    if (!client || !room?.id) { setRemoteTyping([]); return; }
+    const update = (_event, member) => {
+      const roomId = member?.roomId || member?.room?.roomId;
+      if (roomId && roomId !== room.id) return;
+      const matrixRoom = client.getRoom?.(room.id) || member?.room;
+      const ownId = client.getUserId?.();
+      const names = (matrixRoom?.getTypingMembers?.() || []).filter(entry => entry?.userId !== ownId).map(entry => entry?.name || entry?.rawDisplayName || entry?.userId).filter(Boolean);
+      setRemoteTyping(names);
+    };
+    client.on?.("RoomMember.typing", update);
+    update();
+    return () => client.off?.("RoomMember.typing", update);
+  }, [client, room?.id]);
+  typingUsers = remoteTyping;
+  const prepareEmojiSelection = React.useCallback(item => {
+    if (!client || !room?.id || !item) return Promise.reject(new Error("当前房间不可用"));
+    const shortcode = emojiShortcode(item);
+    const key = `${room.id}|:${shortcode}:`;
+    const prepared = preparedEmojiRef.current.get(key);
+    if (prepared) return Promise.resolve(prepared);
+    const existing = pendingEmojiRef.current.get(key);
+    if (existing) return existing;
+    setPreparingEmoji(shortcode);
+    const pending = prepareRemoteEmoji(client, item).then(result => {
+      preparedEmojiRef.current.set(key, result);
+      return result;
+    }).finally(() => {
+      pendingEmojiRef.current.delete(key);
+      setPreparingEmoji(current => current === shortcode ? "" : current);
+    });
+    pendingEmojiRef.current.set(key, pending);
+    return pending;
+  }, [client, room?.id]);
+  const [emojiSuggestions, setEmojiSuggestions] = useState([]); const emojiQueryRef = useRef(0); const emojiActionRef = useRef("typing"); const [hoveredSuggestion, setHoveredSuggestion] = useState(null);
+  const updateEmojiSuggestions = value => {
+    // Match both the original `:shortcode` flow and ordinary keywords such as
+    // “好”. The latter is how the upstream comment widget exposes its
+    // horizontal emoji preview while composing a message.
+    const raw = String(value || "").trim();
+    const match = raw.match(/(?:^|\s):([^:\s]*)$/);
+    const query = match?.[1] || raw.match(/[\p{L}\p{N}_-]{1,12}$/u)?.[0] || "";
+    emojiSearchTextRef.current = query;
+    if (!query) { emojiQueryRef.current += 1; setEmojiSuggestions([]); return; }
+    emojiActionRef.current = "typing";
+    const q = query.toLowerCase();
+    const requestId = ++emojiQueryRef.current;
+    ensureEmojiCatalog().then(items => { if (requestId !== emojiQueryRef.current) return; const ranked = (items || []).map(item => ({ item, score: Math.max(fuzzyScore(item.name, q), fuzzyScore(item.shortcode, q), ...(item.keywords || []).map(keyword => fuzzyScore(keyword, q)), 0) })).filter(entry => entry.score > 0).sort((a, b) => b.score - a.score || String(a.item.name).localeCompare(String(b.item.name), "zh-CN")); setEmojiSuggestions(ranked.slice(0, 80).map(entry => entry.item)); });
+  };
+  const [emojiSuggestionMode, setEmojiSuggestionMode] = useState("emoji");
+  const clearComposerAfterSticker = React.useCallback(() => {
+    // A sticker is a standalone message. Remove the keyword that produced
+    // the inline candidates and clear the editor so the suggestion strip
+    // cannot reappear from the stale contenteditable selection.
+    emojiQueryRef.current += 1;
+    emojiInsertGenerationRef.current += 1;
+    pendingEmojiRef.current.clear();
+    setDraft("");
+    setDraftHtml("");
+    setMentionTargets([]);
+    setEmojiSuggestions([]);
+    setHoveredSuggestion(null);
+    emojiActionRef.current = "select";
+    inputRef.current?.clear?.();
+  }, []);
+  const selectSticker = React.useCallback(item => {
+    if (!item) return;
+    clearComposerAfterSticker();
+    onEmojiSelect?.(item);
+  }, [clearComposerAfterSticker, onEmojiSelect]);
+  React.useEffect(() => {
+    const move = event => {
+      const button = event.target?.closest?.(".emoji-suggestion-items > button");
+      if (!button) return;
+      const rect = button.getBoundingClientRect();
+      document.documentElement.style.setProperty("--orbit-emoji-preview-x", `${rect.left + rect.width / 2}px`);
+    };
+    document.addEventListener("mousemove", move);
+    return () => document.removeEventListener("mousemove", move);
+  }, []);
+  React.useEffect(() => { emojiQueryRef.current += 1; setEmojiSuggestions([]); setHoveredSuggestion(null); }, [room?.id, editing?.id]);
+  // A browser can restore the previous contenteditable subtree after a reload
+  // even though React's draft is empty. Clear that stale visual on a fresh
+  // room composer, while leaving an active edit draft untouched.
+  React.useEffect(() => {
+    if (!room?.id || editing) return;
+    const frame = requestAnimationFrame(() => inputRef.current?.clear?.());
+    return () => cancelAnimationFrame(frame);
+  }, [room?.id, editing?.id]);
+  const [mentionTargets, setMentionTargets] = useState([]);
+  const scrollStorageKey = roomId => `orbit.scroll-position:${client?.getUserId?.() || "anonymous"}:${roomId}`;
+  const readScrollMemory = roomId => {
+    if (!roomId) return null;
+    const cached = scrollMemoryRef.current.get(roomId);
+    if (cached) return cached;
+    try {
+      const stored = JSON.parse(localStorage.getItem(scrollStorageKey(roomId)) || "null");
+      if (stored && typeof stored === "object") { scrollMemoryRef.current.set(roomId, stored); return stored; }
+    } catch {}
+    return null;
+  };
+  const rememberScrollPosition = roomId => {
+    const el = scrollRef.current;
+    if (!el || !roomId) return;
+    const containerRect = el.getBoundingClientRect();
+    const anchor = [...el.querySelectorAll(".message-row[id]")].find(node => node.getBoundingClientRect().bottom > containerRect.top + 8);
+    const anchorId = anchor?.id?.replace(/^event-/, "") || null;
+    const offset = anchor ? anchor.getBoundingClientRect().top - containerRect.top : 0;
+    const snapshot = { top: Number(el.scrollTop) || 0, anchorId, offset: Math.round(offset) };
+    scrollMemoryRef.current.set(roomId, snapshot);
+    try { localStorage.setItem(scrollStorageKey(roomId), JSON.stringify(snapshot)); } catch {}
+  };
+  const restoreScrollPosition = roomId => {
+    const el = scrollRef.current;
+    if (!el || !roomId || !messages.length) return false;
+    const saved = readScrollMemory(roomId);
+    let targetTop = null;
+    let anchorFound = false;
+    if (saved?.anchorId) {
+      const safe = String(saved.anchorId).replace(/[^a-zA-Z0-9_-]/g, "_");
+      const anchor = document.getElementById(`event-${safe}`);
+      if (anchor) {
+        anchorFound = true;
+        const containerRect = el.getBoundingClientRect();
+        targetTop = el.scrollTop + anchor.getBoundingClientRect().top - containerRect.top - Number(saved.offset || 0);
+      }
+    }
+    if (targetTop === null && saved && Number.isFinite(Number(saved.top))) targetTop = Number(saved.top);
+    if (targetTop === null) targetTop = el.scrollHeight;
+    const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+    el.scrollTop = Math.min(maxTop, Math.max(0, targetTop));
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom <= 120;
+    setShowJump(distanceFromBottom > 260);
+    restoredRoomRef.current = roomId;
+    // Keep an out-of-window Matrix read marker intact until scrollback brings
+    // that event into the rendered window; otherwise the fallback at scrollTop
+    // 0 would overwrite the only useful anchor.
+    if (!saved?.anchorId || anchorFound) rememberScrollPosition(roomId);
+    return true;
+  };
+  React.useEffect(() => {
+    emojiInsertGenerationRef.current += 1;
+    const editHtml = editing?.formattedBody || "";
+    const editText = editing?.editorText || editorTextFromFormattedBody(editHtml) || editing?.text || "";
+    // Replace the live ProseMirror document immediately. Waiting for the
+    // draft state render allows Chromium's restored contenteditable subtree
+    // to survive for one frame and leak old emoji chips into this edit.
+    inputRef.current?.setContent?.(editText);
+    setDraft(editText);
+    setDraftHtml(editHtml);
+    setMentionTargets([]);
+    setHistoryExhausted(false);
+    preparedEmojiRef.current.clear();
+    (editing?.emojiRefs || emojiRefsFromFormattedBody(editHtml)).forEach(entry => {
+      const shortcode = String(entry.shortcode || "").replace(/^:+|:+$/g, "");
+      if (shortcode && entry.mxc?.startsWith?.("mxc://") && room?.id) {
+        preparedEmojiRef.current.set(`${room.id}|:${shortcode}:`, { ...entry, shortcode });
+      }
+    });
+    pendingEmojiRef.current.clear();
+    setPreparingEmoji("");
+    setEmojiSuggestions?.([]);
+    emojiSearchTextRef.current = "";
+    restoreInteractionRef.current = false;
+    restoredRoomRef.current = null;
+    restoreTimersRef.current.forEach(clearTimeout);
+    restoreTimersRef.current = [];
+    stickToBottomRef.current = false;
+    previousTailRef.current = { roomId: room?.id || null, eventId: null };
+    if (room?.id) pendingRoomScrollRef.current = room.id;
+  }, [room?.id, editing?.id]);
+  const cancelEditing = React.useCallback(() => {
+    inputRef.current?.clear?.();
+    setDraft("");
+    setDraftHtml("");
+    setEmojiSuggestions([]);
+    emojiSearchTextRef.current = "";
+    onCancelEdit?.();
+  }, [onCancelEdit]);
+  React.useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !room?.id || pendingRoomScrollRef.current !== room.id || !messages.length) return;
+    // Restore the last visible timeline anchor. Media/decryption can change
+    // row heights after the first paint, so re-apply the anchor briefly unless
+    // the user has interacted with the scroll surface.
+    const settle = () => { if (window.orbitActiveRoomId === room.id && !restoreInteractionRef.current) restoreScrollPosition(room.id); };
+    const frame = requestAnimationFrame(settle);
+    const timers = [120, 350, 800, 1500, 2600].map(delay => setTimeout(settle, delay));
+    pendingRoomScrollRef.current = null;
+    restoreTimersRef.current = timers;
+    return () => { cancelAnimationFrame(frame); timers.forEach(clearTimeout); restoreTimersRef.current = []; };
+  }, [room?.id, messages.length, client]);
+  React.useEffect(() => { const el = scrollRef.current; if (!el || !forceScrollRef.current) return; requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; forceScrollRef.current = false; }); }, [messages.length]);
+  const tailEventId = messages.length ? messages[messages.length - 1]?.id || null : null;
+  React.useLayoutEffect(() => {
+    const previous = previousTailRef.current;
+    const sameRoom = previous.roomId === room?.id;
+    const appended = sameRoom && previous.eventId && tailEventId && previous.eventId !== tailEventId;
+    previousTailRef.current = { roomId: room?.id || null, eventId: tailEventId };
+    if (!appended || !stickToBottomRef.current || loadingEarlierRef.current) return;
+    const revealTail = () => {
+      const el = scrollRef.current;
+      if (!el || window.orbitActiveRoomId !== room?.id || !stickToBottomRef.current) return;
+      el.scrollTop = el.scrollHeight;
+      setShowJump(false);
+    };
+    revealTail();
+    const frame = requestAnimationFrame(revealTail);
+    const timers = [120, 420, 1000].map(delay => setTimeout(revealTail, delay));
+    return () => { cancelAnimationFrame(frame); timers.forEach(clearTimeout); };
+  }, [room?.id, tailEventId]);
+  const send = async () => {
+    const text = normalizeComposerText(draft, draftHtml).trim();
+    if ((!text && !pendingAttachments.length) || !room?.id || sendingRef.current) return;
+    const roomPrefix = `${room.id}|`;
+    // Snapshot emoji uploads before invalidating callbacks. The previous
+    // order cleared this map first, so an emoji inserted immediately before
+    // Send lost its MXC mapping and was sent as duplicate keyword text.
+    const preparing = [...pendingEmojiRef.current.entries()]
+      .filter(([key]) => key.startsWith(roomPrefix))
+      .map(([, promise]) => promise);
+    // Clear optimistically before any network/upload work starts so the
+    // just-submitted text never lingers in the editor while Matrix responds.
+    setDraft(""); setDraftHtml(""); setMentionTargets([]); setEmojiSuggestions([]); emojiActionRef.current = "select";
+    inputRef.current?.clear?.();
+    // Invalidate visual insertion callbacks while preserving the promises
+    // captured above so their prepared MXC records remain available below.
+    emojiInsertGenerationRef.current += 1;
+    pendingEmojiRef.current.clear();
+    sendingRef.current = true; setSending(true);
+    try {
+      if (pendingAttachments.length && onUpload) {
+        const queue = [...pendingAttachments];
+        for (const entry of queue) {
+          setPendingAttachments(current => current.map(item => item.id === entry.id ? { ...item, status: "uploading", percent: 0 } : item));
+          try {
+            const displayName = String(entry.displayName || "").trim() || entry.file.name;
+            const uploadFile = displayName !== entry.file.name ? new File([entry.file], displayName, { type: entry.file.type, lastModified: entry.file.lastModified }) : entry.file;
+            await onUpload(uploadFile, (loaded, total) => {
+              const progress = loaded && typeof loaded === "object" ? loaded : { loaded, total };
+              const currentLoaded = Number(progress.loaded) || 0;
+              const currentTotal = Number(progress.total) || 0;
+              const percent = currentTotal > 0 ? Math.min(99, Math.max(0, Math.round(currentLoaded / currentTotal * 100))) : 0;
+              setPendingAttachments(current => current.map(item => item.id === entry.id ? { ...item, status: "uploading", percent } : item));
+            });
+          } catch (error) {
+            setPendingAttachments(current => current.map(item => item.id === entry.id ? { ...item, status: "failed" } : item));
+            throw error;
+          }
+          setPendingAttachments(current => current.map(item => item.id === entry.id ? { ...item, status: "sent", percent: 100 } : item));
+        }
+        queue.forEach(entry => entry.preview && URL.revokeObjectURL(entry.preview));
+        setPendingAttachments([]);
+      }
+      if (!text) return;
+    if (preparing.length) await Promise.all(preparing);
+    const emojiSource = `${text}\n${draftHtml || ""}`;
+    const editorEmojiRefs = emojiRefsFromEditorHtml(draftHtml);
+    const copiedEmojiEntries = editorEmojiRefs.map(entry => ({ ...entry, item: { name: entry.shortcode, shortcode: entry.shortcode } }));
+    const resolvedEmoji = [...preparedEmojiRef.current.entries()]
+      .filter(([key, entry]) => {
+        if (!key.startsWith(roomPrefix)) return false;
+        const shortcode = String(entry.shortcode || "").replace(/^:+|:+$/g, "").toLowerCase();
+        const plain = text.trim().toLowerCase();
+        const token = ":" + shortcode + ":";
+        const attr = 'data-emoji-token=":' + shortcode + ':"';
+        const bareAtEnd = new RegExp(shortcode.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*$", "i");
+        return emojiSource.toLowerCase().includes(token) || emojiSource.toLowerCase().includes(attr) || plain === shortcode || bareAtEnd.test(plain) || plain === String(entry.item?.name || "").trim().toLowerCase();
+      })
+      .map(([, entry]) => entry);
+    for (const entry of copiedEmojiEntries) {
+      if (!resolvedEmoji.some(item => item.mxc === entry.mxc)) resolvedEmoji.push(entry);
+    }
+    const pending = (window.orbitPendingMentions || {})[room.id] || [];
+    const mentions = [...mentionTargets, ...pending].filter((entry, index, list) => entry?.userId && text.includes(`@${String(entry.name || "").replace(/^@/, "")}`) && list.findIndex(other => other.userId === entry.userId) === index);
+    await onSend(text, draftHtml, mentions, resolvedEmoji);
+    [...preparedEmojiRef.current.keys()].filter(key => key.startsWith(roomPrefix)).forEach(key => preparedEmojiRef.current.delete(key));
+    forceScrollRef.current = stickToBottomRef.current;
+    setTimeout(() => { const el = scrollRef.current; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); setShowJump(false); }, 350);
+    } catch (error) { Toast.error(`发送失败：${error?.message || "未知错误"}`); }
+    finally { sendingRef.current = false; setSending(false); }
+  };
+  React.useEffect(() => { window.orbitActiveRoomId = room?.id || null; }, [room?.id]);
+  React.useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const rememberPosition = () => { if (restoredRoomRef.current !== room?.id) return; stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 120; rememberScrollPosition(room?.id); };
+    el.addEventListener("scroll", rememberPosition, { passive: true });
+    const markInteraction = () => { restoreInteractionRef.current = true; };
+    el.addEventListener("wheel", markInteraction, { passive: true });
+    el.addEventListener("touchstart", markInteraction, { passive: true });
+    el.addEventListener("pointerdown", markInteraction, { passive: true });
+    el.addEventListener("keydown", markInteraction, { passive: true });
+    return () => { el.removeEventListener("scroll", rememberPosition); el.removeEventListener("wheel", markInteraction); el.removeEventListener("touchstart", markInteraction); el.removeEventListener("pointerdown", markInteraction); el.removeEventListener("keydown", markInteraction); };
+  }, [room?.id]);
+  const keyDown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
+  const loadEarlier = async () => { if (loadingEarlierRef.current || historyExhausted) return; const el = scrollRef.current; loadingEarlierRef.current = true; setLoadingEarlier(true); const beforeHeight = el?.scrollHeight || 0; try { const loaded = await onLoadMore?.(); if (loaded === false) setHistoryExhausted(true); requestAnimationFrame(() => { if (el) el.scrollTop += el.scrollHeight - beforeHeight; }); } finally { loadingEarlierRef.current = false; setLoadingEarlier(false); } };
+  const jumpBottom = () => { const el = scrollRef.current; stickToBottomRef.current = true; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); setShowJump(false); };
+  React.useEffect(() => () => { recorderRef.current?.stop?.(); recorderStreamRef.current?.getTracks?.().forEach(track => track.stop()); }, []);
+  if (!room) return h("main", { className: "main-panel" }, h("div", { className: "empty-messages" }, "登录后选择一个房间开始聊天"));
+  const insertEmoji = (item, options = {}) => {
+    const generation = emojiInsertGenerationRef.current;
+    prepareEmojiSelection(item).then(result => {
+      if (generation !== emojiInsertGenerationRef.current || !room?.id) return;
+      const token = `:${result.shortcode}:`;
+      // Insert an inline emoji node so the composer shows its image while
+      // TipTap still serializes the shortcode for Matrix. The node command
+      // replaces only the unfinished :query at the caret; if the editor is
+      // unavailable, retain the plain-text fallback.
+      const replaceQuery = options.replaceQuery === true;
+      const query = String(options.query || emojiSearchTextRef.current || "").trim();
+      const inserted = inputRef.current?.insertEmoji?.(result.item || item, { replaceQuery, query, mxc: result.mxc || "" });
+      if (!inserted) setDraft(value => {
+        const current = String(value || "");
+        const queryPattern = query ? new RegExp(`${query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "iu") : /(?:^|\s)(?::[^:\s]*|[\p{L}\p{N}_-]{1,32})$/u;
+        return replaceQuery && queryPattern.test(current)
+          ? current.replace(queryPattern, match => `${match.startsWith(" ") ? " " : ""}${token} `)
+          : `${current}${token} `;
+      });
+      setEmojiSuggestions([]);
+      emojiActionRef.current = "select";
+    }).catch(error => Toast.error(`表情准备失败：${error?.message || "无法上传到 Matrix"}`));
+  };
+  const insertMention = mention => { const userId = mention?.userId; const name = String(mention?.name || userId || "").replace(/^@/, "").trim(); if (!userId || !name) return; setMentionTargets(current => current.some(entry => entry.userId === userId) ? current : [...current, { userId, name }]); const current = String(draft || ""); const prefix = current && !/[\s\n]$/.test(current) ? " " : ""; inputRef.current?.insertText?.(`${prefix}@${name} `); };
+  const toggleRecording = async () => {
+    if (recorderRef.current) { recorderRef.current.stop(); return; }
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { Toast.warning("当前浏览器不支持语音录制"); return; }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find(type => window.MediaRecorder.isTypeSupported?.(type)) || "";
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      recorderStreamRef.current = stream; recorderChunksRef.current = []; recorderRef.current = recorder; setRecording(true);
+      recorder.ondataavailable = event => { if (event.data?.size) recorderChunksRef.current.push(event.data); };
+      recorder.onerror = () => { recorderRef.current = null; stream.getTracks().forEach(track => track.stop()); setRecording(false); Toast.error("语音录制失败"); };
+      recorder.onstop = async () => {
+        recorderRef.current = null; stream.getTracks().forEach(track => track.stop()); setRecording(false);
+        const blob = new Blob(recorderChunksRef.current, { type: recorder.mimeType || "audio/webm" }); recorderChunksRef.current = [];
+        if (!blob.size || !onUpload) return;
+        try {
+          const file = await encodeVoiceMp3(blob);
+          await onUpload(file);
+        } catch (error) {
+          Toast.error("语音发送失败：" + (error?.message || "无法编码为 MP3"));
+        }
+      };
+      recorder.start();
+    } catch { Toast.error("无法访问麦克风，请检查浏览器权限"); }
+  };
+  const handleFiles = files => {
+    const list = [...(files || [])].filter(file => file && file.size >= 0);
+    if (!list.length) return;
+    setPendingAttachments(current => [...current, ...list.map(file => ({ id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, file, displayName: file.name, status: "queued", percent: 0, preview: file.type.startsWith("image/") || file.type.startsWith("video/") ? URL.createObjectURL(file) : "" }))]);
+  };
+  const removeAttachment = entry => { if (entry?.preview) URL.revokeObjectURL(entry.preview); setPendingAttachments(current => current.filter(item => item.id !== entry.id)); };
+  const clearAttachments = () => { pendingAttachmentsRef.current.forEach(entry => entry.preview && URL.revokeObjectURL(entry.preview)); setPendingAttachments([]); };
+  const isFileDrag = event => Array.from(event?.dataTransfer?.types || []).some(type => String(type).toLowerCase() === "files");
+  const onMessageDragOver = event => { if (!isFileDrag(event)) return; event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = "copy"; setDraggingFiles(true); };
+  const onMessageDragEnter = event => { if (!isFileDrag(event)) return; event.preventDefault(); dragDepthRef.current += 1; setDraggingFiles(true); };
+  const onMessageDragLeave = event => { if (!isFileDrag(event)) return; event.preventDefault(); dragDepthRef.current = Math.max(0, dragDepthRef.current - 1); if (!dragDepthRef.current) setDraggingFiles(false); };
+  const onMessageDrop = event => { if (!isFileDrag(event)) return; event.preventDefault(); dragDepthRef.current = 0; setDraggingFiles(false); handleFiles(event.dataTransfer?.files); };
+  const pendingPreview = pendingAttachments.length ? createPortal(h("div", { className: "pending-attachments-backdrop", role: "presentation", onMouseDown: event => event.target === event.currentTarget && !sending && clearAttachments() }, h("section", { className: "pending-attachments", role: "dialog", "aria-modal": "true", "aria-label": `发送给 ${room.name}` }, h("div", { className: "pending-attachments-head" }, h("strong", null, `发送给 ${room.name}`), h("button", { type: "button", className: "pending-close", disabled: sending, onClick: clearAttachments, "aria-label": "关闭附件预览" }, "×")), h("div", { className: "pending-attachment-list" }, pendingAttachments.map(entry => { const file = entry.file; const kind = attachmentKind(file.name); const isImage = file.type.startsWith("image/"); const isVideo = file.type.startsWith("video/"); const statusText = entry.status === "uploading" ? `上传中 ${entry.percent || 0}%` : entry.status === "sent" ? "已发送" : `${formatAttachmentSize(file.size) || kind.label}`; return h("div", { className: `pending-attachment pending-${entry.status || "queued"}`, key: entry.id }, h("div", { className: "pending-attachment-thumb" }, isImage && entry.preview ? h("img", { src: entry.preview, alt: file.name }) : isVideo && entry.preview ? h("video", { src: entry.preview, muted: true, preload: "metadata" }) : h("span", { className: `pending-file-icon ${kind.className}` }, kind.icon)), h("div", { className: "pending-attachment-info" }, h("input", { className: "pending-name-input", value: entry.displayName || file.name, disabled: sending || entry.status === "sent", onChange: event => { const value = event.target.value; setPendingAttachments(current => current.map(item => item.id === entry.id ? { ...item, displayName: value } : item)); }, onKeyDown: event => { if (event.key === "Enter") event.currentTarget.blur(); }, title: entry.displayName || file.name, "aria-label": "附件文件名" }), h("span", null, statusText), entry.status === "uploading" && h("div", { className: "pending-progress", "aria-label": `上传进度 ${entry.percent || 0}%` }, h("span", { style: { width: `${entry.percent || 0}%` } }))), entry.status !== "sent" && h("button", { type: "button", className: "pending-remove", disabled: sending, onClick: () => removeAttachment(entry), "aria-label": `移除 ${file.name}` }, "×")); })), h(UiButton, { variant: "primary", className: "pending-send", disabled: sending, onClick: send }, sending ? "发送中…" : `发送(${pendingAttachments.length})`))), document.body) : null;
+  const threadReplies = threadRoot ? messages.filter(item => item.type !== "empty" && item.threadRoot === threadRoot.id) : [];
+  messages.forEach((item, index) => { const previous = messages[index - 1]; const sameSender = previous && item.type !== "empty" && previous.type !== "empty" && item.handle && item.handle === previous.handle; const sameMinute = sameSender && item.time && item.time === previous.time; item.grouped = Boolean(sameMinute); });
+  return h("main", { className: `main-panel ${threadRoot ? "thread-open" : ""} ${draggingFiles ? "is-dragging-files" : ""}`, onPaste: event => { if (event.defaultPrevented) return; const files = clipboardFiles(event.clipboardData); if (files.length) { event.preventDefault(); handleFiles(files); } }, onDragOver: onMessageDragOver, onDragEnter: onMessageDragEnter, onDragLeave: onMessageDragLeave, onDrop: onMessageDrop },
+    h("header", { className: "chat-header" }, h("div", { className: "chat-heading" }, h(MatrixAvatar, { client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 40, style: { background: room.color, width: 40, height: 40 }, fallback: room.initials, alt: room.name }), h("div", null, h("div", { className: "chat-title" }, room.name), h("div", { className: room.directUserId ? (client?.getUser?.(room.directUserId)?.presence === "online" ? "chat-subtitle direct-presence" : "chat-subtitle direct-offline") : "chat-subtitle" }, room.directUserId ? `${client?.getUser?.(room.directUserId)?.presence === "online" ? "在线" : "离线"} · ${client?.getUser?.(room.directUserId)?.displayName || room.directUserId}` : `${room.members} 位成员 · ${room.desc}`))), h("div", { className: "header-actions" }, h("button", { className: "icon-button", title: "搜索消息", onClick: onSearch }, h(Icon, { name: "search" })), h("button", { className: `icon-button ${activeCall?.roomId === room.id && activeCall.kind !== "video" ? "is-calling" : ""}`, title: "发起语音通话", onClick: () => onStartCall?.("voice") }, h(Icon, { name: "phone" })), h("button", { className: `icon-button ${activeCall?.roomId === room.id && activeCall.kind === "video" ? "is-calling" : ""}`, title: "发起视频通话", onClick: () => onStartCall?.("video") }, h(Icon, { name: "video" })), h("button", { className: `icon-button header-selection-toggle ${selecting ? "is-active" : ""}`, title: selecting ? "退出多选" : "多选消息", onClick: () => selecting ? onStartSelecting?.(false) : onStartSelecting?.(true) }, h(Icon, { name: "list" })), h("button", { className: "icon-button", title: "查看置顶消息", onClick: () => Toast.info(pinnedEventIds?.length ? `本房间有 ${pinnedEventIds.length} 条置顶消息，请从消息菜单管理` : "暂无置顶消息") }, h(Icon, { name: "pin" })), h("button", { className: "icon-button room-details-toggle", title: "房间详情（点击展开/收起）", onClick: onOpenDetails }, h(Icon, { name: "room", size: 18 })))),
+    h("div", { className: "message-scroll", ref: scrollRef, onScroll: e => { const current = e.currentTarget; if (restoredRoomRef.current !== room?.id) return; const distanceFromBottom = current.scrollHeight - current.scrollTop - current.clientHeight; stickToBottomRef.current = distanceFromBottom <= 120; setShowJump(distanceFromBottom > 260); rememberScrollPosition(room?.id); if (current.scrollTop <= 72 && !loadingEarlierRef.current && !historyExhausted) loadEarlier(); } }, h(UiButton, { className: "load-more", disabled: loadingEarlier || historyExhausted, onClick: loadEarlier }, loadingEarlier ? "正在加载更早的消息…" : historyExhausted ? "没有更早的消息了" : "加载更早的消息"), messages.map((item, i) => h(Message, { key: item.id || `empty-${i}`, item, client, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onMention: mention => { const user = mention?.userId ? client?.getUser?.(mention.userId) : null; const raw = mention?.name === "你" ? (user?.displayName || mention?.userId || "") : (mention?.name || mention?.userId || ""); const name = String(raw).replace(/^@/, "").trim(); if (!name) return; const current = String(draft || ""); const prefix = current && !/[\\s\\n]$/.test(current) ? " " : ""; inputRef.current?.insertText?.(`${prefix}@${name} `); } , onTogglePinMessage, pinnedEventIds, selecting, selected: forwardItems?.some?.(entry => entry.id === item.id), onSelect: onSelectForward })), showJump && h(UiButton, { className: "jump-bottom", onClick: jumpBottom }, "↓ 回到最新消息")),
+    h("div", { className: "composer-wrap" }, pendingPreview, typingUsers.length > 0 && h("div", { className: "typing-indicator", role: "status" }, h("span", { className: "typing-dots", "aria-hidden": "true" }, h("i"), h("i"), h("i")), h("span", null, typingUsers.length === 1 ? `${typingUsers[0]} 正在输入…` : `${typingUsers.slice(0, 2).join("、")} 正在输入…`)), (replyTo || threadRoot || editing) && h("div", { className: "reply-bar" }, h("span", null, editing ? "✎ 正在编辑消息" : threadRoot ? `⌁ 正在线程中回复：${String(threadRoot.text || threadRoot.attachment?.name || "消息").slice(0, 60)}` : `↩ 正在回复：${String(replyTo.text || replyTo.attachment?.name || "消息").slice(0, 60)}`), h("button", { onClick: editing ? cancelEditing : threadRoot ? onCancelThread : onCancelReply }, "×")), emojiSuggestions.length > 0 && h("div", { className: "emoji-inline-suggestions", role: "listbox", "aria-label": "表情联想" }, h("div", { className: "emoji-suggestion-mode" }, h("button", { type: "button", className: emojiSuggestionMode === "emoji" ? "active" : "", onClick: () => setEmojiSuggestionMode("emoji") }, "表情"), h("button", { type: "button", className: emojiSuggestionMode === "sticker" ? "active" : "", onClick: () => setEmojiSuggestionMode("sticker") }, "贴纸")), h("div", { className: "emoji-suggestion-items" }, emojiSuggestions.map(item => h("button", { type: "button", key: item.id, role: "option", title: item.name, onMouseDown: event => event.preventDefault(), onMouseEnter: () => setHoveredSuggestion(item), onMouseLeave: () => setHoveredSuggestion(null), onClick: () => emojiSuggestionMode === "sticker" ? selectSticker(item) : insertEmoji(item, { replaceQuery: true }) }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" }), h("span", null, item.name)))), hoveredSuggestion && createPortal(h("div", { className: "emoji-inline-preview", role: "tooltip" }, h("img", { src: assetRequestUrl(hoveredSuggestion.url || hoveredSuggestion.thumbUrl), alt: hoveredSuggestion.name }), h("strong", null, hoveredSuggestion.name)), document.body)), h("div", { className: "composer" }, h(HaloComposer, { key: `${room.id}:${room.name}`, ref: inputRef, value: draft, onChange: (value, html) => { setDraft(value); setDraftHtml(html || ""); updateEmojiSuggestions(value); onTyping(true); }, onKeyDown: keyDown, onFiles: handleFiles, placeholder: `发送消息到 ${room.name}`, emojiFallbackItems: (editing?.emojiRefs || []).map(entry => { const http = client?.mxcUrlToHttp?.(entry.mxc, 32, 32, "scale", false, true, true) || matrixDownloadFallbackUrl(client, entry.mxc); const src = mediaRequestUrl(client, http); return { name: entry.shortcode, shortcode: entry.shortcode, url: src, thumbUrl: src, mxc: entry.mxc }; }), toolbarExtra: h(React.Fragment, null, h(EmojiPicker, { onSelect: selectSticker, onInsert: insertEmoji }), h("button", { type: "button", className: `tool-button voice-record-button ${recording ? "is-recording" : ""}`, title: recording ? "停止录音并发送" : "录制语音", onClick: toggleRecording }, recording ? h(Icon, { name: "mic", size: 17 }) : h(Icon, { name: "mic", size: 17 })), h("button", { type: "button", className: "tool-button", title: "上传文件", onClick: () => fileRef.current?.click() }, h(Icon, { name: "attachment", size: 17 })), h("input", { ref: fileRef, type: "file", hidden: true, multiple: true, onChange: e => { handleFiles(e.target.files); e.target.value = ""; } }), h(UiButton, { variant: "primary", className: "send-button", disabled: sending, onClick: send }, editing ? "保存　↵" : "发送　↵")) })) , h("div", { className: "composer-hint" }, "Enter 发送 · Shift + Enter 换行")),
+    h(ThreadPanel, { root: threadRoot, replies: threadReplies, client, onClose: onCancelThread, onJumpTo })
+  );
+}
+
+function Details({ room, client, onInvite, onLeave, collapsed, onToggle, onRoomUpdated }) {
+  const [nameDraft, setNameDraft] = useState(room?.name || "");
+  const [savingName, setSavingName] = useState(false);
+  const [savingAvatar, setSavingAvatar] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [presenceByUser, setPresenceByUser] = useState({});
+  const avatarRef = useRef(null);
+  useEffect(() => { if (room) setNameDraft(room.name || ""); }, [room?.id, room?.name]);
+  useEffect(() => {
+    if (!room || !client?.getRoomPushRule) { setMuted(false); return; }
+    try {
+      const rule = client.getRoomPushRule("global", room.id);
+      setMuted(Boolean(rule?.actions?.includes?.("dont_notify")));
+    } catch { setMuted(false); }
+  }, [room?.id, client]);
+  useEffect(() => {
+    let active = true;
+    const ids = room?.matrixRoom?.getJoinedMembers?.().map(member => member.userId).filter(Boolean) || [];
+    if (!ids.length || typeof client?.getPresence !== "function") return () => { active = false; };
+    (async () => {
+      const next = {};
+      for (let start = 0; start < ids.length; start += 20) {
+        const batch = await Promise.all(ids.slice(start, start + 20).map(async userId => {
+          try { const result = await client.getPresence(userId); const value = String(result?.presence || "").toLowerCase(); return [userId, value || "unknown"]; } catch { return [userId, "unknown"]; }
+        }));
+        batch.filter(Boolean).forEach(([userId, value]) => { next[userId] = value; });
+        if (active) setPresenceByUser(current => ({ ...current, ...next }));
+      }
+    })();
+    return () => { active = false; };
+  }, [room?.id, client]);
+  if (!room) return null;
+  const members = room.matrixRoom?.getJoinedMembers?.() || [];
+  const saveRoomName = async () => { const value = nameDraft.trim(); if (!value || value === room.name) return; setSavingName(true); try { await client.sendStateEvent(room.id, "m.room.name", { name: value }, ""); Toast.success("房间名称已更新"); await onRoomUpdated?.(); } catch (error) { Toast.error(`房间名称更新失败：${error?.message || "请检查房间权限"}`); } finally { setSavingName(false); } };
+  const saveRoomAvatar = async file => { if (!file) return; setSavingAvatar(true); try { const uploaded = await client.uploadContent(file, { name: file.name, type: file.type }); await client.sendStateEvent(room.id, "m.room.avatar", { url: uploaded.content_uri }, ""); Toast.success("房间头像已更新"); await onRoomUpdated?.(); } catch (error) { Toast.error(`房间头像更新失败：${error?.message || "请检查房间权限"}`); } finally { setSavingAvatar(false); } };
+  const toggleRoomMute = async () => {
+    const next = !muted;
+    try {
+      if (typeof client.setRoomMutePushRule !== "function") throw new Error("当前 homeserver 不支持房间通知设置");
+      await client.setRoomMutePushRule("global", room.id, next);
+      setMuted(next);
+      Toast.success(next ? "已关闭该房间通知" : "已开启该房间通知");
+    } catch (error) { Toast.error(`房间通知设置失败：${error?.message || "请稍后重试"}`); }
+  };
+  const roomLink = room.matrixRoom?.getCanonicalAlias?.() || room.id;
+  const copyRoomLink = async () => {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(roomLink);
+      Toast.success("房间链接已复制");
+    } catch { Toast.error("房间链接复制失败，请手动复制"); }
+  };
+  if (collapsed) return null;
+  const memberData = members.map(member => {
+    const user = client?.getUser?.(member.userId);
+    const presence = member.userId === client?.getUserId?.() ? "online" : (presenceByUser[member.userId] || matrixPresence(client, member.userId));
+    const displayName = member.name || user?.displayName || member.userId;
+    return { member, user, presence, displayName };
+  });
+  const presenceRank = { online: 0, busy: 1, unavailable: 2, unknown: 3, offline: 4 };
+  const sortedMemberData = [...memberData].sort((a, b) => (presenceRank[a.presence] ?? 3) - (presenceRank[b.presence] ?? 3) || a.displayName.localeCompare(b.displayName, "zh-CN"));
+  const onlineCount = memberData.filter(item => ["online", "busy", "unavailable"].includes(item.presence)).length;
+  const offlineCount = memberData.filter(item => item.presence === "offline").length;
+  const memberRows = sortedMemberData.map(({ member, presence, displayName }) => {
+    const profile = h("div", { className: "member-popover" },
+      h("div", { className: "member-popover-name" }, displayName),
+      h("div", { className: "member-popover-id" }, member.userId),
+      h("div", { className: `member-popover-presence ${presence === "online" ? "presence-online" : presence === "offline" ? "presence-offline" : ""}` }, presence === "online" ? "在线" : presence === "offline" ? "离线" : "状态未知"));
+    return h(AntPopover, { content: profile, trigger: "click", placement: "left", key: member.userId },
+      h("div", { className: "member-row", title: "点击查看用户资料" },
+        h(MatrixAvatar, { client, mxcUrl: memberAvatarMxc(member), size: 34, className: "member-avatar", style: { background: colorFor(member.userId) }, fallback: initials(displayName), alt: displayName }),
+        h("div", { className: "member-copy" }, h("div", { className: "member-name", title: displayName }, displayName), h("div", { className: "member-id", title: member.userId }, member.userId)),
+        h("span", { className: `member-presence-badge ${presence === "online" ? "online" : presence === "offline" ? "offline" : "unknown"}` }, h("i", null), presence === "online" ? "在线" : presence === "offline" ? "离线" : "未知")));
+  });
+  return h("aside", { className: "details-panel" },
+    h("div", { className: "details-title" }, "房间详情", h("div", { className: "details-title-actions" }, h(UiButton, { size: "small", title: "收起房间详情", onClick: onToggle }, "收起"), h(UiButton, { size: "small", danger: true, title: "退出房间", onClick: onLeave }, "退出"))),
+    h("div", { className: "details-room" }, h("button", { type: "button", className: "details-room-avatar-button", title: "更换房间头像", onClick: () => avatarRef.current?.click?.() }, h(MatrixAvatar, { client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 56, style: { background: room.color, width: 56, height: 56 }, fallback: room.initials, alt: room.name }), h("span", { className: "details-room-avatar-edit" }, savingAvatar ? "…" : "✎")), h("input", { ref: avatarRef, type: "file", accept: "image/*", hidden: true, onChange: e => { const file = e.target.files?.[0]; e.target.value = ""; saveRoomAvatar(file); } }), h("div", { className: "details-room-name" }, h(Input, { value: nameDraft, onChange: setNameDraft, onPressEnter: saveRoomName, suffix: h(UiButton, { size: "small", type: "text", loading: savingName, disabled: !nameDraft.trim() || nameDraft.trim() === room.name, onClick: saveRoomName }, "保存"), "aria-label": "房间名称" })), h("div", { className: "details-room-edit-hint" }, "点击头像更换 · Enter 保存名称"), h("div", { className: "details-room-desc" }, room.desc)),
+    h("div", { className: "details-section details-room-options" },
+      h("div", { className: "details-section-head" }, h("span", null, "房间设置")),
+      h("div", { className: "room-setting-row" }, h("div", { className: "room-setting-copy" }, h("strong", null, "房间通知"), h("span", null, muted ? "已静音，不接收此房间提醒" : "接收此房间的新消息提醒")), h(UiButton, { size: "small", className: muted ? "room-setting-muted" : "", onClick: toggleRoomMute }, muted ? "已静音" : "已开启")),
+      h("div", { className: "room-setting-row room-link-row" }, h("div", { className: "room-setting-copy" }, h("strong", null, "房间链接"), h("span", { title: roomLink }, roomLink)), h(UiButton, { size: "small", onClick: copyRoomLink }, "复制"))
+    ),
+    h("div", { className: "details-section" },
+      h("div", { className: "details-section-head" }, h("span", null, "成员", h("span", { className: "member-count" }, room.members)), h("button", { className: "detail-link", onClick: onInvite }, "邀请成员")),
+      h("div", { className: "member-summary" }, h("span", { className: "member-summary-total" }, `${room.members} 位成员`), h("span", { className: "member-summary-online" }, `● ${onlineCount} 在线`), h("span", { className: "member-summary-offline" }, `○ ${offlineCount} 离线`)),
+      h("div", { className: "member-stack" }, sortedMemberData.slice(0, 5).map(({ member, displayName }) => h("div", { className: "member-avatar-wrap", key: member.userId, title: `${displayName} · ${member.userId}` }, h(MatrixAvatar, { client, mxcUrl: memberAvatarMxc(member), size: 32, className: "member-avatar", style: { background: colorFor(member.userId) }, fallback: initials(displayName), alt: displayName }))), members.length > 5 && h("span", { className: "member-count" }, `+${members.length - 5}`)),
+      h("div", { className: "member-list" }, memberRows)),
+    h("div", { className: "privacy-note" }, "🔒 房间事件和消息通过 Matrix Client-Server API 同步。加密状态由该房间的 Matrix 状态事件决定."));
+}
+
+function App() {
+  const [connected, setConnected] = useState(null); const [rooms, setRooms] = useState([]); const [invites, setInvites] = useState([]); const [messages, setMessages] = useState({}); const [typingByRoom, setTypingByRoom] = useState({}); const [selectedId, setSelectedId] = useState(null); const [showLogin, setShowLogin] = useState(false); const [showRoom, setShowRoom] = useState(false); const [showSpace, setShowSpace] = useState(false); const [showSpaceRooms, setShowSpaceRooms] = useState(false); const [showAccount, setShowAccount] = useState(false); const [showInvite, setShowInvite] = useState(false); const [showSearch, setShowSearch] = useState(false); const [replyTo, setReplyTo] = useState(null); const [threadRoot, setThreadRoot] = useState(null); const [editing, setEditing] = useState(null); const [syncing, setSyncing] = useState(false); const [presence, setPresence] = useState("online"); const [viewMode, setViewMode] = useState("messages"); const [activeSpaceId, setActiveSpaceId] = useState(null);
+  const excludedRoomIdsRef = useRef(new Set()); const pendingJoinRoomIdsRef = useRef(new Set()); const optimisticJoinedRoomsRef = useRef(new Map()); const locallyReadRoomsRef = useRef(new Map()); const stickerSendingRef = useRef(false); const refreshTimer = useRef(null); const selectedIdRef = useRef(null); const roomsRef = useRef([]); const [detailsCollapsed, setDetailsCollapsed] = useState(false); const [forwardItems, setForwardItems] = useState([]); const [selecting, setSelecting] = useState(false); const [showForward, setShowForward] = useState(false); const [, setEmojiCatalogReady] = useState(0); const [callSession, setCallSession] = useState(null); const callSessionRef = useRef(null); const ringtoneRef = useRef(null);
+  useEffect(() => { selectedIdRef.current = selectedId; }, [selectedId]);
+  useEffect(() => { roomsRef.current = rooms; window.orbitAllRooms = rooms; }, [rooms]);
+  useEffect(() => { callSessionRef.current = callSession; }, [callSession]);
+  useEffect(() => {
+    const client = connected?.client;
+    if (!client) return undefined;
+    const seenRtc = new Set();
+    const notifyIncoming = (name, kind, roomId) => {
+      if (typeof Notification === "function" && Notification.permission === "granted" && (document.hidden || !document.hasFocus?.())) {
+        try { new Notification(`${name} 来电`, { body: kind === "video" ? "视频通话" : "语音通话", tag: `orbit-${encodeURIComponent(roomId || name)}`, renotify: true, data: { roomId } }); } catch {}
+      }
+    };
+    const onIncoming = incoming => {
+      if (!incoming) return;
+      const current = callSessionRef.current;
+      if (hasActiveOrbitCall(current) && current.call !== incoming) {
+        try {
+          if (incoming.state === "ringing") incoming.reject?.();
+          else incoming.hangup?.(CALL_ERROR.userBusy, false);
+        } catch {}
+        Toast.info("已有通话进行中，新来电已拒绝");
+        return;
+      }
+      const kind = orbitCallKind(incoming, incoming.type === "video" ? "video" : "voice");
+      const roomEntry = (roomsRef.current || []).find(item => item.id === incoming.roomId);
+      bindOrbitCall(incoming, { kind, direction: "inbound", ...(roomEntry ? { opponent: { name: roomEntry.name, userId: roomEntry.directUserId, avatarMxc: roomEntry.avatarMxc, color: roomEntry.color, initials: roomEntry.initials } } : {}) }, setCallSession, callSessionRef, ringtoneRef);
+      const opponent = orbitCallOpponent(incoming, roomsRef.current || []);
+      notifyIncoming(opponent.name, kind, incoming.roomId);
+    };
+    const handleRtcEvent = event => {
+      if (!event) return;
+      const decline = parseRtcDecline(event);
+      if (decline) {
+        const current = callSessionRef.current;
+        if (current?.mode === "element" && current.state === "ringing" && current.notificationEventId && current.notificationEventId === decline.notificationEventId) {
+          stopOrbitRingtone(ringtoneRef);
+          if (current.expireTimer) clearTimeout(current.expireTimer);
+          callSessionRef.current = null;
+          setCallSession(null);
+          Toast.info("通话已取消");
+        }
+        return;
+      }
+      if (event.getSender?.() === client.getUserId?.()) return;
+      const parsed = parseRtcNotification(event);
+      if (!parsed?.eventId) return;
+      if (seenRtc.has(parsed.eventId)) return;
+      seenRtc.add(parsed.eventId);
+      if (parsed.expired) return;
+      const roomEntry = (roomsRef.current || []).find(item => item.id === parsed.roomId);
+      const opponentName = roomEntry?.name || "未知用户";
+      if (!parsed.isRing) {
+        Toast.info(`${opponentName} 发起了${parsed.kind === "video" ? "视频" : "语音"}通话`);
+        return;
+      }
+      if (hasActiveOrbitCall(callSessionRef.current)) {
+        Toast.info("已有通话进行中");
+        return;
+      }
+      const opponent = {
+        name: opponentName,
+        userId: parsed.sender || roomEntry?.directUserId || "",
+        avatarMxc: roomEntry?.avatarMxc,
+        color: roomEntry?.color || colorFor(parsed.sender || parsed.roomId || opponentName),
+        initials: roomEntry?.initials || initials(opponentName),
+      };
+      const expireTimer = window.setTimeout(() => {
+        const current = callSessionRef.current;
+        if (current?.mode === "element" && current.state === "ringing" && current.notificationEventId === parsed.eventId) {
+          stopOrbitRingtone(ringtoneRef);
+          callSessionRef.current = null;
+          setCallSession(null);
+          Toast.info("来电已超时");
+        }
+      }, Math.max(0, parsed.expiresAt - Date.now()));
+      const session = {
+        mode: "element",
+        embed: null,
+        iframe: null,
+        notificationEventId: parsed.eventId,
+        expireTimer,
+        roomId: parsed.roomId,
+        kind: parsed.kind,
+        direction: "inbound",
+        state: "ringing",
+        muted: false,
+        videoMuted: parsed.kind !== "video",
+        startedAt: null,
+        opponent,
+        error: null,
+        feeds: [],
+      };
+      callSessionRef.current = session;
+      setCallSession(session);
+      if (!ringtoneRef.current) ringtoneRef.current = createOrbitRingtone();
+      notifyIncoming(opponent.name, parsed.kind, parsed.roomId);
+    };
+    const onTimeline = (event, room, toStartOfTimeline) => {
+      if (toStartOfTimeline) return;
+      handleRtcEvent(event);
+    };
+    client.on(CALL_INCOMING, onIncoming);
+    client.on(ROOM_TIMELINE, onTimeline);
+    client.on(EVENT_DECRYPTED, handleRtcEvent);
+    return () => {
+      client.off?.(CALL_INCOMING, onIncoming);
+      client.off?.(ROOM_TIMELINE, onTimeline);
+      client.off?.(EVENT_DECRYPTED, handleRtcEvent);
+    };
+  }, [connected?.client]);
+  const rememberRoomRead = (roomId, event) => {
+    const eventId = event?.getId?.();
+    if (!roomId || !eventId) return;
+    locallyReadRoomsRef.current.set(roomId, { eventId, ts: Number(event?.getTs?.() || Date.now()) });
+  };
+  useEffect(() => {
+    const client = connected?.client;
+    const room = selectedId ? client?.getRoom?.(selectedId) : null;
+    if (!client || !room || document.hidden) return;
+    const scrollNode = document.querySelector(".message-scroll");
+    if (!scrollNode || scrollNode.scrollHeight - scrollNode.scrollTop - scrollNode.clientHeight > 140) return;
+    const events = room.getLiveTimeline?.().getEvents?.() || [];
+    const readUpTo = room.getEventReadUpTo?.(client.getUserId?.(), true); const readIndex = readUpTo ? events.findIndex(event => event.getId?.() === readUpTo) : -1; const target = readIndex >= 0 ? [...events.slice(readIndex + 1)].reverse().find(event => event?.getId?.() && !room.hasPendingEvent?.(event.getId())) : [...events].reverse().find(event => event?.getId?.() && !room.hasPendingEvent?.(event.getId()));
+    if (!target) return;
+    rememberRoomRead(selectedId, target);
+    setRooms(current => current.map(entry => entry.id === selectedId ? { ...entry, unread: 0, hasUnread: false } : entry));
+    const previous = locallyReadRoomsRef.current.get(selectedId);
+    if (previous?.eventId === target.getId?.()) return;
+    markRoomRead(client, selectedId, target).then(() => { rememberRoomRead(selectedId, target); queueRefresh(client); }).catch(() => {});
+  }, [connected?.client, selectedId, messages[selectedId]?.length]);
+  useEffect(() => { const client = connected?.client; const crypto = client?.getCrypto?.(); if (!client) return; const eventName = MatrixSDK.CryptoEvent?.VerificationRequestReceived || "crypto.verificationRequestReceived"; const onRequest = request => { if (request && !request.initiatedByMe) Toast.info(`收到设备验证请求：${request.otherDeviceId || "其他设备"}，请打开“我的设置 → 设备与安全”`); }; client.on?.(eventName, onRequest); crypto?.on?.(eventName, onRequest); return () => { client.off?.(eventName, onRequest); crypto?.off?.(eventName, onRequest); }; }, [connected?.client]);
+  useEffect(() => { ensureEmojiCatalog().then(() => setEmojiCatalogReady(value => value + 1)); }, []);
+  const onForward = (item, append = false) => {
+    // Right-click → 转发 enters the same batch-selection flow as the header
+    // button, with the originating message selected automatically.
+    setSelecting(true);
+    setForwardItems(current => append
+      ? (current.some(entry => entry.id === item.id) ? current : [...current, item])
+      : [item]);
+  };
+  const toggleForwardItem = item => setForwardItems(current => current.some(entry => entry.id === item.id) ? current.filter(entry => entry.id !== item.id) : [...current, item]);
+  const redactSelected = async () => {
+    const selected = [...forwardItems];
+    if (!selected.length) return;
+    const own = selected.filter(item => item.isMe && item.id);
+    const skipped = selected.length - own.length;
+    if (!own.length) return Toast.warning("只能撤回自己发送的消息");
+    if (!confirm(`确定撤回已选的 ${own.length} 条消息吗？`)) return;
+    try {
+      for (const item of own) await connected.client.redactEvent(room.id, item.id);
+      Toast.success(`已撤回 ${own.length} 条消息${skipped ? `，跳过 ${skipped} 条无权限消息` : ""}`);
+      setForwardItems([]); setSelecting(false); await refresh(connected.client);
+    } catch (error) { Toast.error(`批量撤回失败：${error?.message || "未知错误"}`); }
+  };
+  const leaveSpace = async () => {
+    const space = spaces.find(item => item.id === activeSpaceId);
+    if (!space) return;
+    if (!confirm(`确定退出空间「${space.name}」吗？空间内房间不会被删除。`)) return;
+    try { excludedRoomIdsRef.current.add(space.id); window.orbitExcludedRooms = excludedRoomIdsRef.current; await connected.client.leave(space.id); setRooms(current => current.filter(item => item.id !== space.id)); setActiveSpaceId(null); setSelectedId(null); setViewMode("messages"); await refresh(connected.client); Toast.success("已退出空间"); } catch (error) { Toast.error(`退出空间失败：${error?.message || "请确认空间权限"}`); }
+  };
+  window.orbitLeaveSpace = leaveSpace;
+  React.useEffect(() => {
+    window.orbitBatchRedact = redactSelected;
+    const bar = document.querySelector(".forward-bar:not(.forward-bar-empty)");
+    if (!bar || bar.querySelector(".batch-redact-dom")) return;
+    const button = document.createElement("button");
+    button.type = "button"; button.className = "batch-redact-dom"; button.textContent = "批量撤回";
+    button.addEventListener("click", () => window.orbitBatchRedact?.());
+    bar.insertBefore(button, bar.lastElementChild);
+    return () => button.remove();
+  }, [forwardItems.length]);
+  const [cryptoState, setCryptoState] = useState({ available: false, backupInfo: null, activeVersion: null, verified: false, localTrusted: false, keyRestored: false, restoring: false, restoreProgress: 0, restoreStage: "idle", error: null });
+  React.useEffect(() => { if (!connected?.client) return; const timer = setTimeout(() => retryLoadedRoomDecryption(connected.client).then(() => queueRefresh(connected.client)).catch(() => {}), 8000); return () => clearTimeout(timer); }, [connected?.client]);
+  const refreshCrypto = async client => { const crypto = client?.getCrypto?.(); if (!crypto) return setCryptoState(s => ({ ...s, available: false, error: s.error || "加密模块尚未就绪，请重新登录或刷新页面" })); try { const backupInfo = await crypto.getKeyBackupInfo?.(); const activeVersion = await crypto.getActiveSessionBackupVersion?.(); const currentStatus = await Promise.resolve(crypto.getDeviceVerificationStatus?.(client.getUserId?.(), client.getDeviceId?.())).catch(() => null); const persistedTrust = localStorage.getItem(localVerificationKey(client)) === "1"; const deviceVerified = Boolean(currentStatus?.crossSigningVerified || persistedTrust); const localTrusted = Boolean(currentStatus?.localVerified || persistedTrust); if (persistedTrust && !currentStatus?.crossSigningVerified) { try { await crypto.setDeviceVerified?.(client.getUserId?.(), client.getDeviceId?.(), true); } catch {} } setCryptoState(s => ({ ...s, available: true, verified: deviceVerified, localTrusted, backupInfo: backupInfo || null, activeVersion: activeVersion || backupInfo?.version || null, error: null })); } catch (error) { setCryptoState(s => ({ ...s, available: true, error: error?.message || "无法读取密钥备份状态" })); } };
+  const refresh = async client => {
+    const allRooms = client.getRooms();
+    const pendingJoinIds = pendingJoinRoomIdsRef.current;
+    const optimisticJoined = optimisticJoinedRoomsRef.current;
+    // Once the sync loop reflects the join, the temporary optimistic entry is
+    // no longer needed. Until then, keep the room out of the invite section.
+    allRooms.forEach(room => {
+      if (room.getMyMembership?.() === "join") {
+        pendingJoinIds.delete(room.roomId);
+        optimisticJoined.delete(room.roomId);
+      }
+    });
+    const pending = allRooms.filter(room => room.getMyMembership?.() === "invite" && !pendingJoinIds.has(room.roomId)).map(room => roomToView(room, client));
+    setInvites(pending);
+    const joinedViews = allRooms.filter(room => room.getMyMembership?.() === "join" || pendingJoinIds.has(room.roomId)).map(room => {
+      const view = roomToView(room, client);
+      const localRead = locallyReadRoomsRef.current.get(room.roomId);
+      if (!localRead) return view;
+      const last = room.getLastLiveEvent?.() || room.getLiveTimeline?.().getEvents?.().slice(-1)[0];
+      const lastId = last?.getId?.();
+      const lastTs = Number(last?.getTs?.() || 0);
+      // Do not let a lagging SDK unread cache resurrect a badge. A genuinely
+      // newer remote event removes this override in the timeline listener.
+      if (lastId === localRead.eventId || lastTs <= localRead.ts) {
+        view.unread = 0;
+        view.hasUnread = false;
+      }
+      return view;
+    });
+    const joinedIds = new Set(joinedViews.map(room => room.id));
+    const fallbackViews = [...optimisticJoined.values()].filter(room => !joinedIds.has(room.id));
+    const next = [...joinedViews, ...fallbackViews].sort((a, b) => { if (a.pinned !== b.pinned) return a.pinned ? -1 : 1; return (b.matrixRoom.getLastLiveEvent?.()?.getTs?.() || b.lastTs || 0) - (a.matrixRoom.getLastLiveEvent?.()?.getTs?.() || a.lastTs || 0); });
+    setRooms(next); setSelectedId(id => id || next[0]?.id || null);
+    const nextMessages = {}; await Promise.all(next.map(async room => { nextMessages[room.id] = await roomMessages(room.matrixRoom, client.getUserId(), client); })); setMessages(current => ({ ...current, ...nextMessages }));
+    // Presence returned by Matrix is often `offline` when a client has not
+    // explicitly published presence.  The connection indicator should reflect
+    // the sync session, not that optional presence hint.
+    if (client.isRunning?.() !== false) setPresence("online");
+  };
+  const acceptInvite = async invite => { try {
+    // matrix-js-sdk exposes room joins as joinRoom(); older Orbit builds used
+    // client.join(), which is not present in the current SDK and caused the
+    // invite action to fail before any request was sent.
+    const join = connected.client?.joinRoom || connected.client?.join;
+    if (typeof join !== "function") throw new Error("当前 Matrix SDK 不支持加入房间");
+    pendingJoinRoomIdsRef.current.add(invite.id);
+    // Keep a renderable copy in case the SDK waits for the next sync response
+    // before exposing the newly joined room through getRooms().
+    optimisticJoinedRoomsRef.current.set(invite.id, { ...invite, unread: 0, hasUnread: false, lastTs: Date.now(), time: "刚刚" });
+    const inviteMember = invite.matrixRoom?.getMember?.(connected.userId);
+    const inviterId = inviteMember?.events?.member?.getSender?.() || inviteMember?.events?.member?.getContent?.()?.sender;
+    const crypto = connected.client.getCrypto?.();
+    if (inviterId) { try { await crypto?.markRoomAsPendingKeyBundle?.(invite.id, inviterId); } catch (error) { console.warn("Unable to mark pending history bundle", error); } }
+    await join.call(connected.client, invite.id);
+    if (inviterId) { try { await crypto?.maybeAcceptKeyBundle?.(invite.id, inviterId); } catch (error) { console.warn("Unable to import encrypted history bundle", error); } }
+    Toast.success(`已加入「${invite.name}」`);
+    setInvites(current => current.filter(item => item.id !== invite.id));
+    setRooms(current => [optimisticJoinedRoomsRef.current.get(invite.id), ...current.filter(item => item.id !== invite.id)]);
+    setViewMode(invite.isSpace ? "spaces" : invite.isGroup ? "groups" : "messages");
+    if (invite.isSpace) setActiveSpaceId(invite.id);
+    setSelectedId(invite.id);
+    await refresh(connected.client);
+  } catch (error) {
+    pendingJoinRoomIdsRef.current.delete(invite.id);
+    optimisticJoinedRoomsRef.current.delete(invite.id);
+    await refresh(connected.client).catch(() => {});
+    Toast.error(`接受邀请失败：${error?.message || "请稍后重试"}`);
+  } };
+  const declineInvite = async invite => { try { await connected.client.leave(invite.id); Toast.success("已忽略房间邀请"); await refresh(connected.client); } catch (error) { Toast.error(`忽略邀请失败：${error?.message || "请稍后重试"}`); } };
+  const queueRefresh = client => { if (refreshTimer.current) return; refreshTimer.current = setTimeout(() => { refreshTimer.current = null; refresh(client).catch(error => console.warn("刷新房间失败", error)); }, 250); };
+  const restoreKeys = async ({ type, key, passphrase, version }) => { const crypto = connected?.client?.getCrypto?.(); if (!crypto || !version) return; setCryptoState(s => ({ ...s, restoring: true, restoreProgress: 0, restoreStage: "prepare", error: null })); try {
+    if (type === "key") {
+      // Element's recovery key is the Secret Storage key. It must first
+      // unwrap m.megolm_backup.v1; it is not necessarily the room-backup key.
+      window.orbitRecoveryKeyBytes = key;
+      try { localStorage.setItem(recoveryStorageKey(connected.client.getUserId?.()), encodeBase64Url(key)); } catch {}
+      if (typeof crypto.loadSessionBackupPrivateKeyFromSecretStorage === "function") {
+        try {
+          await crypto.loadSessionBackupPrivateKeyFromSecretStorage();
+        } catch (error) {
+          // Keep compatibility with legacy backups that stored the backup key
+          // directly rather than in Secret Storage.
+          if (typeof crypto.storeSessionBackupPrivateKey !== "function") throw error;
+          await crypto.storeSessionBackupPrivateKey(key, version);
+        }
+      } else if (typeof crypto.storeSessionBackupPrivateKey === "function") {
+        await crypto.storeSessionBackupPrivateKey(key, version);
+      } else {
+        throw new Error("当前加密模块不支持恢复密钥");
+      }
+    }
+    if (type === "secret") { if (typeof crypto.loadSessionBackupPrivateKeyFromSecretStorage === "function") { try { await crypto.loadSessionBackupPrivateKeyFromSecretStorage(); } catch (error) { const stored = await crypto.isKeyBackupKeyStored?.(version); if (!stored) throw error; } } }
+    const progressCallback = p => setCryptoState(s => ({ ...s, restoreStage: p?.stage || s.restoreStage, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })); const result = type === "passphrase" ? await crypto.restoreKeyBackupWithPassphrase(passphrase, { progressCallback }) : await crypto.restoreKeyBackup({ progressCallback }); try { await crypto.bootstrapCrossSigning?.({ authUploadDeviceSigningKeys: async () => ({}) }); } catch {} const retried = await retryLoadedRoomDecryption(connected.client); await refresh(connected.client); setCryptoState(s => ({ ...s, restoring: false, restoreProgress: 100, restoreStage: "done", keyRestored: true })); Toast.success(`密钥恢复完成，导入 ${result?.imported ?? 0} 个会话，已重试解密 ${retried} 条已加载消息。`); } catch (error) { const raw = error?.message || "密钥恢复失败"; const mismatch = /does not match|mismatch|match.*decryption key/i.test(raw); const message = mismatch ? `恢复密钥与服务器备份版本 ${version} 不匹配。请确认这是该账号当前 Secret Storage 的恢复密钥；如果备份曾重置，请从 Element“设置 → 安全与隐私”获取最新密钥。` : raw; setCryptoState(s => ({ ...s, restoring: false, restoreStage: "error", error: message })); Toast.error(message); } };
+  const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); setSyncing(true); setTimeout(() => setSyncing(false), 15000); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setPresence("offline"); setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const authExpired = /unknown token|M_UNKNOWN_TOKEN|401/i.test(text); const message = authExpired ? (client.getRefreshToken?.() ? "Matrix 访问令牌过期，正在尝试刷新" : "Matrix 登录状态已失效，请重新登录") : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired && !client.getRefreshToken?.()) { client.stopClient?.(); window.orbitMatrixClient = null; localStorage.removeItem(MATRIX_SESSION_STORAGE_KEY); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); } }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room, toStartOfTimeline) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const selectedRoom = room?.roomId === selectedIdRef.current; const scrollNode = selectedRoom ? document.querySelector(".message-scroll") : null; const nearBottom = Boolean(scrollNode && scrollNode.scrollHeight - scrollNode.scrollTop - scrollNode.clientHeight <= 140); if (selectedRoom && !document.hidden && nearBottom) { Promise.resolve(markRoomRead(client, room?.roomId, event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && !toStartOfTimeline && eventId && (room?.roomId !== selectedIdRef.current || document.hidden || !document.hasFocus?.() || !nearBottom); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); if (!hasDecryptedNotificationContent(event)) { const timer = setTimeout(() => { orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body: "收到加密消息", compact: true }); }, 1400); orbitPendingEncryptedNotifications.set(eventId, { room, eventId, title, timer }); } else { markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body }); } } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", () => { queueRefresh(client); }); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user?.presence === "offline" ? "online" : (user?.presence || "online")); queueRefresh(client); }); client.on("Event.decrypted", event => { queueRefresh(client); const eventId = event?.getId?.(); const pending = eventId && orbitPendingEncryptedNotifications.get(eventId); if (!pending) return; clearTimeout(pending.timer); orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room: pending.room, roomId: pending.room?.roomId, eventId, title: pending.title, body: notificationBody(event) }); }); queueRefresh(client); setShowLogin(false); };
+  React.useEffect(() => { const session = readMatrixSession(); if (!session) return; (async () => { try { loadPersistedRecoveryKey(session.userId); const resolved = await resolveHomeserver(session.homeserver); const client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, session); await initCryptoSafely(client); try { await client.getCrypto?.()?.loadSessionBackupPrivateKeyFromSecretStorage?.(); } catch {} window.orbitMatrixClient = client; connectedHandler({ client, userId: session.userId, homeserver: resolved.homeserver }); startOrbitSync(client, resolved); } catch { localStorage.removeItem(MATRIX_SESSION_STORAGE_KEY); } })(); }, []);
+  React.useEffect(() => {
+    const url = new URL(window.location.href);
+    const loginToken = url.searchParams.get("loginToken");
+    if (!loginToken) return;
+    const pendingRaw = localStorage.getItem("orbit.matrix.sso.pending");
+    url.searchParams.delete("loginToken"); url.searchParams.delete("matrix_sso");
+    window.history.replaceState({}, document.title, `${url.pathname}${url.search}${url.hash}`);
+    if (!pendingRaw) return Toast.error("SSO 登录信息已过期，请重新开始登录");
+    (async () => {
+      try {
+        const pending = JSON.parse(pendingRaw);
+        const { resolved, result, session, client } = await loginWithMatrixToken(pending.homeserver, loginToken);
+        localStorage.removeItem("orbit.matrix.sso.pending");
+        saveMatrixSession(session);
+        window.orbitMatrixClient = client;
+        connectedHandler({ client, userId: result.user_id, homeserver: resolved.homeserver });
+        startOrbitSync(client, resolved);
+        Toast.success("SSO 登录成功，正在同步房间");
+      } catch (error) { localStorage.removeItem("orbit.matrix.sso.pending"); Toast.error(`SSO 登录失败：${error?.message || "请重新尝试"}`); }
+    })();
+  }, []);
+  React.useEffect(() => {
+    const client = connected?.client; const userId = connected?.userId;
+    if (!client) return;
+    const onTyping = (_event, member) => {
+      const roomId = member?.roomId || member?.room?.roomId;
+      if (!roomId) return;
+      const matrixRoom = client.getRoom?.(roomId) || member?.room;
+      const names = (matrixRoom?.getTypingMembers?.() || []).filter(entry => entry?.userId !== userId).map(entry => entry?.name || entry?.rawDisplayName || entry?.userId).filter(Boolean);
+      setTypingByRoom(current => ({ ...current, [roomId]: names }));
+    };
+    client.on?.("RoomMember.typing", onTyping);
+    return () => client.off?.("RoomMember.typing", onTyping);
+  }, [connected?.client, connected?.userId]);
+  React.useEffect(() => {
+    const client = connected?.client;
+    if (!client) return undefined;
+    const onAuthSyncError = (state, _previous, data) => {
+      if (state !== "ERROR") return;
+      const raw = data?.error?.message || data?.error?.errcode || data?.errorCode || data?.errcode || "";
+      const text = String(raw);
+      if (!/token is not active|invalid refresh token|tokenrefresherror/i.test(text)) return;
+      client.stopClient?.(); window.orbitMatrixClient = null;
+      localStorage.removeItem(MATRIX_SESSION_STORAGE_KEY);
+      setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); setShowLogin(true);
+      Toast.error("Matrix 登录会话已失效（与消息解密/设备验证无关），请重新登录后继续加载历史消息。");
+    };
+    client.on("sync", onAuthSyncError);
+    return () => client.off?.("sync", onAuthSyncError);
+  }, [connected?.client]);
+  React.useEffect(() => {
+    const client = connected?.client;
+    if (!client?.sendMessage) return;
+    const original = client.sendMessage.bind(client);
+    client.sendMessage = (roomId, content, ...rest) => {
+      const room = client.getRoom?.(roomId);
+      const inferred = [...String(content?.body || "").matchAll(/@([^\s@<>,，。！？!?]+)/g)].map(match => {
+        const label = match[1];
+        const member = (room?.getJoinedMembers?.() || []).find(entry => String(entry?.name || entry?.rawDisplayName || "").replace(/^@/, "") === label);
+        return member ? { userId: member.userId, name: label } : null;
+      }).filter(Boolean);
+      const pending = [...(window.orbitPendingMentions?.[roomId] || []), ...inferred];
+      if (content?.msgtype === "m.text" && pending.length) {
+        const valid = pending.filter(entry => entry?.userId && String(content.body || "").includes(`@${String(entry.name || "").replace(/^@/, "")}`));
+        if (valid.length) {
+          content = { ...content, "m.mentions": { user_ids: [...new Set(valid.map(entry => entry.userId))] } };
+          if (!content.formatted_body) {
+            content.format = "org.matrix.custom.html";
+            content.formatted_body = mentionHtml(content.body, valid);
+          }
+        }
+        const next = { ...(window.orbitPendingMentions || {}) }; delete next[roomId]; window.orbitPendingMentions = next;
+      }
+      return original(roomId, content, ...rest);
+    };
+    return () => { client.sendMessage = original; };
+  }, [connected?.client]);
+  const spaces = useMemo(() => rooms.filter(item => item.isSpace), [rooms]);
+  const visibleRooms = useMemo(() => { if (viewMode === "spaces") { const space = spaces.find(item => item.id === activeSpaceId); if (!space) return []; const childIds = new Set(spaceChildIds(space.matrixRoom)); return rooms.filter(item => !item.isSpace && (childIds.has(item.id) || roomParentSpaceIds(item.matrixRoom).includes(space.id))); } if (viewMode === "groups") return rooms.filter(item => item.isGroup); return rooms.filter(item => !item.isSpace && item.isDirect); }, [rooms, spaces, viewMode, activeSpaceId]);
+  const room = useMemo(() => rooms.find(item => item.id === selectedId) || visibleRooms.find(item => item.id === selectedId) || null, [rooms, visibleRooms, selectedId]);
+  const loadMore = async () => { if (!connected || !room) return false; try { await ensureMatrixAccessToken(connected.client); const matrixRoom = room.matrixRoom; const before = (messages[room.id] || []).filter(item => item.type !== "empty").length; const beforeToken = matrixRoom?.oldState?.paginationToken; await connected.client.scrollback(matrixRoom, 40); const loaded = await roomMessages(matrixRoom, connected.userId, connected.client); const next = loaded.filter(item => item.type !== "empty"); setMessages(current => ({ ...current, [room.id]: loaded })); const afterToken = matrixRoom?.oldState?.paginationToken; const reachedStart = afterToken === null; // Continue only when scrollback made observable progress; some homeservers keep returning the same page at the boundary.
+    return (!next.length && before === 0) || next.length > before || (!reachedStart && afterToken !== beforeToken); } catch (error) { const raw = String(error?.message || ""); const authExpired = /unknown token|token is not active|invalid refresh token|M_UNKNOWN_TOKEN|401/i.test(raw); if (authExpired) { connected.client.stopClient?.(); window.orbitMatrixClient = null; localStorage.removeItem(MATRIX_SESSION_STORAGE_KEY); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); setShowLogin(true); Toast.error("Matrix 登录会话已失效（与消息解密/设备验证无关），请重新登录后再加载历史消息。"); } else Toast.error(`历史消息加载失败：${raw || "未知错误"}`); return false; } };
+  const send = async (text, _html, mentions = [], resolvedEmoji = []) => {
+    if (!connected || !room) return;
+    try {
+      if (editing) {
+        const validMentions = (mentions || []).filter(entry => entry?.userId && String(text).includes(`@${String(entry.name || "").replace(/^@/, "")}`));
+        const editedContent = resolvedEmoji.length ? createEmojiTextContent(text, resolvedEmoji, validMentions) : { msgtype: "m.text", body: text };
+        if (!resolvedEmoji.length && _html && editorHtmlHasUserFormatting(_html)) {
+          editedContent.format = "org.matrix.custom.html";
+          editedContent.formatted_body = sanitizeOutgoingEditorHtml(_html, text);
+        }
+        if (!editedContent.formatted_body && hasMarkdownSyntax(text)) {
+          const markdownHtml = markdownToHtml(text);
+          if (markdownHtml) { editedContent.format = "org.matrix.custom.html"; editedContent.formatted_body = markdownHtml; }
+        }
+        const replacementContent = {
+          msgtype: "m.text",
+          body: `* ${editedContent.body || text}`,
+          "m.new_content": editedContent,
+          "m.relates_to": { rel_type: "m.replace", event_id: editing.id },
+        };
+        await connected.client.sendMessage(room.id, replacementContent);
+        setEditing(null);
+      } else {
+        const validMentions = (mentions || []).filter(entry => entry?.userId && String(text).includes(`@${String(entry.name || "").replace(/^@/, "")}`));
+        let content = resolvedEmoji.length
+          ? createEmojiTextContent(text, resolvedEmoji, validMentions)
+          : { msgtype: "m.text", body: text };
+        // Preserve interoperable Matrix formatting generated by the editor.
+        // Plain messages stay compact; formatted messages carry the standard
+        // org.matrix.custom.html fields understood by Element/Cinny.
+        if (!resolvedEmoji.length && _html && editorHtmlHasUserFormatting(_html)) {
+          content.format = "org.matrix.custom.html";
+          content.formatted_body = sanitizeOutgoingEditorHtml(_html, text);
+        }
+        if (!content.formatted_body && hasMarkdownSyntax(text)) {
+          const markdownHtml = markdownToHtml(text);
+          if (markdownHtml) {
+            content.format = "org.matrix.custom.html";
+            content.formatted_body = markdownHtml;
+          }
+        }
+        if (validMentions.length) {
+          content["m.mentions"] = { user_ids: [...new Set(validMentions.map(entry => entry.userId))] };
+          if (!content.formatted_body) {
+            content.format = "org.matrix.custom.html";
+            content.formatted_body = mentionHtml(text, validMentions);
+          }
+        }
+        if (threadRoot) content["m.relates_to"] = { rel_type: "m.thread", event_id: threadRoot.id, "m.in_reply_to": { event_id: threadRoot.id } };
+        else if (replyTo) content["m.relates_to"] = { "m.in_reply_to": { event_id: replyTo.id } };
+        await connected.client.sendMessage(room.id, content);
+        setReplyTo(null); setThreadRoot(null);
+      }
+      queueRefresh(connected.client);
+    } catch (error) {
+      Toast.error(`消息发送失败：${error?.message || "未知错误"}`);
+      throw error;
+    }
+  };
+  const react = async (item, key = "👍") => { try {
+    // Matrix custom emoji reactions use the uploaded MXC URI as the relation
+    // key. This is the interoperable wire format used by Cinny/Element;
+    // sending :shortcode: alone leaves the literal text visible to clients
+    // that do not have our local catalogue.
+    let customItem = !/^mxc:\/\//i.test(String(key || "")) ? emojiItemForToken(key) : null;
+    if (!customItem && !/^mxc:\/\//i.test(String(key || "")) && /^:.+:$/.test(String(key || "").trim())) {
+      const catalog = await ensureEmojiCatalog();
+      customItem = (catalog || []).find(entry => `:${emojiShortcode(entry)}:` === String(key).trim()) || null;
+    }
+    let wireKey = key;
+    let shortcode = null;
+    if (customItem) {
+      const prepared = await prepareRemoteEmoji(connected.client, customItem);
+      wireKey = prepared.mxc;
+      shortcode = prepared.shortcode;
+      await publishRoomEmojiPack(connected.client, room?.matrixRoom, customItem, wireKey);
+    }
+    const matrixRoom = room?.matrixRoom;
+    const timelineEvents = matrixRoom?.getLiveTimeline?.().getEvents?.() || [];
+    let candidates = timelineEvents;
+    try {
+      const relations = matrixRoom?.getRelationsForEvent?.(item.id, "m.annotation", "m.reaction");
+      const relatedEvents = relations?.getRelations?.() || relations?.events || [];
+      if (relatedEvents.length) candidates = [...candidates, ...relatedEvents];
+    } catch {}
+    const acceptedKeys = new Set([String(key || ""), String(wireKey || "")]);
+    if (shortcode) { acceptedKeys.add(`:${shortcode}:`); acceptedKeys.add(shortcode); }
+    const mine = candidates.find(event => {
+      const relation = event.getContent?.()?.["m.relates_to"];
+      return event.getType?.() === "m.reaction" && event.getSender?.() === connected.userId && relation?.event_id === item.id && acceptedKeys.has(String(relation?.key || ""));
+    });
+    if (mine) await connected.client.redactEvent(room.id, mine.getId?.());
+    else {
+      const content = { "m.relates_to": { rel_type: "m.annotation", event_id: item.id, key: wireKey } };
+      if (shortcode) content.shortcode = shortcode;
+      await connected.client.sendEvent(room.id, "m.reaction", content);
+    }
+    refresh(connected.client);
+  } catch (error) { Toast.error(`回应操作失败：${error?.message || "未知错误"}`); } };
+  const redact = async item => { if (!confirm("确定撤回这条消息吗？")) return; try { await connected.client.redactEvent(room.id, item.id); refresh(connected.client); } catch (error) { Toast.error(`撤回失败：${error?.message || "未知错误"}`); } };
+  const upload = async (file, onProgress) => { try { const encryptedRoom = Boolean(room.matrixRoom.hasEncryptionStateEvent?.()); const { uploaded, fileInfo } = await uploadMatrixMedia(connected.client, file, encryptedRoom, onProgress); const type = file.type.startsWith("image/") ? "m.image" : file.type.startsWith("video/") ? "m.video" : file.type.startsWith("audio/") ? "m.audio" : "m.file"; const info = { mimetype: file.type, size: file.size }; if (Number(file.orbitVoiceDuration) > 0) info.duration = Number(file.orbitVoiceDuration); const content = applyUploadedMedia({ msgtype: type, body: file.name, info }, uploaded, fileInfo); if (type === "m.audio" && info.duration) { content["org.matrix.msc3245.voice"] = {}; content["org.matrix.msc1767.audio"] = { duration: info.duration }; } await connected.client.sendMessage(room.id, content); Toast.success(encryptedRoom ? "加密文件已发送" : "文件已发送"); refresh(connected.client); } catch (error) { Toast.error(`文件发送失败：${error?.message || "未知错误"}`); throw error; } };
+  const sendEmoji = async item => {
+    if (!connected?.client || !room || !item) return;
+    if (stickerSendingRef.current) return Toast.info("上一张贴纸正在发送，请稍候");
+    stickerSendingRef.current = true;
+    try {
+      const content = await createStickerEventContent(connected.client, room.matrixRoom, item);
+      if (threadRoot) content["m.relates_to"] = { rel_type: "m.thread", event_id: threadRoot.id, "m.in_reply_to": { event_id: threadRoot.id } };
+      else if (replyTo) content["m.relates_to"] = { "m.in_reply_to": { event_id: replyTo.id } };
+      await sendStickerEvent(connected.client, room.matrixRoom, content);
+      setReplyTo(null); setThreadRoot(null);
+      Toast.success("贴纸已发送");
+      queueRefresh(connected.client);
+    } catch (error) {
+      Toast.error(`贴纸发送失败：${error?.message || "网络错误"}`);
+    } finally {
+      stickerSendingRef.current = false;
+    }
+  };
+  const typing = value => { if (connected && room) connected.client.sendTyping(room.id, value, 5000).catch(() => {}); };
+  const markRead = id => {
+    setRooms(current => current.map(entry => entry.id === id ? { ...entry, unread: 0, hasUnread: false } : entry));
+    const targetRoom = connected?.client.getRoom(id);
+    // Seed a first-open position from Matrix's existing read marker. Once a
+    // local scroll anchor exists, never overwrite the user's more precise
+    // position with the moving server receipt.
+    const readEventId = targetRoom?.getEventReadUpTo?.(connected?.userId, true);
+    if (readEventId && connected?.userId) {
+      const storageKey = `orbit.scroll-position:${connected.userId}:${id}`;
+      try {
+        if (!localStorage.getItem(storageKey)) localStorage.setItem(storageKey, JSON.stringify({ top: 0, anchorId: readEventId, offset: 120 }));
+      } catch {}
+    }
+    const target = targetRoom?.getLiveTimeline?.().getEvents?.().slice(-1)[0];
+    if (target) {
+      rememberRoomRead(id, target);
+      Promise.resolve(markRoomRead(connected.client, id, target)).then(() => queueRefresh(connected.client)).catch(() => {});
+    } else if (connected?.client) queueRefresh(connected.client);
+  };
+  const togglePinMessage = async item => { if (!room || !item?.id) return; try { const state = room.matrixRoom.currentState?.getStateEvents?.("m.room.pinned_events", ""); const current = Array.isArray(state) ? state[0]?.getContent?.()?.pinned : state?.getContent?.()?.pinned; const pinnedIds = Array.isArray(current) ? current : []; const next = pinnedIds.includes(item.id) ? pinnedIds.filter(id => id !== item.id) : [...pinnedIds, item.id].slice(-50); await connected.client.sendStateEvent(room.id, "m.room.pinned_events", { pinned: next }, ""); await refresh(connected.client); Toast.success(next.includes(item.id) ? "消息已置顶" : "已取消消息置顶"); } catch (error) { Toast.error(`消息置顶失败：${error?.message || "当前 homeserver 不支持置顶消息"}`); } };
+  const closeElementCall = (message) => {
+    const session = callSessionRef.current;
+    stopOrbitRingtone(ringtoneRef);
+    if (session?.expireTimer) clearTimeout(session.expireTimer);
+    if (session?.mode === "element") disposeElementCallEmbed(session.embed);
+    if (session && callSessionRef.current === session) {
+      callSessionRef.current = null;
+      setCallSession(null);
+    }
+    if (message && session) Toast.info(message);
+  };
+  const hangupCall = () => {
+    const session = callSessionRef.current;
+    stopOrbitRingtone(ringtoneRef);
+    if (session?.mode === "element") {
+      if (session.direction === "inbound" && session.state === "ringing") {
+        sendRtcDecline(connected.client, session.roomId, session.notificationEventId).catch(() => {});
+      } else {
+        hangupElementCall(session.embed);
+      }
+      closeElementCall();
+      return;
+    }
+    hangupOrbitCall(session?.call);
+  };
+  const answerCall = async () => {
+    const session = callSessionRef.current;
+    if (!session) return;
+    if (session.mode === "element") {
+      if (session.state !== "ringing") return;
+      let embed = null;
+      try {
+        stopOrbitRingtone(ringtoneRef);
+        if (session.expireTimer) clearTimeout(session.expireTimer);
+        const client = connected.client;
+        const matrixRoom = client.getRoom(session.roomId);
+        const orbitRoom = (roomsRef.current || []).find(item => item.id === session.roomId);
+        embed = await createElementCallEmbed({
+          client,
+          room: matrixRoom,
+          orbitRoom,
+          kind: session.kind,
+          joining: true,
+          isDm: Boolean(orbitRoom?.isDirect || orbitRoom?.directUserId),
+          notify: false,
+          homeserverUrl: matrixHomeserverUrl(client),
+          onHangup: () => closeElementCall("通话已结束"),
+          onMute: data => setCallSession(current => current?.mode === "element" ? { ...current, muted: data.audio_enabled === false, videoMuted: data.video_enabled === false } : current),
+        });
+        const next = { ...session, embed, iframe: embed.iframe, expireTimer: 0, state: "connected", startedAt: Date.now() };
+        callSessionRef.current = next;
+        setCallSession(next);
+      } catch (error) {
+        disposeElementCallEmbed(embed);
+        Toast.error(`接听失败：${error?.message || "无法启动 Element Call"}`);
+      }
+      return;
+    }
+    if (!session.call) return;
+    try {
+      stopOrbitRingtone(ringtoneRef);
+      if (typeof session.call.answer === "function") await session.call.answer();
+      else throw new Error("当前 Matrix SDK 未提供接听能力");
+    } catch (error) {
+      Toast.error(`接听失败：${callErrorMessage(error) || error?.message || "未知错误"}`);
+    }
+  };
+  const toggleCallMute = async () => {
+    const session = callSessionRef.current;
+    if (!session) return;
+    if (session.mode === "element") {
+      const muted = !session.muted;
+      try {
+        await setElementCallMute(session.embed, { muted, videoMuted: session.videoMuted });
+        setCallSession(current => current ? { ...current, muted } : current);
+      } catch { Toast.error("麦克风切换失败"); }
+      return;
+    }
+    if (!session.call) return;
+    try {
+      const next = !session.call.isMicrophoneMuted?.();
+      await session.call.setMicrophoneMuted?.(next);
+      setCallSession(current => current ? { ...current, muted: Boolean(session.call.isMicrophoneMuted?.()) } : current);
+    } catch { Toast.error("麦克风切换失败"); }
+  };
+  const toggleCallVideo = async () => {
+    const session = callSessionRef.current;
+    if (!session) return;
+    if (session.mode === "element") {
+      const videoMuted = !session.videoMuted;
+      try {
+        await setElementCallMute(session.embed, { muted: session.muted, videoMuted });
+        setCallSession(current => current ? { ...current, videoMuted } : current);
+      } catch { Toast.error("摄像头切换失败"); }
+      return;
+    }
+    if (!session.call) return;
+    try {
+      const next = !session.call.isLocalVideoMuted?.();
+      await session.call.setLocalVideoMuted?.(next);
+      setCallSession(current => current ? { ...current, videoMuted: Boolean(session.call.isLocalVideoMuted?.()) } : current);
+    } catch { Toast.error("摄像头切换失败"); }
+  };
+  const startCall = async kind => {
+    if (!room || !connected?.client) return;
+    if (hasActiveOrbitCall(callSessionRef.current)) return Toast.warning("当前已有通话进行中");
+    const allowed = canPlaceAnyOrbitCall(room);
+    if (!allowed.ok) return Toast.error(allowed.message);
+    const client = connected.client;
+    const matrixRoom = room.matrixRoom || client.getRoom(room.id);
+    const isDm = Boolean(room.isDirect || room.directUserId) || Number(room.members) <= 2;
+    const joining = hasActiveMatrixRtcSession(client, matrixRoom || room.id);
+    const opponent = { name: room.name, userId: room.directUserId, avatarMxc: room.avatarMxc, color: room.color, initials: room.initials };
+    let embed = null;
+    try {
+      embed = await createElementCallEmbed({
+        client,
+        room: matrixRoom,
+        orbitRoom: room,
+        kind,
+        joining,
+        isDm,
+        notify: !joining,
+        homeserverUrl: matrixHomeserverUrl(client),
+        onHangup: () => closeElementCall("通话已结束"),
+        onMute: data => setCallSession(current => current?.mode === "element" ? { ...current, muted: data.audio_enabled === false, videoMuted: data.video_enabled === false } : current),
+      });
+      const session = {
+        mode: "element",
+        embed,
+        iframe: embed.iframe,
+        roomId: room.id,
+        kind,
+        direction: "outbound",
+        state: "connected",
+        muted: false,
+        videoMuted: kind !== "video",
+        startedAt: Date.now(),
+        opponent,
+        error: null,
+        feeds: [],
+      };
+      callSessionRef.current = session;
+      setCallSession(session);
+      return;
+    } catch (error) {
+      disposeElementCallEmbed(embed);
+      console.warn("Element Call unavailable, trying legacy 1:1", error);
+      const legacyAllowed = canPlaceOrbitCall(room);
+      if (!legacyAllowed.ok) return Toast.error("群组通话需要 Element Call，当前无法启动");
+    }
+    try {
+      await warnMissingTurn(client);
+      const call = client.createCall?.(room.id) || MatrixSDK.createNewMatrixCall?.(client, room.id);
+      if (!call) throw new Error("当前 Matrix SDK 未提供通话能力");
+      bindOrbitCall(call, { kind, direction: "outbound", opponent }, setCallSession, callSessionRef, ringtoneRef);
+      const method = kind === "video" ? (call.placeVideoCall || call.placeCall) : (call.placeVoiceCall || call.placeCall);
+      if (typeof method !== "function") throw new Error("当前 homeserver 未启用 Matrix 通话");
+      await method.call(call, kind === "video");
+    } catch (error) {
+      const shown = callSessionRef.current?.error;
+      if (callSessionRef.current?.call && callSessionRef.current.state !== "ended") hangupOrbitCall(callSessionRef.current.call);
+      if (!error?.code && !shown) Toast.error(`通话发起失败：${callErrorMessage(error) || error?.message || "请确认 TURN 与 VoIP 配置"}`);
+    }
+  };
+  const jumpTo = async eventId => { if (!eventId) return; const safe = String(eventId).replace(/[^a-zA-Z0-9_-]/g, "_"); let node = document.getElementById(`event-${safe}`); if (!node && room) { try { await connected.client.scrollback(room.matrixRoom, 100); await refresh(connected.client); await new Promise(resolve => setTimeout(resolve, 80)); node = document.getElementById(`event-${safe}`); } catch {} } if (node) { node.scrollIntoView({ behavior: "smooth", block: "center" }); node.classList.add("message-highlight"); setTimeout(() => node.classList.remove("message-highlight"), 1600); } else Toast.info("原消息不在当前服务器返回的历史范围内"); };
+  window.orbitNavigateToMessage = (roomId, eventId) => { if (!roomId) return; const target = (roomsRef.current || rooms).find(entry => entry.id === roomId) || (window.orbitAllRooms || []).find(entry => entry.id === roomId); if (target?.isDirect) setViewMode("messages"); else if (target?.isGroup) setViewMode("groups"); else if (target?.isSpace) { setViewMode("spaces"); setActiveSpaceId(target.id); } setSelectedId(roomId); markRead(roomId); setTimeout(() => { const safe = String(eventId || "").replace(/[^a-zA-Z0-9_-]/g, "_"); const node = eventId && document.getElementById(`event-${safe}`); if (node) { node.scrollIntoView({ behavior: "smooth", block: "center" }); node.classList.add("message-highlight"); setTimeout(() => node.classList.remove("message-highlight"), 1600); } }, 180); };
+  const leaveRoom = async () => { if (!room || !confirm(`确定离开「${room.name}」吗？`)) return; try { await connected.client.leave(room.id); setSelectedId(null); refresh(connected.client); Toast.success("已离开房间"); } catch (error) { Toast.error(`离开房间失败：${error?.message || "未知错误"}`); } };
+  const logout = async () => { stopOrbitRingtone(ringtoneRef); if (callSessionRef.current?.mode === "element") { hangupElementCall(callSessionRef.current.embed); disposeElementCallEmbed(callSessionRef.current.embed); } hangupOrbitCall(callSessionRef.current?.call); callSessionRef.current = null; setCallSession(null); try { await connected.client.logout(); } catch {} connected.client.stopClient(); pendingJoinRoomIdsRef.current.clear(); optimisticJoinedRoomsRef.current.clear(); window.orbitMatrixClient = null; localStorage.removeItem(MATRIX_SESSION_STORAGE_KEY); try { localStorage.removeItem(recoveryStorageKey(connected.userId)); localStorage.removeItem(localVerificationKey(connected.client)); } catch {} setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); Toast.success("已退出 Matrix"); };
+  if (!connected) return h("div", { className: "app-shell" }, h("div", { className: "sidebar landing-sidebar" }, h("div", { className: "brand-row" }, h("div", { className: "brand" }, h("div", { className: "brand-mark" }, "O"), h("div", null, "Orbit", h("div", { className: "workspace-pill" }, "Matrix 工作台")))), h("div", { className: "sidebar-footer" }, h("div", { className: "connection-state" }, h("span", { className: "offline-dot" }), "未连接"))), h("main", { className: "main-panel" }, h("div", { className: "login-landing" }, h("div", { className: "landing-mark" }, "O"), h("div", { className: "landing-title" }, "连接你的 Matrix 世界"), h("div", { className: "landing-copy" }, "登录后同步真实房间、消息和成员。"), h("button", { className: "primary-btn landing-button", onClick: () => setShowLogin(true) }, "连接 Matrix 账户"))), showLogin && h(LoginDialog, { onConnected: connectedHandler, onClose: () => setShowLogin(false) }));
+  const setSelectingState = active => {
+    if (active === false) {
+      setSelecting(false);
+      setForwardItems([]);
+      return;
+    }
+    setSelecting(true);
+  };
+  const onReact = react;
+  return h("div", { className: "app-shell" }, h(Sidebar, { rooms: visibleRooms, allRooms: rooms, invites, spaces, selectedId, connected, presence, viewMode, activeSpaceId, onViewMode: mode => { setViewMode(mode); const first = mode === "spaces" ? null : rooms.find(item => mode === "groups" ? item.isGroup : item.isDirect); if (first) setSelectedId(first.id); }, onSpaceSelect: id => { setActiveSpaceId(id); const child = spaceChildIds(spaces.find(item => item.id === id)?.matrixRoom)[0]; setSelectedId(child || null); }, onSelect: id => { setSelectedId(id); markRead(id); }, onAcceptInvite: acceptInvite, onDeclineInvite: declineInvite, onCreate: () => setShowRoom(true), onCreateSpace: () => setShowSpace(true), onManageSpace: () => activeSpaceId && setShowSpaceRooms(true), onAccount: () => setShowAccount(true), onLogout: logout }), syncing && h("div", { className: "sync-indicator" }, "正在同步 Matrix…"), h(Chat, { room, messages: selectedId ? (messages[selectedId] || []) : [], client: connected.client, detailsCollapsed, onLoadMore: loadMore, onSearch: () => setShowSearch(true), onSend: send, onTyping: typing, onReply: item => { setReplyTo(item); setThreadRoot(null); setEditing(null); }, onReact, onThread: item => { const loaded = messages[selectedId] || []; let root = item; const seen = new Set(); while (root && (root.threadRoot || root.replyTo) && !seen.has(root.id)) { seen.add(root.id); const parentId = root.threadRoot || root.replyTo; root = loaded.find(entry => entry.id === parentId) || root; if (root.id === item.id) break; } setThreadRoot(root); setReplyTo(null); setEditing(null); }, onEdit: item => { setEditing(item); setReplyTo(null); setThreadRoot(null); }, onRedact: redact, onJumpTo: jumpTo, onForward, onEmojiSelect: sendEmoji, replyTo, threadRoot, editing, onCancelReply: () => setReplyTo(null), onCancelThread: () => setThreadRoot(null), onCancelEdit: () => setEditing(null), onUpload: upload, selecting, forwardItems, onSelectForward: toggleForwardItem, onStartSelecting: setSelectingState, pinnedEventIds: room?.pinnedEventIds || [], onTogglePinMessage: togglePinMessage, onStartCall: startCall, activeCall: callSession, onOpenDetails: () => setDetailsCollapsed(value => !value) }), h(Details, { room, client: connected.client, onInvite: () => setShowInvite(true), onLeave: leaveRoom, collapsed: detailsCollapsed, onToggle: () => setDetailsCollapsed(value => !value), onRoomUpdated: () => refresh(connected.client) }), forwardItems.length > 0 && h("div", { className: "forward-bar" }, h("span", null, `已选择 ${forwardItems.length} 条消息`), h(UiButton, { size: "small", variant: "primary", onClick: () => setShowForward(true) }, "打开转发"), h(UiButton, { size: "small", className: "ghost-btn", onClick: () => setSelectingState(false) }, "清除")), selecting && forwardItems.length === 0 && h("div", { className: "forward-bar forward-bar-empty" }, h("span", null, "已进入多选模式，点击消息进行选择"), h(UiButton, { size: "small", className: "ghost-btn", onClick: () => setSelectingState(false) }, "取消多选")), showForward && h(ForwardDialog, { client: connected.client, rooms, items: forwardItems, onClose: () => { setShowForward(false); setSelectingState(false); } }), showRoom && h(RoomDialog, { client: connected.client, space: viewMode === "spaces" ? spaces.find(item => item.id === activeSpaceId) : null, onClose: () => setShowRoom(false), onCreated: roomId => { setSelectedId(roomId); refresh(connected.client); } }), showSpace && h(SpaceDialog, { client: connected.client, onClose: () => setShowSpace(false), onCreated: roomId => { setActiveSpaceId(roomId); refresh(connected.client); } }), showSpaceRooms && activeSpaceId && h(SpaceRoomsDialog, { client: connected.client, space: spaces.find(item => item.id === activeSpaceId), rooms, onClose: () => setShowSpaceRooms(false), onChanged: () => refresh(connected.client) }), showInvite && room && h(InviteDialog, { client: connected.client, room, onClose: () => setShowInvite(false) }), showSearch && room && h(SearchDialog, { client: connected.client, room, onClose: () => setShowSearch(false) }), showAccount && h(AccountDialog, { client: connected.client, cryptoState, onRestore: restoreKeys, onClose: () => setShowAccount(false) }), callSession && h(CallOverlay, { session: callSession, client: connected.client, onHangup: hangupCall, onAnswer: answerCall, onToggleMute: toggleCallMute, onToggleVideo: toggleCallVideo }));
+}
+
+function AccountDialog({ client, onClose, cryptoState, onRestore }) {
+  const [active, setActive] = useState("general");
+  const [displayName, setDisplayName] = useState(() => client.getUser?.(client.getUserId?.())?.displayName || "");
+  const [notificationPermission, setNotificationPermission] = useState(() => typeof Notification === "undefined" ? "unsupported" : Notification.permission);
+  const saveName = async () => { const value = displayName.trim(); if (!value) return; try { await client.setDisplayName?.(value); Toast.success("昵称已更新"); } catch (error) { Toast.error(`昵称更新失败：${error?.message || "请检查账户权限"}`); } };
+  const enableNotifications = async () => { if (typeof Notification === "undefined") return Toast.error("当前浏览器不支持桌面通知"); const result = await Notification.requestPermission(); setNotificationPermission(result); Toast[result === "granted" ? "success" : "warning"](result === "granted" ? "桌面通知已开启" : "桌面通知未授权"); };
+  if (active === "security") return h(LegacyAccountDialog, { client, onClose, onBack: () => setActive("general"), cryptoState, onRestore });
+  const nav = [{ id: "general", label: "常规", hint: "界面与消息" }, { id: "account", label: "账号", hint: "资料与身份" }, { id: "notifications", label: "通知", hint: "提醒方式" }, { id: "security", label: "设备与安全", hint: "加密与设备" }, { id: "emoji", label: "表情与分类", hint: "云端目录" }, { id: "ai", label: "AI 助手", hint: "可选能力" }, { id: "developer", label: "开发工具", hint: "连接信息" }, { id: "about", label: "关于", hint: "版本信息" }];
+  const panel = active === "general" ? h("div", { className: "settings-panel-content" }, h("h3", null, "常规"), h("p", null, "保持清晰、克制的企业工作台体验。"), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "外观主题"), h("span", null, "浅色 · 企业蓝")), h("span", { className: "settings-value-chip" }, "当前")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "消息排版"), h("span", null, "紧凑布局，长文本保留原始换行")), h("span", { className: "settings-value-chip" }, "紧凑")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "发送方式"), h("span", null, "Enter 发送 · Shift + Enter 换行")), h("span", { className: "settings-value-chip" }, "默认"))) : active === "account" ? h("div", { className: "settings-panel-content" }, h("h3", null, "账号"), h("p", null, "你的资料会通过 Matrix 账户接口同步到其他客户端。"), h("label", { className: "settings-field-label" }, "显示昵称", h(Input, { value: displayName, onChange: setDisplayName, placeholder: "输入显示昵称" })), h(UiButton, { variant: "primary", onClick: saveName }, "保存昵称"), h("div", { className: "settings-account-id" }, h("span", null, "Matrix ID"), h("code", null, client.getUserId?.() || "未知"))) : active === "notifications" ? h("div", { className: "settings-panel-content" }, h("h3", null, "通知"), h("p", null, "只在后台或当前房间之外提醒新消息。"), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "桌面通知"), h("span", null, notificationPermission === "granted" ? "浏览器通知已授权" : "需要授权后接收提醒")), h(UiButton, { size: "small", onClick: enableNotifications }, notificationPermission === "granted" ? "已开启" : "开启")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "未读红点"), h("span", null, "房间列表会显示未读数量")), h("span", { className: "settings-value-chip" }, "已启用"))) : active === "emoji" ? h("div", { className: "settings-panel-content" }, h("h3", null, "表情与分类"), h("p", null, "从云端目录加载分类，发送时使用标准 Matrix 图片事件，GIF 保留动画。"), h("div", { className: "settings-account-id" }, h("span", null, "目录地址"), h("code", null, "image.527012.xyz/index.json")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "已加载分类"), h("span", null, "QQ、钉钉、月薪喵、B 站等")), h("span", { className: "settings-value-chip" }, "云端"))) : active === "ai" ? h("div", { className: "settings-panel-content" }, h("h3", null, "AI 助手"), h("p", null, "当前未配置 AI 服务。配置后可在不影响 Matrix 数据的前提下启用辅助能力。"), h("div", { className: "settings-empty-state" }, "未配置")) : active === "developer" ? h("div", { className: "settings-panel-content" }, h("h3", null, "开发工具"), h("div", { className: "settings-account-id" }, h("span", null, "Homeserver"), h("code", null, client.getHomeserverUrl?.() || "未知")), h("div", { className: "settings-account-id" }, h("span", null, "设备 ID"), h("code", null, client.getDeviceId?.() || "未知")), h("div", { className: "settings-account-id" }, h("span", null, "Matrix SDK"), h("code", null, "matrix-js-sdk 42.3.0"))) : h("div", { className: "settings-panel-content" }, h("h3", null, "关于"), h("p", null, "Orbit 是基于 Matrix 的企业级聊天工作台。"), h("div", { className: "settings-about-version" }, "Orbit Web · Matrix Client-Server API · E2EE Rust Crypto"));
+  return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card settings-card" }, h("div", { className: "modal-head settings-card-head" }, h("div", null, h("div", { className: "modal-title" }, "我的设置"), h("div", { className: "modal-copy" }, "按分类管理账户、通知和设备安全。")), h(UiButton, { className: "icon-button", type: "text", onClick: onClose, "aria-label": "关闭" }, "×")), h("div", { className: "settings-layout" }, h("nav", { className: "settings-sidebar", "aria-label": "设置分类" }, nav.map(item => h("button", { type: "button", key: item.id, className: `settings-nav-item ${active === item.id ? "active" : ""}`, onClick: () => setActive(item.id) }, h("span", null, item.label), h("small", null, item.hint)))), h("section", { className: "settings-panel" }, panel))));
+}
+
+createRoot(document.getElementById("root")).render(h(App));
