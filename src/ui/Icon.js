@@ -34,9 +34,16 @@ export default function Icon({ name, size = 17 }) {
     heading1: "M5 5v14M19 5v14M5 12h14",
     heading2: "M5 5v14M19 5v14M5 12h14",
     heading3: "M5 5v14M19 5v14M5 12h14",
+    chevronLeft: "M15 18l-6-6 6-6",
+    more: "M4 11h2v2H4zm7 0h2v2h-2zm7 0h2v2h-2z",
+    keyboard: "M4 6h16v12H4z M8 10h.01 M12 10h.01 M16 10h.01 M8 14h8",
+    plus: "M12 5v14M5 12h14",
+    image: ["M21 15V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-2", "M21 15l-5-5L5 21", "M8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3"],
+    camera: ["M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z", "M12 13a3 3 0 1 0 0-6 3 3 0 0 0 0 6"],
+    file: ["M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z", "M14 2v6h6"],
   };
   const d = paths[name] || paths.room;
   const list = Array.isArray(d) ? d : [d];
-  const filledIcon = name === "strike";
+  const filledIcon = name === "strike" || name === "more";
   return h("svg", { className: "ui-icon", width: size, height: size, viewBox: "0 0 24 24", fill: filledIcon ? "currentColor" : "none", stroke: filledIcon ? "none" : "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" }, list.map((path, index) => h("path", { key: index, d: path })));
 }

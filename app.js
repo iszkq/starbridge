@@ -6,8 +6,9 @@ import Plyr from "https://esm.sh/plyr@3.7.8?bundle";
 import * as MatrixSDK from "https://esm.sh/matrix-js-sdk@42.3.0?bundle&external=@matrix-org/matrix-sdk-crypto-wasm";
 import { decodeRecoveryKey } from "https://esm.sh/matrix-js-sdk@42.3.0/lib/crypto-api/recovery-key?bundle";
 import { SlidingSync } from "https://esm.sh/matrix-js-sdk@42.3.0/lib/sliding-sync.js?bundle&external=@matrix-org/matrix-sdk-crypto-wasm";
-import Icon from "./src/ui/Icon.js?v=271";
-import { HaloComposer } from "./src/editor/Composer.js?v=264";
+import Icon from "./src/ui/Icon.js?v=288";
+import { HaloComposer, PlainComposer } from "./src/editor/Composer.js?v=294";
+import { installOrbitMobile, isOrbitMobile, useOrbitMobile, longPressHandlers, mobileMessageGestures, setOrbitMobileView, pushOrbitHistory, installHorizontalDragScroll } from "./src/mobile/index.js?v=288";
 import {
   hasActiveMatrixRtcSession,
   parseRtcNotification,
@@ -32,6 +33,7 @@ window.fetch = (input, init) => {
   return orbitFetch(input, init);
 };
 
+installOrbitMobile();
 const { Input: AntInput, Avatar: AntAvatar, Button: AntButton, Popover: AntPopover, Checkbox: AntCheckbox, message: antMessage } = Antd;
 const TextArea = AntInput.TextArea;
 const Input = props => h(AntInput, { ...props, allowClear: props.showClear, onChange: event => props.onChange?.(event?.target?.value ?? event) });
@@ -113,6 +115,28 @@ function compactNotificationText(value, max = 96) {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
+function isRoomMutedByPushRule(client, roomId) {
+  try {
+    const rule = client?.getRoomPushRule?.("global", roomId);
+    if (!rule || rule.enabled === false) return false;
+    const actions = rule.actions || [];
+    if (!actions.length) return true;
+    return actions.includes("dont_notify");
+  } catch {
+    return false;
+  }
+}
+
+function eventShouldNotify(client, event) {
+  try {
+    if (typeof client?.getPushActionsForEvent === "function") {
+      const actions = client.getPushActionsForEvent(event);
+      if (actions) return Boolean(actions.notify);
+    }
+  } catch {}
+  return !isRoomMutedByPushRule(client, event?.getRoomId?.());
+}
+
 function hasDecryptedNotificationContent(event) {
   if (event?.getType?.() !== "m.room.encrypted") return true;
   const clear = event?.getClearContent?.();
@@ -145,10 +169,11 @@ function enqueueMessageNotification({ room, roomId, eventId, title, body, compac
       // Keep room routing metadata intact while constraining what is rendered
       // in the toast/desktop notification. Long room names and message bodies
       // should never make the notification span the entire viewport.
-      const displayTitle = compactNotificationText(existing.title || "Matrix 新消息", 32);
+      const mobileToast = typeof window !== "undefined" && window.matchMedia && document.documentElement.dataset.orbitMobile === "1";
+      const displayTitle = compactNotificationText(existing.title || "Matrix 新消息", mobileToast ? 16 : 32);
       const text = existing.compact
         ? `${displayTitle}：${existing.count} 条消息`
-        : `${displayTitle}：${countLabel}${compactNotificationText(existing.latestBody, 56)}`;
+        : `${displayTitle}：${countLabel}${compactNotificationText(existing.latestBody, mobileToast ? 18 : 56)}`;
       let desktopShown = false;
       if (typeof Notification !== "undefined" && Notification.permission === "granted") {
         try {
@@ -163,7 +188,7 @@ function enqueueMessageNotification({ room, roomId, eventId, title, body, compac
           type: "info",
           duration: existing.count > 1 ? 6 : 5,
           onClick: () => { window.orbitNavigateToMessage?.(roomId, existing.latestEventId); antMessage.destroy?.(key); },
-          content: h("button", { type: "button", className: "toast-notification-link", "data-room-id": roomId, onClick: event => { event.preventDefault(); event.stopPropagation(); window.orbitNavigateToMessage?.(roomId, existing.latestEventId); antMessage.destroy?.(key); } }, text)
+          content: h("button", { type: "button", className: "toast-notification-link", title: text, "data-room-id": roomId, onClick: event => { event.preventDefault(); event.stopPropagation(); window.orbitNavigateToMessage?.(roomId, existing.latestEventId); antMessage.destroy?.(key); } }, text)
         });
         else Toast.info(text);
       }
@@ -1156,10 +1181,20 @@ function MediaLightbox({ viewer, onClose }) {
     h("div", { className: `media-lightbox-stage ${dragging ? "is-dragging" : ""}`, onWheel: event => { event.preventDefault(); adjustScale(event.deltaY > 0 ? -0.1 : 0.1); }, onMouseDown: event => event.target === event.currentTarget ? close(event) : beginDrag(event), onMouseMove: moveDrag, onMouseUp: endDrag, onMouseLeave: endDrag }, h("img", { className: "media-lightbox-image", src: viewer.src, alt: viewer.alt || "图片预览", draggable: false, style: { transform: `translate(${offset.x}px, ${offset.y}px) rotate(${rotation}deg) scale(${scale})` } }))), document.body);
 }
 
-function EmojiPicker({ onSelect, onInsert }) {
-  const [items, setItems] = useState([]); const [packs, setPacks] = useState([]); const [pack, setPack] = useState("all"); const [query, setQuery] = useState(""); const [loading, setLoading] = useState(false); const [hovered, setHovered] = useState(null); const [mode, setMode] = useState("emoji");
-  useEffect(() => { const move = event => { const target = event.target?.closest?.(".emoji-item-wrap"); if (!target) return; const rect = target.getBoundingClientRect(); const width = 164; const height = 180; const gap = 10; const x = window.innerWidth - rect.right >= width + gap ? rect.right + gap : Math.max(8, rect.left - width - gap); const y = rect.top >= height + gap ? rect.top - height - gap : Math.min(window.innerHeight - height - 8, rect.bottom + gap); document.documentElement.style.setProperty("--orbit-picker-preview-x", `${x}px`); document.documentElement.style.setProperty("--orbit-picker-preview-y", `${y}px`); }; document.addEventListener("mousemove", move); return () => document.removeEventListener("mousemove", move); }, []);
-  useEffect(() => { let active = true; setLoading(true); ensureEmojiCatalog().then(nextItems => { if (active) { setItems(nextItems); setPacks(window.orbitEmojiPacks || []); } }).finally(() => active && setLoading(false)); return () => { active = false; }; }, []);
+function EmojiPicker({ onSelect, onInsert, variant = "popover", open, onOpenChange, onRequestKeyboard, panelHostRef }) {
+  const [items, setItems] = useState([]); const [packs, setPacks] = useState([]); const [pack, setPack] = useState("all"); const [query, setQuery] = useState(""); const [loading, setLoading] = useState(false); const [hovered, setHovered] = useState(null); const [mode, setMode] = useState(variant === "panel" ? "sticker" : "emoji");
+  const catsRef = useRef(null);
+  const skipSendRef = useRef(false);
+  const previewTimerRef = useRef(0);
+  const [pressPreview, setPressPreview] = useState(null);
+  useEffect(() => { if (variant === "panel") return undefined; const move = event => { const target = event.target?.closest?.(".emoji-item-wrap"); if (!target) return; const rect = target.getBoundingClientRect(); const width = 164; const height = 180; const gap = 10; const x = window.innerWidth - rect.right >= width + gap ? rect.right + gap : Math.max(8, rect.left - width - gap); const y = rect.top >= height + gap ? rect.top - height - gap : Math.min(window.innerHeight - height - 8, rect.bottom + gap); document.documentElement.style.setProperty("--orbit-picker-preview-x", `${x}px`); document.documentElement.style.setProperty("--orbit-picker-preview-y", `${y}px`); }; document.addEventListener("mousemove", move); return () => document.removeEventListener("mousemove", move); }, []);
+  useEffect(() => { let active = true; setLoading(true); ensureEmojiCatalog().then(nextItems => { if (active) { setItems(nextItems); const nextPacks = window.orbitEmojiPacks || []; setPacks(nextPacks); if (variant === "panel" && nextPacks[0]?.id) setPack(current => current === "all" ? nextPacks[0].id : current); } }).finally(() => active && setLoading(false)); return () => { active = false; }; }, [variant]);
+  const bindCats = node => {
+    if (catsRef.current === node) return;
+    if (catsRef.current?.__orbitUnbindDrag) catsRef.current.__orbitUnbindDrag();
+    catsRef.current = node;
+    if (node) node.__orbitUnbindDrag = installHorizontalDragScroll(node);
+  };
   const normalizedQuery = query.trim().toLowerCase();
   const shown = items.filter(item => (pack === "all" || item.packId === pack) && (!normalizedQuery || `${item.name} ${(item.keywords || []).join(" ")}`.toLowerCase().includes(normalizedQuery)));
   const categoryNav = h("nav", { className: "emoji-category-nav", "aria-label": "表情分类" },
@@ -1170,6 +1205,36 @@ function EmojiPicker({ onSelect, onInsert }) {
   const modeTabs = h("div", { className: "emoji-mode-tabs", role: "tablist" }, h("button", { type: "button", className: mode === "emoji" ? "active" : "", role: "tab", onClick: () => setMode("emoji") }, "表情", h("small", null, "插入文本")), h("button", { type: "button", className: mode === "sticker" ? "active" : "", role: "tab", onClick: () => setMode("sticker") }, "贴纸", h("small", null, "发送大图")));
   const hoverPreview = hovered ? createPortal(h("div", { className: "emoji-hover-preview", role: "tooltip" }, h("img", { src: assetRequestUrl(hovered.url || hovered.thumbUrl), alt: hovered.name }), h("strong", null, hovered.name)), document.body) : null;
   const content = h(React.Fragment, null, h("div", { className: "emoji-popover", onMouseDown: event => event.stopPropagation() }, modeTabs, h(Input, { size: "small", autoFocus: true, value: query, onChange: setQuery, onMouseDown: event => event.stopPropagation(), placeholder: mode === "emoji" ? "搜索表情名称" : "搜索贴纸名称" }), h("div", { className: "emoji-browser" }, categoryNav, h("section", { className: "emoji-category-content" }, h("div", { className: "emoji-category-title" }, pack === "all" ? (mode === "emoji" ? "全部表情" : "全部贴纸") : packs.find(item => item.id === pack)?.name || "表情"), emojiGrid))), hoverPreview);
+  if (variant === "panel") {
+    const panelOpen = Boolean(open);
+    const firstPackItem = packId => items.find(entry => !packId || packId === "all" || entry.packId === packId);
+    const catButtons = packs.map(item => {
+      const thumb = firstPackItem(item.id);
+      return h("button", { type: "button", className: `orbit-emoji-cat ${pack === item.id ? "is-active" : ""}`, key: item.id, title: item.name, "aria-label": item.name, onClick: () => setPack(item.id) }, thumb ? h("img", { src: assetRequestUrl(thumb.thumbUrl || thumb.url), alt: item.name }) : h("span", null, String(item.name || "表").slice(0, 1)));
+    });
+    const panelGrid = loading
+      ? h("div", { className: "emoji-loading" }, "正在加载表情…")
+      : h("div", { className: "orbit-emoji-grid" }, (shown.length ? shown : []).map(item => h("button", { type: "button", className: "orbit-emoji-cell", key: item.id, title: item.name,
+        onPointerDown: () => {
+          skipSendRef.current = false;
+          clearTimeout(previewTimerRef.current);
+          previewTimerRef.current = window.setTimeout(() => { skipSendRef.current = true; setPressPreview(item); }, 420);
+        },
+        onPointerUp: () => { clearTimeout(previewTimerRef.current); setPressPreview(null); },
+        onPointerCancel: () => { clearTimeout(previewTimerRef.current); skipSendRef.current = true; setPressPreview(null); },
+        onClick: () => { if (skipSendRef.current || Date.now() < (window.__orbitEmojiArmUntil || 0)) return; (mode === "emoji" ? onInsert : onSelect)?.(item); }
+      }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" }))));
+    const trigger = h("button", { type: "button", className: `tool-button composer-emoji-button ${panelOpen ? "is-open" : ""}`, title: panelOpen ? "键盘" : "表情", "aria-label": panelOpen ? "键盘" : "表情", onMouseDown: event => event.preventDefault(), onClick: () => { const next = !panelOpen; if (next) window.__orbitEmojiArmUntil = Date.now() + 320; onOpenChange?.(next); onRequestKeyboard?.(!next); } }, h(Icon, { name: panelOpen ? "keyboard" : "smile", size: 22 }));
+    const panelNode = panelOpen ? h("div", { className: "orbit-emoji-panel", onMouseDown: event => { if (event.target?.closest?.(".orbit-emoji-cats, .orbit-emoji-grid")) return; event.preventDefault(); } },
+      h("nav", { ref: bindCats, className: "orbit-emoji-cats", "aria-label": "表情分类" }, catButtons),
+      h("div", { className: "orbit-emoji-panel-body" },
+        h("div", { className: "orbit-emoji-panel-title" }, pack === "all" ? "所有表情" : (packs.find(item => item.id === pack)?.name || "表情")),
+        panelGrid
+      )
+    ) : null;
+    const host = panelHostRef?.current;
+    return h(React.Fragment, null, trigger, panelNode && host ? createPortal(panelNode, host) : null, pressPreview ? createPortal(h("div", { className: "orbit-emoji-press-preview", role: "dialog" }, h("img", { src: assetRequestUrl(pressPreview.url || pressPreview.thumbUrl), alt: pressPreview.name }), h("strong", null, pressPreview.name)), document.body) : null);
+  }
   return h(AntPopover, { trigger: "click", placement: "top", arrow: false, autoAdjustOverflow: true, getPopupContainer: node => node.closest?.(".composer-wrap") || document.body, content }, h("button", { type: "button", className: "tool-button composer-emoji-button", title: "表情包", "aria-label": "表情包" }, h(Icon, { name: "smile", size: 17 })));
 }
 
@@ -1250,7 +1315,7 @@ function ReactionPopover({ users = [], children }) {
     window.addEventListener("scroll", reposition, true);
     return () => { window.removeEventListener("resize", reposition); window.removeEventListener("scroll", reposition, true); };
   }, [popover.visible, uniqueUsers.length]);
-  return h(React.Fragment, null, h("span", { ref: anchorRef, className: "reaction-popover-anchor", onMouseEnter: updatePosition, onMouseLeave: hide, onFocus: updatePosition, onBlur: hide },
+  return h(React.Fragment, null, h("span", { ref: anchorRef, className: "reaction-popover-anchor", onMouseEnter: event => { if (!isOrbitMobile()) updatePosition(event); }, onMouseLeave: event => { if (!isOrbitMobile()) hide(event); }, onFocus: updatePosition, onBlur: hide, onClick: event => { if (!isOrbitMobile()) return; event.preventDefault(); event.stopPropagation(); popover.visible ? hide(event) : updatePosition(event); } },
     React.cloneElement(children, { title: label, "aria-label": label }),
   ), createPortal(content, document.body));
 }
@@ -2168,6 +2233,7 @@ function InviteDialog({ client, room, onClose }) {
 }
 
 function LegacyAccountDialog({ client, onClose, onBack, cryptoState, onRestore }) {
+  const mobile = useOrbitMobile();
   const [devices, setDevices] = useState([]); const [loading, setLoading] = useState(true); const [displayName, setDisplayName] = useState(() => client.getUser?.(client.getUserId?.())?.displayName || ""); const [profileSaving, setProfileSaving] = useState(false);
   const [recoveryKey, setRecoveryKey] = useState(""); const [passphrase, setPassphrase] = useState(""); const [verification, setVerification] = useState(null);
   const [deviceStatuses, setDeviceStatuses] = useState({});
@@ -2184,7 +2250,7 @@ function LegacyAccountDialog({ client, onClose, onBack, cryptoState, onRestore }
   const backup = cryptoState?.backupInfo; const generatedSas = verification?.sas?.sas || verification?.sas || {}; const sasText = generatedSas?.emoji?.map(item => item[0]).join(" ") || generatedSas?.decimal?.join(" · ") || "";
   const localDeviceId = client.getDeviceId?.();
   const renderDevice = device => { const status = deviceStatuses[device.device_id]; const verified = Boolean(status?.crossSigningVerified); const locallyTrusted = Boolean(status?.localVerified); return h("div", { className: `device-row ${verified ? "device-row-verified" : locallyTrusted ? "device-row-local-trusted" : ""}`, key: device.device_id }, h("div", { className: "device-icon" }, verified ? "✓" : locallyTrusted ? "•" : "▣"), h("div", { className: "device-copy" }, h("div", null, device.display_name || "未命名设备", device.device_id === localDeviceId && h("span", { className: "device-current" }, "本机"), verified && h("span", { className: "device-verified-mini" }, "跨设备已验证"), !verified && locallyTrusted && h("span", { className: "device-local-mini" }, "本地信任")), h("div", { className: "device-id" }, device.device_id)), verified ? h("span", { className: "device-state" }, "可信设备") : h(UiButton, { className: "ghost-btn", onClick: () => verify(device.device_id) }, locallyTrusted ? "发布验证" : "验证")); };
-   return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card security-card" }, h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "设备与安全"), h("div", { className: "modal-copy" }, "恢复密钥、设备验证和端到端加密。")), h("div", { className: "modal-head-actions" }, h(UiButton, { className: "ghost-btn settings-back-button", onClick: onBack }, "返回设置"), h(UiButton, { className: `ghost-btn notification-toggle ${notificationPermission === "granted" ? "notification-enabled" : ""}`, onClick: enableNotifications }, notificationPermission === "granted" ? "通知已开启" : "开启桌面通知"), h(UiButton, { className: "icon-button", type: "text", "aria-label": "关闭", onClick: onClose }, "×"))),
+   return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card security-card" }, h("div", { className: "modal-head" }, mobile && h(UiButton, { className: "icon-button", type: "text", onClick: onBack, "aria-label": "返回设置" }, h(Icon, { name: "chevronLeft", size: 20 })), h("div", null, h("div", { className: "modal-title" }, "设备与安全"), !mobile && h("div", { className: "modal-copy" }, "恢复密钥、设备验证和端到端加密。")), h("div", { className: "modal-head-actions" }, !mobile && h(UiButton, { className: "ghost-btn settings-back-button", onClick: onBack }, "返回设置"), !mobile && h(UiButton, { className: `ghost-btn notification-toggle ${notificationPermission === "granted" ? "notification-enabled" : ""}`, onClick: enableNotifications }, notificationPermission === "granted" ? "通知已开启" : "开启桌面通知"), h(UiButton, { className: "icon-button", type: "text", "aria-label": "关闭", onClick: onClose }, "×"))),
     h("div", { className: "settings-overview" }, h("div", { className: "settings-section-label" }, "我的账户"), h("div", { className: "settings-profile-row" }, h("div", { className: "settings-profile-copy" }, h("strong", null, client.getUser?.(client.getUserId?.())?.displayName || client.getUserId?.()), h("span", null, client.getUserId?.())), h("span", { className: "profile-online" }, "在线")), h("div", { className: "settings-profile-edit" }, h(Input, { value: displayName, onChange: setDisplayName, placeholder: "修改显示昵称" }), h(UiButton, { size: "small", variant: "primary", disabled: profileSaving || !displayName.trim(), onClick: saveProfile }, profileSaving ? "保存中…" : "保存昵称")), h("div", { className: "settings-section-label" }, "偏好设置"), h("div", { className: "settings-preference-grid" }, h("div", { className: "settings-preference-card" }, h("strong", null, "桌面通知"), h("span", null, notificationPermission === "granted" ? "已开启新消息提醒" : "新消息到达时提醒"), h(UiButton, { size: "small", onClick: enableNotifications }, notificationPermission === "granted" ? "已开启" : "开启")), h("div", { className: "settings-preference-card" }, h("strong", null, "界面主题"), h("span", null, "当前为浅色企业主题"), h(UiButton, { size: "small", onClick: () => Toast.info("主题设置已使用当前企业浅色方案") }, "浅色")), h("div", { className: "settings-preference-card" }, h("strong", null, "会话"), h("span", null, "此设备的 Matrix 登录会话"), h(UiButton, { size: "small", danger: true, onClick: onClose }, "关闭设置")))),
     h("section", { className: "backup-section" }, h("div", { className: "backup-title" }, "加密消息恢复"),
       h("div", { className: "backup-status" }, !cryptoState?.available ? "正在初始化加密模块…" : backup ? `服务器备份：${backup.version ? `版本 ${backup.version}` : "已启用"}${backup.count != null ? ` · ${backup.count} 个会话` : ""}` : "未发现服务器密钥备份", cryptoState?.activeVersion && h("span", null, ` · 当前版本 ${cryptoState.activeVersion}`), cryptoState?.keyRestored && h("span", { className: "verified-badge" }, "密钥已恢复"), cryptoState?.verified && h("span", { className: "verified-badge" }, "跨设备已验证"), !cryptoState?.verified && cryptoState?.localTrusted && h("span", { className: "local-trusted-badge" }, "本机已信任")),
@@ -2202,13 +2268,110 @@ function LegacyAccountDialog({ client, onClose, onBack, cryptoState, onRestore }
     ), h("div", { className: `local-device-status ${cryptoState?.verified ? "verified" : ""}` }, h("span", { className: "local-device-dot" }), h("span", null, "本机设备 · ", localDeviceId || "当前设备"), cryptoState?.verified ? h("span", { className: "verified-badge" }, "跨设备已验证") : cryptoState?.localTrusted ? h("span", { className: "device-state-pending" }, "本机已信任 · 其他客户端未同步") : h("span", { className: "device-state-pending" }, cryptoState?.keyRestored ? "密钥已恢复 · 待设备验证" : "待设备验证")), h("div", { className: "device-list-heading" }, h("strong", null, "设备列表"), h("span", null, "验证后会发布跨签名信任，其他客户端也会同步状态")), loading ? h("div", { className: "dialog-loading" }, "正在读取设备…") : h("div", { className: "device-list" }, devices.length ? devices.map(renderDevice) : h("div", { className: "dialog-empty" }, "服务器没有返回设备列表")), verification && h("section", { className: "verification-panel" }, h("div", { className: "verification-head" }, h("div", { className: "verification-title" }, "设备验证"), h(UiButton, { className: "verification-close", type: "text", onClick: cancelVerification }, "取消")), h("div", { className: "verification-copy" }, verification.status === "incoming" ? `收到来自 ${verification.deviceId || "其他设备"} 的验证请求` : verification.status === "waiting" ? "验证请求已发送，等待另一台设备接受" : verification.status === "verifying" ? "正在交换验证信息…" : verification.status === "confirm" ? "请核对两台设备上的安全码是否一致" : verification.status === "done" ? "两台设备已建立跨设备信任，其他客户端同步后会显示已验证" : verification.error || "验证准备中"), verification.status === "confirm" && h("div", { className: "sas-code" }, sasText), verification.status === "incoming" && h(UiButton, { variant: "primary", className: "primary-btn full-btn", onClick: () => runVerification(verification.request, verification.deviceId) }, "接受并开始验证"), verification.status === "confirm" && h("div", { className: "verification-actions" }, h(UiButton, { variant: "primary", className: "primary-btn", onClick: confirmSas }, "匹配，完成验证"), h(UiButton, { className: "ghost-btn", onClick: cancelVerification }, "不匹配")), verification.status === "done" && h("div", { className: "verification-success" }, "验证完成，已发布跨签名信任。"), verification.status === "error" && h("div", { className: "backup-error" }, verification.error || "验证失败"))));
 }
 
+function loadRecentForwardIds() {
+  try {
+    const ids = JSON.parse(localStorage.getItem("orbit-recent-forwards") || "[]");
+    return Array.isArray(ids) ? ids.filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberForwardIds(ids) {
+  try {
+    const prev = loadRecentForwardIds();
+    const next = [...ids, ...prev.filter(id => !ids.includes(id))].slice(0, 12);
+    localStorage.setItem("orbit-recent-forwards", JSON.stringify(next));
+  } catch {}
+}
+
 function ForwardDialog({ client, rooms, items, onClose }) {
-  const [targets, setTargets] = useState([]); const [loading, setLoading] = useState(false); const [query, setQuery] = useState(""); const [note, setNote] = useState("");
+  const mobile = isOrbitMobile();
+  const [targets, setTargets] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [query, setQuery] = useState("");
+  const [note, setNote] = useState("");
+  const [multi, setMulti] = useState(false);
+  const [step, setStep] = useState("pick");
   const available = rooms.filter(room => !room.isSpace);
   const filtered = available.filter(room => `${room.name} ${room.id}`.toLowerCase().includes(query.trim().toLowerCase()));
   const selectedRooms = targets.map(id => available.find(room => room.id === id)).filter(Boolean);
+  const recentRooms = loadRecentForwardIds().map(id => available.find(room => room.id === id)).filter(Boolean).slice(0, 8);
   const toggle = id => setTargets(current => current.includes(id) ? current.filter(value => value !== id) : [...current, id]);
-  const forward = async () => { if (!targets.length || !items.length) return; setLoading(true); try { for (const targetId of targets) { for (const item of items) { const eventContent = item.event?.getClearContent?.() || item.event?.getContent?.() || { msgtype: "m.text", body: item.text || "" }; const content = { ...eventContent }; delete content.event_id; delete content.room_id; delete content.sender; delete content.origin_server_ts; delete content["m.relates_to"]; await client.sendMessage(targetId, content); } if (note.trim()) await client.sendMessage(targetId, { msgtype: "m.text", body: note.trim() }); } Toast.success(`已转发 ${items.length} 条消息到 ${targets.length} 个房间`); onClose(); } catch (error) { Toast.error(`转发失败：${error?.message || "未知错误"}`); } finally { setLoading(false); } };
+  const pickOne = id => { setTargets([id]); setStep("confirm"); };
+  const forward = async () => {
+    if (!targets.length || !items.length) return;
+    setLoading(true);
+    try {
+      for (const targetId of targets) {
+        for (const item of items) {
+          const eventContent = item.event?.getClearContent?.() || item.event?.getContent?.() || { msgtype: "m.text", body: item.text || "" };
+          const content = { ...eventContent };
+          delete content.event_id;
+          delete content.room_id;
+          delete content.sender;
+          delete content.origin_server_ts;
+          delete content["m.relates_to"];
+          await client.sendMessage(targetId, content);
+        }
+        if (note.trim()) await client.sendMessage(targetId, { msgtype: "m.text", body: note.trim() });
+      }
+      rememberForwardIds(targets);
+      Toast.success(`已转发 ${items.length} 条消息到 ${targets.length} 个房间`);
+      onClose();
+    } catch (error) {
+      Toast.error(`转发失败：${error?.message || "未知错误"}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+  if (mobile) {
+    const roomButton = (room, compact = false) => h("button", {
+      type: "button",
+      className: compact ? `orbit-forward-recent-item ${targets.includes(room.id) ? "is-selected" : ""}` : `orbit-forward-row ${targets.includes(room.id) ? "is-selected" : ""}`,
+      key: room.id,
+      onClick: () => multi ? toggle(room.id) : pickOne(room.id)
+    },
+      (!compact && multi) && h("i", { className: `orbit-forward-check ${targets.includes(room.id) ? "is-on" : ""}` }),
+      h(MatrixAvatar, { client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: compact ? 48 : 42, style: { background: room.color }, fallback: room.initials, alt: room.name }),
+      h("span", { className: compact ? "" : "orbit-forward-name" }, room.name),
+      compact && multi && h("i", { className: `orbit-forward-check is-mini ${targets.includes(room.id) ? "is-on" : ""}` })
+    );
+    return h("div", { className: "orbit-forward-page", role: "dialog", "aria-modal": "true" },
+      h("header", { className: "orbit-forward-head" },
+        h("button", { type: "button", className: "orbit-forward-text-btn", onClick: () => { if (step === "confirm") { setStep("pick"); return; } if (multi) { setMulti(false); setTargets([]); return; } onClose(); } }, step === "confirm" ? "返回" : (multi ? "取消" : "关闭")),
+        h("strong", null, "选择聊天"),
+        multi
+          ? h("button", { type: "button", className: `orbit-forward-next ${targets.length ? "is-ready" : ""}`, disabled: !targets.length, onClick: () => setStep("confirm") }, targets.length ? `下一步(${targets.length})` : "下一步")
+          : h("button", { type: "button", className: "orbit-forward-text-btn", onClick: () => setMulti(true) }, "多选")
+      ),
+      h("div", { className: "orbit-forward-search" }, h("input", { value: query, onChange: event => setQuery(event.target.value), placeholder: "搜索", "aria-label": "搜索会话" })),
+      !query.trim() && recentRooms.length > 0 && h("section", { className: "orbit-forward-recent" },
+        h("div", { className: "orbit-forward-section-label" }, "最近转发"),
+        h("div", { className: "orbit-forward-recent-row" }, recentRooms.map(room => roomButton(room, true)))
+      ),
+      h("section", { className: "orbit-forward-list-wrap" },
+        h("div", { className: "orbit-forward-section-label" }, query.trim() ? "搜索结果" : "最近聊天"),
+        h("div", { className: "orbit-forward-list" }, filtered.length ? filtered.map(room => roomButton(room)) : h("div", { className: "dialog-empty" }, "没有匹配的会话"))
+      ),
+      step === "confirm" && h("div", { className: "orbit-sheet-backdrop orbit-forward-confirm", onClick: event => event.target === event.currentTarget && setStep("pick") },
+        h("div", { className: "orbit-sheet orbit-forward-confirm-sheet", onClick: event => event.stopPropagation() },
+          h("div", { className: "orbit-sheet-handle" }),
+          h("div", { className: "orbit-forward-confirm-title" }, "分别发送给"),
+          h("div", { className: "orbit-forward-confirm-list" }, selectedRooms.map(room => h("div", { className: "orbit-forward-confirm-row", key: room.id },
+            h(MatrixAvatar, { client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 36, style: { background: room.color }, fallback: room.initials, alt: room.name }),
+            h("span", null, room.name)
+          ))),
+          h("div", { className: "orbit-forward-summary" }, `[逐条转发] 共 ${items.length} 条消息`),
+          h("input", { className: "orbit-forward-note", value: note, onChange: event => setNote(event.target.value), placeholder: "发消息", maxLength: 500 }),
+          h("div", { className: "orbit-forward-confirm-actions" },
+            h("button", { type: "button", className: "orbit-forward-cancel", disabled: loading, onClick: () => setStep("pick") }, "取消"),
+            h("button", { type: "button", className: "orbit-forward-send", disabled: !targets.length || loading, onClick: forward }, loading ? "发送中…" : `发送(${targets.length})`)
+          )
+        )
+      )
+    );
+  }
   return h("div", { className: "modal-backdrop forward-backdrop", onMouseDown: event => event.target === event.currentTarget && onClose() },
     h("div", { className: "modal-card forward-card forward-dialog" },
       h("div", { className: "forward-dialog-head" }, h("div", null, h("div", { className: "modal-title" }, "转发消息"), h("div", { className: "modal-copy" }, `共 ${items.length} 条消息`)), h(UiButton, { className: "icon-button", type: "text", title: "关闭", onClick: onClose }, "×")),
@@ -2323,7 +2486,7 @@ function Sidebar({ rooms, allRooms: roomUniverse = rooms, invites = [], spaces, 
       h("div", { className: "invite-actions" }, h("button", { type: "button", className: "invite-accept", onClick: () => onAcceptInvite?.(invite) }, "接受"), h("button", { type: "button", className: "invite-decline", onClick: () => onDeclineInvite?.(invite) }, "忽略"))
     ))
   ) : null;
-  return h("aside", { className: "sidebar" }, h("div", { className: "brand-row" }, h("div", { className: "brand" }, h("div", { className: "brand-mark" }, "O"), h("div", null, "Orbit", h("div", { className: "workspace-pill" }, "Matrix 工作台"))), h("button", { className: "icon-button", title: viewMode === "spaces" && activeSpaceId ? "在当前空间创建房间" : "创建房间", onClick: onCreate }, "+")), h("button", { className: "user-card", onClick: onAccount, title: "打开我的设置" }, h(MatrixAvatar, { client: connected.client, mxcUrl: memberAvatarMxc(currentUser), size: 32, className: "user-avatar", style: { background: colorFor(connected.userId) }, fallback: initials(connected.userId), alt: connected.userId }), h("div", { className: "user-meta" }, h("div", { className: "user-name" }, connected.client?.getUser?.(connected.userId)?.displayName || connected.userId), h("div", { className: "user-id" }, "我的设置")), h("span", { className: `online-dot ${presence === "offline" ? "offline-dot" : ""}`, title: presence || "online" })), h("div", { className: "sidebar-nav" }, h("button", { className: `nav-item ${viewMode === "messages" ? "active" : ""}`, onClick: () => onViewMode("messages") }, "私聊", unreadBadge(totalUnread)), h("button", { className: `nav-item ${viewMode === "groups" ? "active" : ""}`, onClick: () => onViewMode("groups") }, "群聊", unreadBadge(groupUnread), invites.length > 0 && h("span", { className: "nav-unread-dot", title: `${invites.length} 个房间邀请` })), h("button", { className: `nav-item ${viewMode === "spaces" ? "active" : ""}`, onClick: () => onViewMode("spaces") }, "空间")), inviteNotice, viewMode === "spaces" && h("div", { className: "space-list" }, h("div", { className: "section-label" }, h("span", null, "我的空间"), h("span", { className: "space-actions" }, h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onCreateSpace?.(); }, title: "创建空间" }, "+"), activeSpaceId && h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onCreate?.(); }, title: "在当前空间创建房间" }, "新房间"), activeSpaceId && h("button", { className: "mini-link danger-mini-link", onClick: event => { event.stopPropagation(); onLeaveSpace?.(); }, title: "退出当前空间" }, "退出"), h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onManageSpace?.(); }, title: "管理空间房间" }, "⋯"))), spaces.length ? spaces.map(space => h("div", { className: `space-row ${space.id === activeSpaceId ? "active" : ""}`, key: space.id, onClick: () => onSpaceSelect(space.id) }, h("div", { className: "space-icon", style: { background: space.color } }, space.initials), h("span", null, space.name))) : h("div", { className: "empty-sidebar" }, "服务器没有返回 Space 房间")), h("div", { className: "room-tools" }, h(Input, { prefix: "⌕", placeholder: viewMode === "spaces" ? "搜索空间内房间" : viewMode === "groups" ? "搜索群聊" : "搜索私聊", value: query, onChange: setQuery, showClear: true })), h("div", { className: "section-label" }, h("span", null, viewMode === "spaces" ? "空间内房间" : viewMode === "groups" ? "群聊" : "私聊"), h("span", null, filtered.length), viewMode === "messages" && h("span", { className: "sort-switch", role: "group", "aria-label": "私聊排序" }, h("button", { type: "button", className: directSort === "active" ? "active" : "", onClick: () => setDirectSort("active") }, "活跃优先"), h("button", { type: "button", className: directSort === "online" ? "active" : "", onClick: () => setDirectSort("online") }, "在线优先"))), h("div", { className: "room-list" }, sortedRooms.length ? sortedRooms.map(room => { const directPresence = room.directUserId ? connected.client?.getUser?.(room.directUserId)?.presence : null; const showUnread = room.id !== selectedId && room.unread > 0; return h("div", { key: room.id, className: `room-row ${room.id === selectedId ? "active" : ""}`, onClick: () => onSelect(room.id) }, h(MatrixAvatar, { client: connected.client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 38, style: { background: room.color }, fallback: room.initials, alt: room.name }), h("div", { className: "room-copy" }, h("div", { className: "room-name-line" }, h("span", { className: "room-name" }, room.name), directPresence && h("span", { className: `room-presence-dot ${directPresence === "online" ? "online" : ""}`, title: directPresence === "online" ? "在线" : "离线" })), h("div", { className: "room-preview" }, room.preview)), h("div", { className: "room-trailing" }, h("span", { className: "room-time" }, room.time), showUnread ? h("span", { className: `room-unread-badge ${room.unread === 1 ? "dot" : ""}`, title: `${room.unread} 条未读消息` }, room.unread > 1 ? room.unread : null) : null)); }) : h("div", { className: "empty-sidebar" }, viewMode === "spaces" ? "请选择一个空间，或该空间还没有子房间" : "暂无房间")), h("div", { className: "sidebar-footer" }, h("div", { className: "connection-state" }, h("span", { className: `online-dot ${presence === "offline" ? "offline-dot" : ""}` }), presence === "offline" ? "离线" : "Matrix 已连接"), h("button", { className: "icon-button", title: "退出登录", onClick: onLogout }, "↪")));
+  return h("aside", { className: "sidebar" }, h("div", { className: "brand-row desktop-only" }, h("div", { className: "brand" }, h("div", { className: "brand-mark" }, "O"), h("div", null, "Orbit", h("div", { className: "workspace-pill" }, "Matrix 工作台"))), h("button", { className: "icon-button", title: viewMode === "spaces" && activeSpaceId ? "在当前空间创建房间" : "创建房间", onClick: onCreate }, "+")), h("div", { className: "sidebar-user-row" }, h("button", { className: "user-card", onClick: onAccount, title: "打开我的设置" }, h(MatrixAvatar, { client: connected.client, mxcUrl: memberAvatarMxc(currentUser), size: 32, className: "user-avatar", style: { background: colorFor(connected.userId) }, fallback: initials(connected.userId), alt: connected.userId }), h("div", { className: "user-meta" }, h("div", { className: "user-name" }, connected.client?.getUser?.(connected.userId)?.displayName || connected.userId), h("div", { className: "user-id" }, "我的设置")), h("span", { className: `online-dot ${presence === "offline" ? "offline-dot" : ""}`, title: presence || "online" })), h("button", { type: "button", className: "icon-button mobile-only mobile-create-room", title: "创建房间", "aria-label": "创建房间", onClick: onCreate }, h(Icon, { name: "plus", size: 22 }))), h("div", { className: "sidebar-nav" }, h("button", { className: `nav-item ${viewMode === "messages" ? "active" : ""}`, onClick: () => onViewMode("messages") }, "私聊", unreadBadge(totalUnread)), h("button", { className: `nav-item ${viewMode === "groups" ? "active" : ""}`, onClick: () => onViewMode("groups") }, "群聊", unreadBadge(groupUnread), invites.length > 0 && h("span", { className: "nav-unread-dot", title: `${invites.length} 个房间邀请` })), h("button", { className: `nav-item ${viewMode === "spaces" ? "active" : ""}`, onClick: () => onViewMode("spaces") }, "空间")), inviteNotice, viewMode === "spaces" && h("div", { className: "space-list" }, h("div", { className: "section-label" }, h("span", null, "我的空间"), h("span", { className: "space-actions" }, h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onCreateSpace?.(); }, title: "创建空间" }, "+"), activeSpaceId && h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onCreate?.(); }, title: "在当前空间创建房间" }, "新房间"), activeSpaceId && h("button", { className: "mini-link danger-mini-link", onClick: event => { event.stopPropagation(); onLeaveSpace?.(); }, title: "退出当前空间" }, "退出"), h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onManageSpace?.(); }, title: "管理空间房间" }, "⋯"))), spaces.length ? spaces.map(space => h("div", { className: `space-row ${space.id === activeSpaceId ? "active" : ""}`, key: space.id, onClick: () => onSpaceSelect(space.id) }, h("div", { className: "space-icon", style: { background: space.color } }, space.initials), h("span", null, space.name))) : h("div", { className: "empty-sidebar" }, "服务器没有返回 Space 房间")), h("div", { className: "room-tools" }, h(Input, { prefix: "⌕", placeholder: viewMode === "spaces" ? "搜索空间内房间" : viewMode === "groups" ? "搜索群聊" : "搜索私聊", value: query, onChange: setQuery, showClear: true })), h("div", { className: "section-label" }, h("span", null, viewMode === "spaces" ? "空间内房间" : viewMode === "groups" ? "群聊" : "私聊"), h("span", { className: "desktop-only" }, filtered.length), viewMode === "messages" && h("span", { className: "sort-switch", role: "group", "aria-label": "私聊排序" }, h("button", { type: "button", className: directSort === "active" ? "active" : "", onClick: () => setDirectSort("active") }, "活跃优先"), h("button", { type: "button", className: directSort === "online" ? "active" : "", onClick: () => setDirectSort("online") }, "在线优先"))), h("div", { className: "room-list" }, sortedRooms.length ? sortedRooms.map(room => { const directPresence = room.directUserId ? connected.client?.getUser?.(room.directUserId)?.presence : null; const showUnread = room.id !== selectedId && room.unread > 0; return h("div", { key: room.id, className: `room-row ${room.id === selectedId ? "active" : ""}`, onClick: () => onSelect(room.id) }, h(MatrixAvatar, { client: connected.client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 38, style: { background: room.color }, fallback: room.initials, alt: room.name }), h("div", { className: "room-copy" }, h("div", { className: "room-name-line" }, h("span", { className: "room-name" }, room.name), directPresence && h("span", { className: `room-presence-dot ${directPresence === "online" ? "online" : ""}`, title: directPresence === "online" ? "在线" : "离线" })), h("div", { className: "room-preview" }, room.preview)), h("div", { className: "room-trailing" }, h("span", { className: "room-time" }, room.time), showUnread ? h("span", { className: `room-unread-badge ${room.unread === 1 ? "dot" : ""}`, title: `${room.unread} 条未读消息` }, room.unread > 1 ? room.unread : null) : null)); }) : h("div", { className: "empty-sidebar" }, viewMode === "spaces" ? "请选择一个空间，或该空间还没有子房间" : "暂无房间")), h("div", { className: "sidebar-footer desktop-only" }, h("div", { className: "connection-state" }, h("span", { className: `online-dot ${presence === "offline" ? "offline-dot" : ""}` }), presence === "offline" ? "离线" : "Matrix 已连接"), h("button", { className: "icon-button", title: "退出登录", onClick: onLogout }, "↪")));
 }
 
 function SpaceDialog({ client, onClose, onCreated }) {
@@ -2346,8 +2509,8 @@ function ReactionPicker({ client, onSelect }) {
   useEffect(() => {
     if (!open) return undefined;
     const close = event => { if (!event.target?.closest?.(".reaction-picker, .message-action-reaction")) setOpen(false); };
-    document.addEventListener("mousedown", close);
-    return () => document.removeEventListener("mousedown", close);
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
   }, [open]);
   const shown = items.filter(item => pack === "all" || item.packId === pack).slice(0, 240);
   const submitCustom = () => { const value = custom.trim(); if (!value) return; onSelect(value); setCustom(""); setOpen(false); };
@@ -2822,7 +2985,9 @@ function AudioMessagePlayer({ src, className = "", label = "音频文件" }) {
 }
 
 function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onMention, onTogglePinMessage, pinnedEventIds = [], selecting, selected, onSelect, grouped = item?.grouped || false }) {
-  const [contextMenu, setContextMenu] = useState(null);
+  const mobile = useOrbitMobile();
+  const [actionOpen, setActionOpen] = useState(false);
+  const [contextMenu, setContextMenu] = useState(null); const menuGuardRef = useRef(0);
   const [viewer, setViewer] = useState(null);
   const [documentModal, setDocumentModal] = useState(null);
   const [documentPreview, setDocumentPreview] = useState({ status: "idle", html: "", text: "", url: "", error: "" });
@@ -2858,7 +3023,7 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
     }
     setDocumentModal(null);
   };
-  useEffect(() => { if (!contextMenu) { document.querySelector(".context-reaction-picker")?.remove(); document.querySelector(".context-reaction-preview")?.remove(); return; } const close = event => { if (event.target?.closest?.(".context-reaction-picker, .message-context-reactions")) return; setContextMenu(null); }; document.addEventListener("click", close); return () => document.removeEventListener("click", close); }, [contextMenu]);
+  useEffect(() => { if (!contextMenu) { document.querySelector(".context-reaction-picker")?.remove(); document.querySelector(".context-reaction-preview")?.remove(); return; } const close = event => { if (event.target?.closest?.(".context-reaction-picker, .message-context-reactions, .message-context-menu, .orbit-message-menu-backdrop")) return; menuGuardRef.current = Date.now(); setContextMenu(null); }; document.addEventListener("click", close); return () => document.removeEventListener("click", close); }, [contextMenu]);
   // Right-clicking another message should replace the current menu instead of
   // leaving several fixed menus stacked over the timeline.
   useEffect(() => {
@@ -2866,12 +3031,30 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
     document.addEventListener("mousedown", closeOnSecondaryPress);
     return () => document.removeEventListener("mousedown", closeOnSecondaryPress);
   }, []);
+  useEffect(() => { if (selecting) setActionOpen(false); }, [selecting]);
+  useEffect(() => {
+    if (!mobile) return undefined;
+    const onOpen = event => { if (event.detail?.id !== item.id) setActionOpen(false); };
+    window.addEventListener("orbit:open-message-actions", onOpen);
+    return () => window.removeEventListener("orbit:open-message-actions", onOpen);
+  }, [mobile, item.id]);
+  useEffect(() => {
+    if (!mobile || !actionOpen || !item.id) return undefined;
+    const rowId = `event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+    const close = event => {
+      if (event.target?.closest?.(".message-actions, .ant-popover, .reaction-popover, .message-context-menu, .orbit-sheet")) return;
+      if (event.target?.closest?.(".message-row")?.id === rowId) return;
+      setActionOpen(false);
+    };
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [mobile, actionOpen, item.id]);
   // Polish the context menu after it mounts so the actions stay in the same
   // order on every message, while keeping the message row itself uncluttered.
   useEffect(() => {
     if (!contextMenu || !item.id) return;
     const row = document.getElementById(`event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`);
-    const menu = row?.querySelector(".message-context-menu");
+    const menu = row?.querySelector(".message-context-menu") || document.querySelector(".message-context-menu");
     if (!menu || menu.dataset.orbitActionsReady === "1") return;
     const buttons = [...menu.querySelectorAll(":scope > button")];
     const find = text => buttons.find(button => String(button.textContent || "").trim() === text);
@@ -2903,7 +3086,10 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
       redact: "M6 7h12M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v6m4-6v6"
     };
     [...menu.querySelectorAll(":scope > button[data-action]")].forEach(button => { const d = paths[button.dataset.action]; if (!d) return; const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg"); svg.classList.add("context-menu-icon"); svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("aria-hidden", "true"); const path = document.createElementNS("http://www.w3.org/2000/svg", "path"); path.setAttribute("d", d); svg.append(path); button.prepend(svg); });
-    if (!row.querySelector(".message-context-reactions")) {
+    if (mobile) {
+      row.querySelector(".message-context-reactions")?.remove();
+      document.querySelector(".context-reaction-picker")?.remove();
+    } else if (!row.querySelector(".message-context-reactions")) {
       const bar = document.createElement("div"); bar.className = "message-context-reactions"; ["👍", "😂", "❤️", "😮", "😢", "👏"].forEach(key => { const button = document.createElement("button"); button.type = "button"; button.textContent = key; button.title = `回应：${key}`; button.addEventListener("click", event => { event.stopPropagation(); onReact?.(item, key); setContextMenu(null); }); bar.append(button); });
       const more = document.createElement("button"); more.type = "button"; more.className = "context-reaction-more"; more.textContent = "+"; more.title = "更多表情或文字回应";
       more.addEventListener("click", async event => { event.stopPropagation(); let panel = document.querySelector(".context-reaction-picker"); if (panel) { panel.remove(); return; }
@@ -2916,7 +3102,7 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
     const bar = row.querySelector(".message-context-reactions");
     if (bar) { bar.style.position = "fixed"; bar.style.zIndex = "2001"; bar.style.left = menu.style.left; bar.style.top = `${Math.max(8, (parseFloat(menu.style.top) || contextMenu.y) - 43)}px`; }
     menu.dataset.orbitActionsReady = "1";
-  }, [contextMenu, item.id, onReact]);
+  }, [contextMenu, item.id, onReact, mobile]);
   useEffect(() => { if (!item.threadRoot || !item.id) return; const row = document.getElementById(`event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`); const reference = row?.querySelector(".thread-reference"); if (!reference) return; const open = event => { event.stopPropagation(); onThread?.(item); }; reference.setAttribute("role", "button"); reference.setAttribute("tabindex", "0"); reference.addEventListener("click", open); return () => reference.removeEventListener("click", open); }, [item.id, item.threadRoot, onThread]);
   useEffect(() => {
     if (!item.id || !item.handle) return;
@@ -3010,7 +3196,7 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
       more.title = "更多";
       more.setAttribute("aria-label", "更多");
       more.textContent = "更多";
-      more.addEventListener("click", event => { event.stopPropagation(); const rect = more.getBoundingClientRect(); setContextMenu({ x: rect.left, y: rect.bottom + 4 }); });
+      more.addEventListener("click", event => { event.stopPropagation(); if (Date.now() - menuGuardRef.current < 450) return; const rect = more.getBoundingClientRect(); setContextMenu({ x: rect.left, y: rect.bottom + 4 }); });
     }
     applyIcon(more, "more");
     // The reference layout keeps edit immediately before the overflow menu.
@@ -3273,11 +3459,26 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
   const attachmentFallback = item.attachment && !media && !documentCard ? h("div", { className: "attachment-unavailable" }, asset.failed ? "媒体加载失败" : "正在加载媒体…", asset.url && h("a", { href: asset.url, onClick: openOriginal }, "打开原文件"), asset.failed && h("button", { type: "button", className: "media-retry-button", onClick: retryMedia }, "重试")) : null;
   const relation = (item.replyTo || item.threadRoot) && h(RelationContext, { item, client, onJumpTo, onThread });
   const payload = item.attachment ? h("div", { className: "attachment-wrap" }, documentCard || emojiRow || media || attachmentFallback || h("div", { className: "attachment-unavailable" }, "附件地址不可用")) : item.formattedBody ? h("div", { className: "message-bubble formatted-message" }, h(FormattedMessage, { html: item.formattedBody, client, emojiFiles: item.emojiFiles, onImage: (src, alt) => setViewer({ src, alt }) })) : h("div", { className: "message-bubble" }, item.decryptFailed ? `🔒 ${item.text}` : h(MessageText, { text: item.text }));
+  const rowGestures = mobile ? mobileMessageGestures({
+    onTap: () => {
+      if (selecting) { onSelect?.(item); return; }
+      setActionOpen(open => {
+        const next = !open;
+        if (next) window.dispatchEvent(new CustomEvent("orbit:open-message-actions", { detail: { id: item.id } }));
+        return next;
+      });
+    },
+    onLongPress: ({ x, y }) => { if (!selecting) setContextMenu({ x, y }); },
+    onSwipeLeft: () => {
+      window.dispatchEvent(new CustomEvent("orbit:start-message-selecting"));
+      onSelect?.(item);
+    },
+  }) : longPressHandlers(({ x, y }) => { if (!selecting) setContextMenu({ x, y }); });
   const documentContent = isOfficeAttachment
     ? h("div", { className: "document-modal-loading" }, documentPreview.error || "正在连接 Office 编辑器…")
     : documentPreview.status === "loading" ? h("div", { className: "document-modal-loading" }, "正在解析文档…") : documentPreview.status === "error" ? h("div", { className: "document-modal-loading" }, documentPreview.error) : isTextAttachment && documentPreview.status === "ready" ? h("pre", { className: "document-modal-text" }, documentPreview.text) : documentPreview.status === "ready" && documentPreview.html ? h("div", { className: `document-modal-html ${documentModal === "edit" ? "is-editable" : ""}`, contentEditable: documentModal === "edit", suppressContentEditableWarning: true, dangerouslySetInnerHTML: { __html: documentPreview.html } }) : h("div", { className: "document-modal-loading" }, documentPreview.error || "此格式暂不支持浏览器内排版，请使用下载后的 Office 应用打开");
   return h(React.Fragment, null,
-    h("div", { className: `message-row ${item.isMe ? "me" : ""} ${item.attachment?.emoji ? "emoji-message-row" : ""} ${grouped ? "message-grouped" : ""} ${item.decryptFailed ? "encrypted-message" : ""} ${selecting ? "message-selecting" : ""} ${selected ? "message-selected" : ""}`, id: item.id ? `event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}` : undefined, onClick: selecting ? () => onSelect?.(item) : undefined, onContextMenu: event => { event.preventDefault(); setContextMenu({ x: event.clientX, y: event.clientY }); } },
+    h("div", { className: `message-row ${item.isMe ? "me" : ""} ${item.attachment?.emoji ? "emoji-message-row" : ""} ${grouped ? "message-grouped" : ""} ${item.decryptFailed ? "encrypted-message" : ""} ${selecting ? "message-selecting" : ""} ${selected ? "message-selected" : ""} ${actionOpen ? "is-action-open" : ""}`, id: item.id ? `event-${item.id.replace(/[^a-zA-Z0-9_-]/g, "_")}` : undefined, onClick: (!mobile && selecting) ? () => onSelect?.(item) : undefined, ...rowGestures },
       h(MatrixAvatar, { client, mxcUrl: item.avatarMxc, size: 34, className: "message-avatar", style: { background: item.color }, fallback: item.avatar, alt: item.author }),
       h("div", { className: "message-body" },
         !grouped && h("div", { className: "message-author" }, h("button", { type: "button", className: "message-author-name", onClick: event => { event.stopPropagation(); onMention?.({ userId: item.handle, name: item.author }); } }, item.author), h("span", { className: "message-time" }, item.time), item.edited && h("span", { className: "message-time" }, "已编辑")),
@@ -3295,17 +3496,30 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
            )
          ),
          item.readBy?.length > 0 && h("div", { className: "message-read-receipt" }, h(ReadReceipt, { readBy: item.readBy || [], client })),
-        contextMenu && h("div", { className: "message-context-menu", style: contextMenuStyle, onClick: event => event.stopPropagation() },
-          // Keep the initial DOM order aligned with the final polished menu.
-          // The effect above adds the multi-select action and SVG glyphs.
-          h("button", { onClick: () => { navigator.clipboard?.writeText(item.text || ""); setContextMenu(null); } }, "复制消息"),
-          item.isMe && h("button", { onClick: () => { setContextMenu(null); onEdit(item); } }, "编辑"),
-          h("button", { onClick: () => { setContextMenu(null); onForward?.(item, false); } }, "转发"),
-          h("button", { onClick: () => { setContextMenu(null); onReply(item); } }, "回复"),
-          h("button", { onClick: () => { setContextMenu(null); onThread(item); } }, "在线程中回复"),
-          h("button", { onClick: () => { setContextMenu(null); onTogglePinMessage?.(item); } }, pinnedEventIds.includes(item.id) ? "取消置顶消息" : "置顶消息"),
-          reactions.length > 0 && h("button", { onClick: () => { setContextMenu(null); Toast.info(`该消息有 ${reactions.reduce((sum, entry) => sum + entry[1], 0)} 个回应`); } }, "查看回应详情"),
-          item.isMe && h("button", { className: "danger", onClick: () => { setContextMenu(null); onRedact(item); } }, "撤回")
+        contextMenu && (mobile
+          ? createPortal(h("div", { className: "orbit-message-menu-backdrop", role: "presentation", onPointerDown: event => { if (event.target !== event.currentTarget) return; event.preventDefault(); event.stopPropagation(); }, onMouseDown: event => { if (event.target !== event.currentTarget) return; event.preventDefault(); event.stopPropagation(); }, onClick: event => { if (event.target !== event.currentTarget) return; event.preventDefault(); event.stopPropagation(); menuGuardRef.current = Date.now(); setContextMenu(null); } },
+              h("div", { className: "message-context-menu orbit-sheet-menu", onClick: event => event.stopPropagation(), onMouseDown: event => event.stopPropagation() },
+                h("div", { className: "orbit-sheet-handle", "aria-hidden": "true" }),
+                h("button", { onClick: () => { navigator.clipboard?.writeText(item.text || ""); setContextMenu(null); } }, "复制消息"),
+                item.isMe && h("button", { onClick: () => { setContextMenu(null); onEdit(item); } }, "编辑"),
+                h("button", { onClick: () => { setContextMenu(null); onForward?.(item, false); } }, "转发"),
+                h("button", { onClick: () => { setContextMenu(null); onReply(item); } }, "回复"),
+                h("button", { onClick: () => { setContextMenu(null); onThread(item); } }, "在线程中回复"),
+                h("button", { onClick: () => { setContextMenu(null); onTogglePinMessage?.(item); } }, pinnedEventIds.includes(item.id) ? "取消置顶消息" : "置顶消息"),
+                reactions.length > 0 && h("button", { onClick: () => { setContextMenu(null); Toast.info(`该消息有 ${reactions.reduce((sum, entry) => sum + entry[1], 0)} 个回应`); } }, "查看回应详情"),
+                item.isMe && h("button", { className: "danger", onClick: () => { setContextMenu(null); onRedact(item); } }, "撤回")
+              )
+            ), document.body)
+          : h("div", { className: "message-context-menu", style: contextMenuStyle, onClick: event => event.stopPropagation() },
+              h("button", { onClick: () => { navigator.clipboard?.writeText(item.text || ""); setContextMenu(null); } }, "复制消息"),
+              item.isMe && h("button", { onClick: () => { setContextMenu(null); onEdit(item); } }, "编辑"),
+              h("button", { onClick: () => { setContextMenu(null); onForward?.(item, false); } }, "转发"),
+              h("button", { onClick: () => { setContextMenu(null); onReply(item); } }, "回复"),
+              h("button", { onClick: () => { setContextMenu(null); onThread(item); } }, "在线程中回复"),
+              h("button", { onClick: () => { setContextMenu(null); onTogglePinMessage?.(item); } }, pinnedEventIds.includes(item.id) ? "取消置顶消息" : "置顶消息"),
+              reactions.length > 0 && h("button", { onClick: () => { setContextMenu(null); Toast.info(`该消息有 ${reactions.reduce((sum, entry) => sum + entry[1], 0)} 个回应`); } }, "查看回应详情"),
+              item.isMe && h("button", { className: "danger", onClick: () => { setContextMenu(null); onRedact(item); } }, "撤回")
+            )
         )
       )
     ),
@@ -3334,8 +3548,9 @@ function ThreadPanel({ root, replies = [], client, onClose, onJumpTo }) {
   );
 }
 
-function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, onSend, onTyping, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onEmojiSelect, replyTo, threadRoot, editing, onCancelReply, onCancelThread, onCancelEdit, onUpload, detailsCollapsed, onToggleDetails, selecting, forwardItems, onSelectForward, onStartSelecting, pinnedEventIds, onTogglePinMessage, onOpenDetails, onStartCall, activeCall }) {
-  const [draft, setDraft] = useState(""); const [draftHtml, setDraftHtml] = useState(""); const [remoteTyping, setRemoteTyping] = useState([]); const inputRef = useRef(null); const fileRef = useRef(null); const scrollRef = useRef(null); const forceScrollRef = useRef(false); const stickToBottomRef = useRef(true); const previousTailRef = useRef({ roomId: null, eventId: null }); const pendingRoomScrollRef = useRef(null); const loadingEarlierRef = useRef(false); const preparedEmojiRef = useRef(new Map()); const pendingEmojiRef = useRef(new Map()); const emojiInsertGenerationRef = useRef(0); const emojiSearchTextRef = useRef(""); const pendingAttachmentsRef = useRef([]); const dragDepthRef = useRef(0); const sendingRef = useRef(false); const scrollMemoryRef = useRef(new Map()); const restoredRoomRef = useRef(null); const restoreInteractionRef = useRef(false); const restoreTimersRef = useRef([]); const [preparingEmoji, setPreparingEmoji] = useState(""); const [showJump, setShowJump] = useState(false); const [loadingEarlier, setLoadingEarlier] = useState(false); const [historyExhausted, setHistoryExhausted] = useState(false); const [pendingAttachments, setPendingAttachments] = useState([]); const [draggingFiles, setDraggingFiles] = useState(false); const [sending, setSending] = useState(false); const [recording, setRecording] = useState(false); const recorderRef = useRef(null); const recorderStreamRef = useRef(null); const recorderChunksRef = useRef([]);
+function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, onSend, onTyping, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onEmojiSelect, replyTo, threadRoot, editing, onCancelReply, onCancelThread, onCancelEdit, onUpload, detailsCollapsed, onToggleDetails, selecting, forwardItems, onSelectForward, onStartSelecting, pinnedEventIds, onTogglePinMessage, onOpenDetails, onStartCall, activeCall, onBack }) {
+  const mobile = useOrbitMobile();
+  const [draft, setDraft] = useState(""); const [draftHtml, setDraftHtml] = useState(""); const [remoteTyping, setRemoteTyping] = useState([]); const inputRef = useRef(null); const fileRef = useRef(null); const scrollRef = useRef(null); const forceScrollRef = useRef(false); const stickToBottomRef = useRef(true); const previousTailRef = useRef({ roomId: null, eventId: null }); const pendingRoomScrollRef = useRef(null); const loadingEarlierRef = useRef(false); const preparedEmojiRef = useRef(new Map()); const pendingEmojiRef = useRef(new Map()); const emojiInsertGenerationRef = useRef(0); const emojiSearchTextRef = useRef(""); const pendingAttachmentsRef = useRef([]); const dragDepthRef = useRef(0); const sendingRef = useRef(false); const scrollMemoryRef = useRef(new Map()); const restoredRoomRef = useRef(null); const restoreInteractionRef = useRef(false); const restoreTimersRef = useRef([]); const [preparingEmoji, setPreparingEmoji] = useState(""); const [showJump, setShowJump] = useState(false); const [loadingEarlier, setLoadingEarlier] = useState(false); const [historyExhausted, setHistoryExhausted] = useState(false); const [pendingAttachments, setPendingAttachments] = useState([]); const [draggingFiles, setDraggingFiles] = useState(false); const [sending, setSending] = useState(false); const [recording, setRecording] = useState(false); const [voiceMode, setVoiceMode] = useState(false); const [recordCancel, setRecordCancel] = useState(false); const [mobileMore, setMobileMore] = useState(false); const [emojiPanel, setEmojiPanel] = useState(false); const [attachSheet, setAttachSheet] = useState(false); const recorderRef = useRef(null); const recorderStreamRef = useRef(null); const recorderChunksRef = useRef([]); const recordCancelRef = useRef(false); const recordStartedAtRef = useRef(0); const holdStartYRef = useRef(0); const holdGestureRef = useRef(null); const micHoldRef = useRef({ timer: 0, started: false, x: 0, y: 0 }); const editorHoldRef = useRef({ timer: 0, started: false, x: 0, y: 0 }); const recordingTokenRef = useRef(0); const composerStackRef = useRef(null); const albumRef = useRef(null); const cameraRef = useRef(null);
   React.useEffect(() => {
     if (!replyTo && !threadRoot && !editing) return;
     const timer = requestAnimationFrame(() => inputRef.current?.focus?.());
@@ -3348,7 +3563,7 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
   }, [onStartSelecting]);
   React.useEffect(() => { pendingAttachmentsRef.current = pendingAttachments; }, [pendingAttachments]);
   React.useEffect(() => () => pendingAttachmentsRef.current.forEach(entry => entry.preview && URL.revokeObjectURL(entry.preview)), [room?.id]);
-  React.useEffect(() => { setPendingAttachments([]); setDraggingFiles(false); }, [room?.id]);
+  React.useEffect(() => { setPendingAttachments([]); setDraggingFiles(false); setVoiceMode(false); setRecordCancel(false); setEmojiPanel(false); setAttachSheet(false); }, [room?.id]);
   React.useEffect(() => {
     if (!client || !room?.id) { setRemoteTyping([]); return; }
     const update = (_event, member) => {
@@ -3359,9 +3574,14 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
       const names = (matrixRoom?.getTypingMembers?.() || []).filter(entry => entry?.userId !== ownId).map(entry => entry?.name || entry?.rawDisplayName || entry?.userId).filter(Boolean);
       setRemoteTyping(names);
     };
+    const matrixRoom = client.getRoom?.(room.id);
     client.on?.("RoomMember.typing", update);
+    matrixRoom?.on?.("RoomMember.typing", update);
     update();
-    return () => client.off?.("RoomMember.typing", update);
+    return () => {
+      client.off?.("RoomMember.typing", update);
+      matrixRoom?.off?.("RoomMember.typing", update);
+    };
   }, [client, room?.id]);
   typingUsers = remoteTyping;
   const prepareEmojiSelection = React.useCallback(item => {
@@ -3573,7 +3793,7 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
       .map(([, promise]) => promise);
     // Clear optimistically before any network/upload work starts so the
     // just-submitted text never lingers in the editor while Matrix responds.
-    setDraft(""); setDraftHtml(""); setMentionTargets([]); setEmojiSuggestions([]); emojiActionRef.current = "select";
+    setDraft(""); setDraftHtml(""); setMentionTargets([]); setEmojiSuggestions([]); emojiActionRef.current = "select"; onTyping(false);
     inputRef.current?.clear?.();
     // Invalidate visual insertion callbacks while preserving the promises
     // captured above so their prepared MXC records remain available below.
@@ -3645,10 +3865,14 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
     el.addEventListener("keydown", markInteraction, { passive: true });
     return () => { el.removeEventListener("scroll", rememberPosition); el.removeEventListener("wheel", markInteraction); el.removeEventListener("touchstart", markInteraction); el.removeEventListener("pointerdown", markInteraction); el.removeEventListener("keydown", markInteraction); };
   }, [room?.id]);
-  const keyDown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
+  const keyDown = e => {
+    if (e.key !== "Enter") return;
+    if (isOrbitMobile()) return;
+    if (!e.shiftKey) { e.preventDefault(); send(); }
+  };
   const loadEarlier = async () => { if (loadingEarlierRef.current || historyExhausted) return; const el = scrollRef.current; loadingEarlierRef.current = true; setLoadingEarlier(true); const beforeHeight = el?.scrollHeight || 0; try { const loaded = await onLoadMore?.(); if (loaded === false) setHistoryExhausted(true); requestAnimationFrame(() => { if (el) el.scrollTop += el.scrollHeight - beforeHeight; }); } finally { loadingEarlierRef.current = false; setLoadingEarlier(false); } };
   const jumpBottom = () => { const el = scrollRef.current; stickToBottomRef.current = true; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); setShowJump(false); };
-  React.useEffect(() => () => { recorderRef.current?.stop?.(); recorderStreamRef.current?.getTracks?.().forEach(track => track.stop()); }, []);
+  React.useEffect(() => () => { recorderRef.current?.stop?.(); recorderStreamRef.current?.getTracks?.().forEach(track => track.stop()); clearTimeout(micHoldRef.current?.timer); clearTimeout(editorHoldRef.current?.timer); }, []);
   if (!room) return h("main", { className: "main-panel" }, h("div", { className: "empty-messages" }, "登录后选择一个房间开始聊天"));
   const insertEmoji = (item, options = {}) => {
     const generation = emojiInsertGenerationRef.current;
@@ -3674,20 +3898,31 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
     }).catch(error => Toast.error(`表情准备失败：${error?.message || "无法上传到 Matrix"}`));
   };
   const insertMention = mention => { const userId = mention?.userId; const name = String(mention?.name || userId || "").replace(/^@/, "").trim(); if (!userId || !name) return; setMentionTargets(current => current.some(entry => entry.userId === userId) ? current : [...current, { userId, name }]); const current = String(draft || ""); const prefix = current && !/[\s\n]$/.test(current) ? " " : ""; inputRef.current?.insertText?.(`${prefix}@${name} `); };
-  const toggleRecording = async () => {
-    if (recorderRef.current) { recorderRef.current.stop(); return; }
+  const stopRecorderTracks = () => {
+    recorderStreamRef.current?.getTracks?.().forEach(track => track.stop());
+    recorderStreamRef.current = null;
+  };
+  const startRecording = async () => {
+    if (recorderRef.current) return;
     if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { Toast.warning("当前浏览器不支持语音录制"); return; }
+    const token = ++recordingTokenRef.current;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (recordingTokenRef.current !== token) { stream.getTracks().forEach(track => track.stop()); return; }
       const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find(type => window.MediaRecorder.isTypeSupported?.(type)) || "";
       const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-      recorderStreamRef.current = stream; recorderChunksRef.current = []; recorderRef.current = recorder; setRecording(true);
+      recorderStreamRef.current = stream; recorderChunksRef.current = []; recorderRef.current = recorder;
+      recordCancelRef.current = false; recordStartedAtRef.current = Date.now(); setRecordCancel(false); setRecording(true);
       recorder.ondataavailable = event => { if (event.data?.size) recorderChunksRef.current.push(event.data); };
-      recorder.onerror = () => { recorderRef.current = null; stream.getTracks().forEach(track => track.stop()); setRecording(false); Toast.error("语音录制失败"); };
+      recorder.onerror = () => { recorderRef.current = null; stopRecorderTracks(); setRecording(false); Toast.error("语音录制失败"); };
       recorder.onstop = async () => {
-        recorderRef.current = null; stream.getTracks().forEach(track => track.stop()); setRecording(false);
+        recorderRef.current = null; stopRecorderTracks(); setRecording(false);
+        const cancelled = recordCancelRef.current;
+        const elapsed = Date.now() - (recordStartedAtRef.current || 0);
         const blob = new Blob(recorderChunksRef.current, { type: recorder.mimeType || "audio/webm" }); recorderChunksRef.current = [];
-        if (!blob.size || !onUpload) return;
+        recordCancelRef.current = false; setRecordCancel(false);
+        if (cancelled || !blob.size || !onUpload) return;
+        if (elapsed < 600) { Toast.warning("说话时间太短"); return; }
         try {
           const file = await encodeVoiceMp3(blob);
           await onUpload(file);
@@ -3696,7 +3931,121 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
         }
       };
       recorder.start();
-    } catch { Toast.error("无法访问麦克风，请检查浏览器权限"); }
+    } catch { Toast.error("无法访问麦克风，请检查权限"); }
+  };
+  const stopRecording = (cancelled = false) => {
+    recordingTokenRef.current += 1;
+    if (cancelled) { recordCancelRef.current = true; setRecordCancel(true); }
+    const recorder = recorderRef.current;
+    if (recorder && recorder.state !== "inactive") recorder.stop();
+    else { stopRecorderTracks(); setRecording(false); setRecordCancel(false); }
+  };
+  const toggleRecording = async () => {
+    if (recorderRef.current) stopRecording(false);
+    else await startRecording();
+  };
+  const endHoldGesture = cancelled => {
+    const gesture = holdGestureRef.current;
+    if (gesture) {
+      window.removeEventListener("pointermove", gesture.onMove);
+      window.removeEventListener("pointerup", gesture.onUp);
+      window.removeEventListener("pointercancel", gesture.onCancel);
+      holdGestureRef.current = null;
+    }
+    if (micHoldRef.current) micHoldRef.current.started = false;
+    if (editorHoldRef.current) editorHoldRef.current.started = false;
+    stopRecording(cancelled);
+  };
+  const beginHoldRecord = (event, options = {}) => {
+    if (holdGestureRef.current || recorderRef.current) return;
+    holdStartYRef.current = event.clientY;
+    if (options.enterVoiceMode) setVoiceMode(true);
+    startRecording();
+    const pointerId = event.pointerId;
+    const onMove = moveEvent => {
+      if (moveEvent.pointerId !== pointerId) return;
+      const cancel = moveEvent.clientY < Math.min(132, window.innerHeight * 0.22) || holdStartYRef.current - moveEvent.clientY > 80;
+      if (recordCancelRef.current !== cancel) { recordCancelRef.current = cancel; setRecordCancel(cancel); }
+    };
+    const onUp = upEvent => {
+      if (upEvent.pointerId !== pointerId) return;
+      endHoldGesture(recordCancelRef.current);
+    };
+    const onCancel = cancelEvent => {
+      if (cancelEvent.pointerId !== pointerId) return;
+      endHoldGesture(true);
+    };
+    holdGestureRef.current = { onMove, onUp, onCancel, pointerId };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+  };
+  const clearHoldTimer = slot => { clearTimeout(slot.current.timer); slot.current.timer = 0; };
+  const holdTalkHandlers = {
+    onPointerDown(event) {
+      if (event.pointerType === "mouse" && event.button !== 0) return;
+      event.preventDefault();
+      event.currentTarget.setPointerCapture?.(event.pointerId);
+      beginHoldRecord(event);
+    },
+  };
+  const micHoldHandlers = {
+    onPointerDown(event) {
+      if (!mobile || voiceMode) return;
+      if (event.pointerType === "mouse" && event.button !== 0) return;
+      const pointer = { pointerId: event.pointerId, clientY: event.clientY };
+      micHoldRef.current = { timer: 0, started: false, x: event.clientX, y: event.clientY };
+      micHoldRef.current.timer = window.setTimeout(() => {
+        micHoldRef.current.started = true;
+        beginHoldRecord(pointer, { enterVoiceMode: true });
+      }, 320);
+    },
+    onPointerMove(event) {
+      if (!micHoldRef.current.timer || micHoldRef.current.started) return;
+      if (Math.hypot(event.clientX - micHoldRef.current.x, event.clientY - micHoldRef.current.y) > 12) clearHoldTimer(micHoldRef);
+    },
+    onPointerUp() { if (!micHoldRef.current.started) clearHoldTimer(micHoldRef); },
+    onPointerCancel() { clearHoldTimer(micHoldRef); },
+    onClick() {
+      if (micHoldRef.current.started) { micHoldRef.current.started = false; return; }
+      if (recording) stopRecording(true);
+      setVoiceMode(value => !value);
+    },
+  };
+  const hasDraft = Boolean(normalizeComposerText(draft, draftHtml).trim());
+  const editorHoldHandlers = !mobile || hasDraft || voiceMode ? null : {
+    onPointerDown(event) {
+      if (event.target?.closest?.("button, a")) return;
+      if (event.pointerType === "mouse" && event.button !== 0) return;
+      const alreadyFocused = event.currentTarget.contains(document.activeElement);
+      if (!alreadyFocused) event.preventDefault();
+      const target = event.currentTarget;
+      const pointer = { pointerId: event.pointerId, clientY: event.clientY };
+      editorHoldRef.current = { timer: 0, started: false, x: event.clientX, y: event.clientY, focused: alreadyFocused };
+      editorHoldRef.current.timer = window.setTimeout(() => {
+        editorHoldRef.current.started = true;
+        window.getSelection?.()?.removeAllRanges?.();
+        inputRef.current?.blur?.();
+        target?.setPointerCapture?.(pointer.pointerId);
+        beginHoldRecord(pointer);
+      }, 420);
+    },
+    onPointerMove(event) {
+      if (!editorHoldRef.current.timer || editorHoldRef.current.started) return;
+      if (Math.hypot(event.clientX - editorHoldRef.current.x, event.clientY - editorHoldRef.current.y) > 10) clearHoldTimer(editorHoldRef);
+    },
+    onPointerUp(event) {
+      if (editorHoldRef.current.started) {
+        event.preventDefault();
+        editorHoldRef.current.started = false;
+        return;
+      }
+      const shouldFocus = !editorHoldRef.current.focused;
+      clearHoldTimer(editorHoldRef);
+      if (shouldFocus) inputRef.current?.focus?.();
+    },
+    onPointerCancel() { clearHoldTimer(editorHoldRef); },
+    onContextMenu(event) { event.preventDefault(); },
   };
   const handleFiles = files => {
     const list = [...(files || [])].filter(file => file && file.size >= 0);
@@ -3710,13 +4059,50 @@ function Chat({ room, messages, client, typingUsers = [], onLoadMore, onSearch, 
   const onMessageDragEnter = event => { if (!isFileDrag(event)) return; event.preventDefault(); dragDepthRef.current += 1; setDraggingFiles(true); };
   const onMessageDragLeave = event => { if (!isFileDrag(event)) return; event.preventDefault(); dragDepthRef.current = Math.max(0, dragDepthRef.current - 1); if (!dragDepthRef.current) setDraggingFiles(false); };
   const onMessageDrop = event => { if (!isFileDrag(event)) return; event.preventDefault(); dragDepthRef.current = 0; setDraggingFiles(false); handleFiles(event.dataTransfer?.files); };
-  const pendingPreview = pendingAttachments.length ? createPortal(h("div", { className: "pending-attachments-backdrop", role: "presentation", onMouseDown: event => event.target === event.currentTarget && !sending && clearAttachments() }, h("section", { className: "pending-attachments", role: "dialog", "aria-modal": "true", "aria-label": `发送给 ${room.name}` }, h("div", { className: "pending-attachments-head" }, h("strong", null, `发送给 ${room.name}`), h("button", { type: "button", className: "pending-close", disabled: sending, onClick: clearAttachments, "aria-label": "关闭附件预览" }, "×")), h("div", { className: "pending-attachment-list" }, pendingAttachments.map(entry => { const file = entry.file; const kind = attachmentKind(file.name); const isImage = file.type.startsWith("image/"); const isVideo = file.type.startsWith("video/"); const statusText = entry.status === "uploading" ? `上传中 ${entry.percent || 0}%` : entry.status === "sent" ? "已发送" : `${formatAttachmentSize(file.size) || kind.label}`; return h("div", { className: `pending-attachment pending-${entry.status || "queued"}`, key: entry.id }, h("div", { className: "pending-attachment-thumb" }, isImage && entry.preview ? h("img", { src: entry.preview, alt: file.name }) : isVideo && entry.preview ? h("video", { src: entry.preview, muted: true, preload: "metadata" }) : h("span", { className: `pending-file-icon ${kind.className}` }, kind.icon)), h("div", { className: "pending-attachment-info" }, h("input", { className: "pending-name-input", value: entry.displayName || file.name, disabled: sending || entry.status === "sent", onChange: event => { const value = event.target.value; setPendingAttachments(current => current.map(item => item.id === entry.id ? { ...item, displayName: value } : item)); }, onKeyDown: event => { if (event.key === "Enter") event.currentTarget.blur(); }, title: entry.displayName || file.name, "aria-label": "附件文件名" }), h("span", null, statusText), entry.status === "uploading" && h("div", { className: "pending-progress", "aria-label": `上传进度 ${entry.percent || 0}%` }, h("span", { style: { width: `${entry.percent || 0}%` } }))), entry.status !== "sent" && h("button", { type: "button", className: "pending-remove", disabled: sending, onClick: () => removeAttachment(entry), "aria-label": `移除 ${file.name}` }, "×")); })), h(UiButton, { variant: "primary", className: "pending-send", disabled: sending, onClick: send }, sending ? "发送中…" : `发送(${pendingAttachments.length})`))), document.body) : null;
+  const pendingPreview = pendingAttachments.length ? createPortal(h("div", { className: "pending-attachments-backdrop", role: "presentation", onMouseDown: event => event.target === event.currentTarget && !sending && clearAttachments() }, h("section", { className: `pending-attachments${mobile ? " is-mobile-sheet" : ""}`, role: "dialog", "aria-modal": "true", "aria-label": `发送给 ${room.name}` }, h("div", { className: "pending-attachments-head" }, h("strong", null, `发送给 ${room.name}`), h("button", { type: "button", className: "pending-close", disabled: sending, onClick: clearAttachments, "aria-label": "关闭附件预览" }, "×")), h("div", { className: "pending-attachment-list" }, pendingAttachments.map(entry => { const file = entry.file; const kind = attachmentKind(file.name); const isImage = file.type.startsWith("image/"); const isVideo = file.type.startsWith("video/"); const statusText = entry.status === "uploading" ? `上传中 ${entry.percent || 0}%` : entry.status === "sent" ? "已发送" : `${formatAttachmentSize(file.size) || kind.label}`; return h("div", { className: `pending-attachment pending-${entry.status || "queued"}`, key: entry.id }, h("div", { className: "pending-attachment-thumb" }, isImage && entry.preview ? h("img", { src: entry.preview, alt: file.name }) : isVideo && entry.preview ? h("video", { src: entry.preview, muted: true, preload: "metadata" }) : h("span", { className: `pending-file-icon ${kind.className}` }, kind.icon)), h("div", { className: "pending-attachment-info" }, h("input", { className: "pending-name-input", value: entry.displayName || file.name, disabled: sending || entry.status === "sent", onChange: event => { const value = event.target.value; setPendingAttachments(current => current.map(item => item.id === entry.id ? { ...item, displayName: value } : item)); }, onKeyDown: event => { if (event.key === "Enter") event.currentTarget.blur(); }, title: entry.displayName || file.name, "aria-label": "附件文件名" }), h("span", null, statusText), entry.status === "uploading" && h("div", { className: "pending-progress", "aria-label": `上传进度 ${entry.percent || 0}%` }, h("span", { style: { width: `${entry.percent || 0}%` } }))), entry.status !== "sent" && h("button", { type: "button", className: "pending-remove", disabled: sending, onClick: () => removeAttachment(entry), "aria-label": `移除 ${file.name}` }, "×")); })), h(UiButton, { variant: "primary", className: "pending-send", disabled: sending, onClick: send }, sending ? "发送中…" : `发送(${pendingAttachments.length})`))), document.body) : null;
   const threadReplies = threadRoot ? messages.filter(item => item.type !== "empty" && item.threadRoot === threadRoot.id) : [];
+  const emojiFallbackItems = (editing?.emojiRefs || []).map(entry => { const http = client?.mxcUrlToHttp?.(entry.mxc, 32, 32, "scale", false, true, true) || matrixDownloadFallbackUrl(client, entry.mxc); const src = mediaRequestUrl(client, http); return { name: entry.shortcode, shortcode: entry.shortcode, url: src, thumbUrl: src, mxc: entry.mxc }; });
+  const composerFileInput = h(React.Fragment, null, h("input", { ref: fileRef, type: "file", hidden: true, multiple: true, onChange: e => { handleFiles(e.target.files); e.target.value = ""; } }), h("input", { ref: albumRef, type: "file", accept: "image/*,video/*", hidden: true, multiple: true, onChange: e => { handleFiles(e.target.files); e.target.value = ""; } }), h("input", { ref: cameraRef, type: "file", accept: "image/*", capture: "environment", hidden: true, onChange: e => { handleFiles(e.target.files); e.target.value = ""; } }));
+  const composerProps = { key: `${room.id}:${room.name}`, ref: inputRef, value: draft, onChange: (value, html) => { setDraft(value); setDraftHtml(html || ""); updateEmojiSuggestions(value); onTyping(Boolean(normalizeComposerText(value, html || "").trim())); }, onKeyDown: keyDown, onFiles: handleFiles, placeholder: mobile ? "发消息" : `发送消息到 ${room.name}`, emojiFallbackItems, enterKeyHint: mobile ? "enter" : undefined, onFocus: () => { if (mobile) setEmojiPanel(false); } };
+  const desktopToolbarExtra = h(React.Fragment, null, h(EmojiPicker, { onSelect: selectSticker, onInsert: insertEmoji }), h("button", { type: "button", className: `tool-button voice-record-button ${recording ? "is-recording" : ""}`, title: recording ? "停止录音并发送" : "录制语音", onClick: toggleRecording }, h(Icon, { name: "mic", size: 17 })), h("button", { type: "button", className: "tool-button", title: "上传文件", onClick: () => fileRef.current?.click() }, h(Icon, { name: "attachment", size: 17 })), composerFileInput, h(UiButton, { variant: "primary", className: "send-button", disabled: sending, onClick: send }, editing ? "保存　↵" : "发送　↵"));
+  const desktopComposer = h("div", { className: "composer" }, h(HaloComposer, { ...composerProps, toolbarExtra: desktopToolbarExtra }));
+  const mobileComposer = h("div", { ref: composerStackRef, className: `composer-stack ${emojiPanel ? "is-emoji-open" : ""}` }, h("div", { className: `composer wechat-composer ${recording ? "is-recording" : ""} ${voiceMode ? "is-voice" : ""} ${emojiPanel ? "is-emoji-open" : ""}` },
+    h("button", { type: "button", className: "composer-side-btn", title: voiceMode ? "切换键盘" : "切换语音", "aria-label": voiceMode ? "切换键盘" : "切换语音", ...micHoldHandlers }, h(Icon, { name: voiceMode ? "keyboard" : "mic", size: 22 })),
+    voiceMode
+      ? h("button", { type: "button", className: `orbit-hold-talk ${recording ? "is-recording" : ""} ${recordCancel ? "is-cancel" : ""}`, ...holdTalkHandlers }, recording ? (recordCancel ? "松开 取消" : "松开发送") : "按住 说话")
+      : h("div", { className: "orbit-editor-hold", ...(editorHoldHandlers || {}) }, h(PlainComposer, composerProps)),
+    h(EmojiPicker, { variant: "panel", open: emojiPanel, panelHostRef: composerStackRef, onOpenChange: next => { setEmojiPanel(next); if (next) setVoiceMode(false); }, onRequestKeyboard: show => { if (show) inputRef.current?.focus?.(); else inputRef.current?.blur?.(); }, onSelect: selectSticker, onInsert: insertEmoji }),
+    hasDraft ? h(UiButton, { variant: "primary", className: "send-button", htmlType: "button", disabled: sending, onClick: send }, editing ? "保存" : "发送") : h("button", { type: "button", className: "composer-side-btn composer-plus-btn", title: "相册、拍摄或文件", "aria-label": "相册、拍摄或文件", onClick: () => setAttachSheet(true) }, h(Icon, { name: "plus", size: 22 })),
+    composerFileInput
+  ));
+  const voiceMask = mobile && recording && h("div", { className: `orbit-voice-mask ${recordCancel ? "is-cancel" : ""}`, "aria-live": "polite" },
+    h("div", { className: "orbit-voice-cancel-zone" }, recordCancel ? "松开手指，取消发送" : "手指上滑，取消发送"),
+    h("div", { className: "orbit-voice-mask-card" },
+      h("div", { className: "orbit-voice-waves", "aria-hidden": "true" }, h("i"), h("i"), h("i"), h("i")),
+      h("strong", null, recordCancel ? "松开取消" : "正在录音")
+    )
+  );
   messages.forEach((item, index) => { const previous = messages[index - 1]; const sameSender = previous && item.type !== "empty" && previous.type !== "empty" && item.handle && item.handle === previous.handle; const sameMinute = sameSender && item.time && item.time === previous.time; item.grouped = Boolean(sameMinute); });
   return h("main", { className: `main-panel ${threadRoot ? "thread-open" : ""} ${draggingFiles ? "is-dragging-files" : ""}`, onPaste: event => { if (event.defaultPrevented) return; const files = clipboardFiles(event.clipboardData); if (files.length) { event.preventDefault(); handleFiles(files); } }, onDragOver: onMessageDragOver, onDragEnter: onMessageDragEnter, onDragLeave: onMessageDragLeave, onDrop: onMessageDrop },
-    h("header", { className: "chat-header" }, h("div", { className: "chat-heading" }, h(MatrixAvatar, { client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 40, style: { background: room.color, width: 40, height: 40 }, fallback: room.initials, alt: room.name }), h("div", null, h("div", { className: "chat-title" }, room.name), h("div", { className: room.directUserId ? (client?.getUser?.(room.directUserId)?.presence === "online" ? "chat-subtitle direct-presence" : "chat-subtitle direct-offline") : "chat-subtitle" }, room.directUserId ? `${client?.getUser?.(room.directUserId)?.presence === "online" ? "在线" : "离线"} · ${client?.getUser?.(room.directUserId)?.displayName || room.directUserId}` : `${room.members} 位成员 · ${room.desc}`))), h("div", { className: "header-actions" }, h("button", { className: "icon-button", title: "搜索消息", onClick: onSearch }, h(Icon, { name: "search" })), h("button", { className: `icon-button ${activeCall?.roomId === room.id && activeCall.kind !== "video" ? "is-calling" : ""}`, title: "发起语音通话", onClick: () => onStartCall?.("voice") }, h(Icon, { name: "phone" })), h("button", { className: `icon-button ${activeCall?.roomId === room.id && activeCall.kind === "video" ? "is-calling" : ""}`, title: "发起视频通话", onClick: () => onStartCall?.("video") }, h(Icon, { name: "video" })), h("button", { className: `icon-button header-selection-toggle ${selecting ? "is-active" : ""}`, title: selecting ? "退出多选" : "多选消息", onClick: () => selecting ? onStartSelecting?.(false) : onStartSelecting?.(true) }, h(Icon, { name: "list" })), h("button", { className: "icon-button", title: "查看置顶消息", onClick: () => Toast.info(pinnedEventIds?.length ? `本房间有 ${pinnedEventIds.length} 条置顶消息，请从消息菜单管理` : "暂无置顶消息") }, h(Icon, { name: "pin" })), h("button", { className: "icon-button room-details-toggle", title: "房间详情（点击展开/收起）", onClick: onOpenDetails }, h(Icon, { name: "room", size: 18 })))),
+    h("header", { className: "chat-header" }, h("button", { type: "button", className: "icon-button mobile-only chat-back", "aria-label": "返回房间列表", onClick: onBack }, h(Icon, { name: "chevronLeft", size: 22 })), h("div", { className: "chat-heading", onClick: () => { if (isOrbitMobile()) onOpenDetails?.(); } }, h(MatrixAvatar, { client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 40, style: { background: room.color, width: 40, height: 40 }, fallback: room.initials, alt: room.name }), h("div", null, h("div", { className: "chat-title" }, room.name), h("div", { className: room.directUserId ? (client?.getUser?.(room.directUserId)?.presence === "online" ? "chat-subtitle direct-presence" : "chat-subtitle direct-offline") : "chat-subtitle" }, room.directUserId ? `${client?.getUser?.(room.directUserId)?.presence === "online" ? "在线" : "离线"} · ${client?.getUser?.(room.directUserId)?.displayName || room.directUserId}` : `${room.members} 位成员 · ${room.desc}`))), h("div", { className: "header-actions" }, h("button", { className: "icon-button", title: "搜索消息", onClick: onSearch }, h(Icon, { name: "search" })), h("button", { className: `icon-button ${activeCall?.roomId === room.id && activeCall.kind !== "video" ? "is-calling" : ""}`, title: "发起语音通话", onClick: () => onStartCall?.("voice") }, h(Icon, { name: "phone" })), h("button", { className: `icon-button desktop-only ${activeCall?.roomId === room.id && activeCall.kind === "video" ? "is-calling" : ""}`, title: "发起视频通话", onClick: () => onStartCall?.("video") }, h(Icon, { name: "video" })), h("button", { className: `icon-button header-selection-toggle desktop-only ${selecting ? "is-active" : ""}`, title: selecting ? "退出多选" : "多选消息", onClick: () => selecting ? onStartSelecting?.(false) : onStartSelecting?.(true) }, h(Icon, { name: "list" })), h("button", { className: "icon-button desktop-only", title: "查看置顶消息", onClick: () => Toast.info(pinnedEventIds?.length ? `本房间有 ${pinnedEventIds.length} 条置顶消息，请从消息菜单管理` : "暂无置顶消息") }, h(Icon, { name: "pin" })), h("button", { className: "icon-button room-details-toggle desktop-only", title: "房间详情（点击展开/收起）", onClick: onOpenDetails }, h(Icon, { name: "room", size: 18 })), h("button", { type: "button", className: "icon-button mobile-only", title: "更多操作", "aria-label": "更多操作", onClick: () => setMobileMore(true) }, h(Icon, { name: "more", size: 20 })))),
     h("div", { className: "message-scroll", ref: scrollRef, onScroll: e => { const current = e.currentTarget; if (restoredRoomRef.current !== room?.id) return; const distanceFromBottom = current.scrollHeight - current.scrollTop - current.clientHeight; stickToBottomRef.current = distanceFromBottom <= 120; setShowJump(distanceFromBottom > 260); rememberScrollPosition(room?.id); if (current.scrollTop <= 72 && !loadingEarlierRef.current && !historyExhausted) loadEarlier(); } }, h(UiButton, { className: "load-more", disabled: loadingEarlier || historyExhausted, onClick: loadEarlier }, loadingEarlier ? "正在加载更早的消息…" : historyExhausted ? "没有更早的消息了" : "加载更早的消息"), messages.map((item, i) => h(Message, { key: item.id || `empty-${i}`, item, client, onReply, onReact, onThread, onEdit, onRedact, onJumpTo, onForward, onMention: mention => { const user = mention?.userId ? client?.getUser?.(mention.userId) : null; const raw = mention?.name === "你" ? (user?.displayName || mention?.userId || "") : (mention?.name || mention?.userId || ""); const name = String(raw).replace(/^@/, "").trim(); if (!name) return; const current = String(draft || ""); const prefix = current && !/[\\s\\n]$/.test(current) ? " " : ""; inputRef.current?.insertText?.(`${prefix}@${name} `); } , onTogglePinMessage, pinnedEventIds, selecting, selected: forwardItems?.some?.(entry => entry.id === item.id), onSelect: onSelectForward })), showJump && h(UiButton, { className: "jump-bottom", onClick: jumpBottom }, "↓ 回到最新消息")),
-    h("div", { className: "composer-wrap" }, pendingPreview, typingUsers.length > 0 && h("div", { className: "typing-indicator", role: "status" }, h("span", { className: "typing-dots", "aria-hidden": "true" }, h("i"), h("i"), h("i")), h("span", null, typingUsers.length === 1 ? `${typingUsers[0]} 正在输入…` : `${typingUsers.slice(0, 2).join("、")} 正在输入…`)), (replyTo || threadRoot || editing) && h("div", { className: "reply-bar" }, h("span", null, editing ? "✎ 正在编辑消息" : threadRoot ? `⌁ 正在线程中回复：${String(threadRoot.text || threadRoot.attachment?.name || "消息").slice(0, 60)}` : `↩ 正在回复：${String(replyTo.text || replyTo.attachment?.name || "消息").slice(0, 60)}`), h("button", { onClick: editing ? cancelEditing : threadRoot ? onCancelThread : onCancelReply }, "×")), emojiSuggestions.length > 0 && h("div", { className: "emoji-inline-suggestions", role: "listbox", "aria-label": "表情联想" }, h("div", { className: "emoji-suggestion-mode" }, h("button", { type: "button", className: emojiSuggestionMode === "emoji" ? "active" : "", onClick: () => setEmojiSuggestionMode("emoji") }, "表情"), h("button", { type: "button", className: emojiSuggestionMode === "sticker" ? "active" : "", onClick: () => setEmojiSuggestionMode("sticker") }, "贴纸")), h("div", { className: "emoji-suggestion-items" }, emojiSuggestions.map(item => h("button", { type: "button", key: item.id, role: "option", title: item.name, onMouseDown: event => event.preventDefault(), onMouseEnter: () => setHoveredSuggestion(item), onMouseLeave: () => setHoveredSuggestion(null), onClick: () => emojiSuggestionMode === "sticker" ? selectSticker(item) : insertEmoji(item, { replaceQuery: true }) }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" }), h("span", null, item.name)))), hoveredSuggestion && createPortal(h("div", { className: "emoji-inline-preview", role: "tooltip" }, h("img", { src: assetRequestUrl(hoveredSuggestion.url || hoveredSuggestion.thumbUrl), alt: hoveredSuggestion.name }), h("strong", null, hoveredSuggestion.name)), document.body)), h("div", { className: "composer" }, h(HaloComposer, { key: `${room.id}:${room.name}`, ref: inputRef, value: draft, onChange: (value, html) => { setDraft(value); setDraftHtml(html || ""); updateEmojiSuggestions(value); onTyping(true); }, onKeyDown: keyDown, onFiles: handleFiles, placeholder: `发送消息到 ${room.name}`, emojiFallbackItems: (editing?.emojiRefs || []).map(entry => { const http = client?.mxcUrlToHttp?.(entry.mxc, 32, 32, "scale", false, true, true) || matrixDownloadFallbackUrl(client, entry.mxc); const src = mediaRequestUrl(client, http); return { name: entry.shortcode, shortcode: entry.shortcode, url: src, thumbUrl: src, mxc: entry.mxc }; }), toolbarExtra: h(React.Fragment, null, h(EmojiPicker, { onSelect: selectSticker, onInsert: insertEmoji }), h("button", { type: "button", className: `tool-button voice-record-button ${recording ? "is-recording" : ""}`, title: recording ? "停止录音并发送" : "录制语音", onClick: toggleRecording }, recording ? h(Icon, { name: "mic", size: 17 }) : h(Icon, { name: "mic", size: 17 })), h("button", { type: "button", className: "tool-button", title: "上传文件", onClick: () => fileRef.current?.click() }, h(Icon, { name: "attachment", size: 17 })), h("input", { ref: fileRef, type: "file", hidden: true, multiple: true, onChange: e => { handleFiles(e.target.files); e.target.value = ""; } }), h(UiButton, { variant: "primary", className: "send-button", disabled: sending, onClick: send }, editing ? "保存　↵" : "发送　↵")) })) , h("div", { className: "composer-hint" }, "Enter 发送 · Shift + Enter 换行")),
+    h("div", { className: "composer-wrap" }, pendingPreview, typingUsers.length > 0 && h("div", { className: "typing-indicator", role: "status" }, h("span", { className: "typing-dots", "aria-hidden": "true" }, h("i"), h("i"), h("i")), h("span", null, typingUsers.length === 1 ? `${typingUsers[0]} 正在输入…` : `${typingUsers.slice(0, 2).join("、")} 正在输入…`)), (replyTo || threadRoot || editing) && h("div", { className: "reply-bar" }, h("span", null, editing ? "✎ 正在编辑消息" : threadRoot ? `⌁ 正在线程中回复：${String(threadRoot.text || threadRoot.attachment?.name || "消息").slice(0, 60)}` : `↩ 正在回复：${String(replyTo.text || replyTo.attachment?.name || "消息").slice(0, 60)}`), h("button", { onClick: editing ? cancelEditing : threadRoot ? onCancelThread : onCancelReply }, "×")), emojiSuggestions.length > 0 && h("div", { className: "emoji-inline-suggestions", role: "listbox", "aria-label": "表情联想" }, h("div", { className: "emoji-suggestion-mode" }, h("button", { type: "button", className: emojiSuggestionMode === "emoji" ? "active" : "", onClick: () => setEmojiSuggestionMode("emoji") }, "表情"), h("button", { type: "button", className: emojiSuggestionMode === "sticker" ? "active" : "", onClick: () => setEmojiSuggestionMode("sticker") }, "贴纸")), h("div", { className: "emoji-suggestion-items" }, emojiSuggestions.map(item => h("button", { type: "button", key: item.id, role: "option", title: item.name, onMouseDown: event => event.preventDefault(), onMouseEnter: () => setHoveredSuggestion(item), onMouseLeave: () => setHoveredSuggestion(null), onClick: () => emojiSuggestionMode === "sticker" ? selectSticker(item) : insertEmoji(item, { replaceQuery: true }) }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" }), h("span", null, item.name)))), hoveredSuggestion && createPortal(h("div", { className: "emoji-inline-preview", role: "tooltip" }, h("img", { src: assetRequestUrl(hoveredSuggestion.url || hoveredSuggestion.thumbUrl), alt: hoveredSuggestion.name }), h("strong", null, hoveredSuggestion.name)), document.body)), mobile ? mobileComposer : desktopComposer, voiceMask, h("div", { className: "composer-hint" }, mobile ? "点发送 · 键盘换行" : "Enter 发送 · Shift + Enter 换行")),
+    attachSheet && h("div", { className: "orbit-sheet-backdrop", onClick: () => setAttachSheet(false) }, h("div", { className: "orbit-sheet orbit-attach-sheet", onClick: event => event.stopPropagation() },
+      h("div", { className: "orbit-sheet-handle", "aria-hidden": "true" }),
+      h("div", { className: "orbit-attach-grid" },
+        h("button", { type: "button", className: "orbit-attach-item", onClick: () => { albumRef.current?.click(); setAttachSheet(false); } }, h(Icon, { name: "image", size: 26 }), h("span", null, "相册")),
+        h("button", { type: "button", className: "orbit-attach-item", onClick: () => { cameraRef.current?.click(); setAttachSheet(false); } }, h(Icon, { name: "camera", size: 26 }), h("span", null, "拍摄")),
+        h("button", { type: "button", className: "orbit-attach-item", onClick: () => { fileRef.current?.click(); setAttachSheet(false); } }, h(Icon, { name: "file", size: 26 }), h("span", null, "文件"))
+      ),
+      h("button", { type: "button", className: "orbit-sheet-item", onClick: () => setAttachSheet(false) }, "取消")
+    )),
+    mobileMore && h("div", { className: "orbit-sheet-backdrop", onClick: () => setMobileMore(false) }, h("div", { className: "orbit-sheet", onClick: event => event.stopPropagation() },
+      h("div", { className: "orbit-sheet-handle", "aria-hidden": "true" }),
+      h("button", { type: "button", className: "orbit-sheet-item", onClick: () => { setMobileMore(false); onStartCall?.("video"); } }, "视频通话"),
+      h("button", { type: "button", className: "orbit-sheet-item", onClick: () => { setMobileMore(false); selecting ? onStartSelecting?.(false) : onStartSelecting?.(true); } }, selecting ? "退出多选" : "多选消息"),
+      h("button", { type: "button", className: "orbit-sheet-item", onClick: () => { setMobileMore(false); Toast.info(pinnedEventIds?.length ? `本房间有 ${pinnedEventIds.length} 条置顶消息，请从消息菜单管理` : "暂无置顶消息"); } }, "置顶消息"),
+      h("button", { type: "button", className: "orbit-sheet-item", onClick: () => { setMobileMore(false); onOpenDetails?.(); } }, "房间详情")
+    )),
     h(ThreadPanel, { root: threadRoot, replies: threadReplies, client, onClose: onCancelThread, onJumpTo })
   );
 }
@@ -3730,11 +4116,14 @@ function Details({ room, client, onInvite, onLeave, collapsed, onToggle, onRoomU
   const avatarRef = useRef(null);
   useEffect(() => { if (room) setNameDraft(room.name || ""); }, [room?.id, room?.name]);
   useEffect(() => {
-    if (!room || !client?.getRoomPushRule) { setMuted(false); return; }
-    try {
-      const rule = client.getRoomPushRule("global", room.id);
-      setMuted(Boolean(rule?.actions?.includes?.("dont_notify")));
-    } catch { setMuted(false); }
+    if (!room || !client) { setMuted(false); return; }
+    const readMuted = () => {
+      try { setMuted(isRoomMutedByPushRule(client, room.id)); } catch { setMuted(false); }
+    };
+    readMuted();
+    const onAccountData = event => { if (!event || event.getType?.() === "m.push_rules") readMuted(); };
+    client.on?.("accountData", onAccountData);
+    return () => client.off?.("accountData", onAccountData);
   }, [room?.id, client]);
   useEffect(() => {
     let active = true;
@@ -3759,8 +4148,10 @@ function Details({ room, client, onInvite, onLeave, collapsed, onToggle, onRoomU
   const toggleRoomMute = async () => {
     const next = !muted;
     try {
-      if (typeof client.setRoomMutePushRule !== "function") throw new Error("当前 homeserver 不支持房间通知设置");
-      await client.setRoomMutePushRule("global", room.id, next);
+      if (typeof client.setRoomMutePushRule === "function") await client.setRoomMutePushRule("global", room.id, next);
+      else if (next && typeof client.addPushRule === "function") await client.addPushRule("global", "room", room.id, { actions: ["dont_notify"] });
+      else if (!next && typeof client.deletePushRule === "function") await client.deletePushRule("global", "room", room.id);
+      else throw new Error("当前客户端不支持房间通知设置");
       setMuted(next);
       Toast.success(next ? "已关闭该房间通知" : "已开启该房间通知");
     } catch (error) { Toast.error(`房间通知设置失败：${error?.message || "请稍后重试"}`); }
@@ -3789,14 +4180,14 @@ function Details({ room, client, onInvite, onLeave, collapsed, onToggle, onRoomU
       h("div", { className: "member-popover-name" }, displayName),
       h("div", { className: "member-popover-id" }, member.userId),
       h("div", { className: `member-popover-presence ${presence === "online" ? "presence-online" : presence === "offline" ? "presence-offline" : ""}` }, presence === "online" ? "在线" : presence === "offline" ? "离线" : "状态未知"));
-    return h(AntPopover, { content: profile, trigger: "click", placement: "left", key: member.userId },
+    return h(AntPopover, { content: profile, trigger: "click", placement: isOrbitMobile() ? "bottom" : "left", key: member.userId },
       h("div", { className: "member-row", title: "点击查看用户资料" },
         h(MatrixAvatar, { client, mxcUrl: memberAvatarMxc(member), size: 34, className: "member-avatar", style: { background: colorFor(member.userId) }, fallback: initials(displayName), alt: displayName }),
         h("div", { className: "member-copy" }, h("div", { className: "member-name", title: displayName }, displayName), h("div", { className: "member-id", title: member.userId }, member.userId)),
         h("span", { className: `member-presence-badge ${presence === "online" ? "online" : presence === "offline" ? "offline" : "unknown"}` }, h("i", null), presence === "online" ? "在线" : presence === "offline" ? "离线" : "未知")));
   });
   return h("aside", { className: "details-panel" },
-    h("div", { className: "details-title" }, "房间详情", h("div", { className: "details-title-actions" }, h(UiButton, { size: "small", title: "收起房间详情", onClick: onToggle }, "收起"), h(UiButton, { size: "small", danger: true, title: "退出房间", onClick: onLeave }, "退出"))),
+    h("div", { className: "details-title" }, h("button", { type: "button", className: "icon-button mobile-only", "aria-label": "返回会话", onClick: onToggle }, h(Icon, { name: "chevronLeft", size: 20 })), "房间详情", h("div", { className: "details-title-actions" }, h(UiButton, { size: "small", className: "desktop-only", title: "收起房间详情", onClick: onToggle }, "收起"), h(UiButton, { size: "small", danger: true, title: "退出房间", onClick: onLeave }, "退出"))),
     h("div", { className: "details-room" }, h("button", { type: "button", className: "details-room-avatar-button", title: "更换房间头像", onClick: () => avatarRef.current?.click?.() }, h(MatrixAvatar, { client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 56, style: { background: room.color, width: 56, height: 56 }, fallback: room.initials, alt: room.name }), h("span", { className: "details-room-avatar-edit" }, savingAvatar ? "…" : "✎")), h("input", { ref: avatarRef, type: "file", accept: "image/*", hidden: true, onChange: e => { const file = e.target.files?.[0]; e.target.value = ""; saveRoomAvatar(file); } }), h("div", { className: "details-room-name" }, h(Input, { value: nameDraft, onChange: setNameDraft, onPressEnter: saveRoomName, suffix: h(UiButton, { size: "small", type: "text", loading: savingName, disabled: !nameDraft.trim() || nameDraft.trim() === room.name, onClick: saveRoomName }, "保存"), "aria-label": "房间名称" })), h("div", { className: "details-room-edit-hint" }, "点击头像更换 · Enter 保存名称"), h("div", { className: "details-room-desc" }, room.desc)),
     h("div", { className: "details-section details-room-options" },
       h("div", { className: "details-section-head" }, h("span", null, "房间设置")),
@@ -3813,8 +4204,50 @@ function Details({ room, client, onInvite, onLeave, collapsed, onToggle, onRoomU
 
 function App() {
   const [connected, setConnected] = useState(null); const [rooms, setRooms] = useState([]); const [invites, setInvites] = useState([]); const [messages, setMessages] = useState({}); const [typingByRoom, setTypingByRoom] = useState({}); const [selectedId, setSelectedId] = useState(null); const [showLogin, setShowLogin] = useState(false); const [showRoom, setShowRoom] = useState(false); const [showSpace, setShowSpace] = useState(false); const [showSpaceRooms, setShowSpaceRooms] = useState(false); const [showAccount, setShowAccount] = useState(false); const [showInvite, setShowInvite] = useState(false); const [showSearch, setShowSearch] = useState(false); const [replyTo, setReplyTo] = useState(null); const [threadRoot, setThreadRoot] = useState(null); const [editing, setEditing] = useState(null); const [syncing, setSyncing] = useState(false); const [presence, setPresence] = useState("online"); const [viewMode, setViewMode] = useState("messages"); const [activeSpaceId, setActiveSpaceId] = useState(null);
-  const excludedRoomIdsRef = useRef(new Set()); const pendingJoinRoomIdsRef = useRef(new Set()); const optimisticJoinedRoomsRef = useRef(new Map()); const locallyReadRoomsRef = useRef(new Map()); const stickerSendingRef = useRef(false); const refreshTimer = useRef(null); const selectedIdRef = useRef(null); const roomsRef = useRef([]); const [detailsCollapsed, setDetailsCollapsed] = useState(false); const [forwardItems, setForwardItems] = useState([]); const [selecting, setSelecting] = useState(false); const [showForward, setShowForward] = useState(false); const [, setEmojiCatalogReady] = useState(0); const [callSession, setCallSession] = useState(null); const callSessionRef = useRef(null); const ringtoneRef = useRef(null);
+  const excludedRoomIdsRef = useRef(new Set()); const pendingJoinRoomIdsRef = useRef(new Set()); const optimisticJoinedRoomsRef = useRef(new Map()); const locallyReadRoomsRef = useRef(new Map()); const stickerSendingRef = useRef(false); const refreshTimer = useRef(null); const selectedIdRef = useRef(null); const roomsRef = useRef([]); const mobile = useOrbitMobile(); const [mobileView, setMobileView] = useState("rooms"); const mobileViewRef = useRef("rooms"); const [detailsCollapsed, setDetailsCollapsed] = useState(false); const [forwardItems, setForwardItems] = useState([]); const [selecting, setSelecting] = useState(false); const [showForward, setShowForward] = useState(false); const [, setEmojiCatalogReady] = useState(0); const [callSession, setCallSession] = useState(null); const callSessionRef = useRef(null); const ringtoneRef = useRef(null);
   useEffect(() => { selectedIdRef.current = selectedId; }, [selectedId]);
+  useEffect(() => { mobileViewRef.current = mobileView; setOrbitMobileView(mobile ? (connected ? mobileView : "landing") : null); }, [mobile, mobileView, connected]);
+  useEffect(() => {
+    if (mobile && mobileView !== "rooms" && !selectedId) setMobileView("rooms");
+  }, [mobile, mobileView, selectedId]);
+  useEffect(() => {
+    if (!mobile) return undefined;
+    const onBack = () => {
+      if (showAccount) { setShowAccount(false); return; }
+      if (showLogin) { setShowLogin(false); return; }
+      if (showSearch) { setShowSearch(false); return; }
+      if (showInvite) { setShowInvite(false); return; }
+      if (showForward) { setShowForward(false); return; }
+      if (showRoom) { setShowRoom(false); return; }
+      if (showSpace) { setShowSpace(false); return; }
+      if (showSpaceRooms) { setShowSpaceRooms(false); return; }
+      if (mobileViewRef.current === "details") { setMobileView("chat"); return; }
+      if (mobileViewRef.current === "chat") setMobileView("rooms");
+    };
+    const onPopState = event => {
+      if (event.state?.overlay) return;
+      setShowAccount(false); setShowLogin(false); setShowSearch(false); setShowInvite(false);
+      setShowForward(false); setShowRoom(false); setShowSpace(false); setShowSpaceRooms(false);
+      const view = event.state?.view;
+      if (view === "details" || view === "chat" || view === "rooms") setMobileView(view);
+      else if (mobileViewRef.current === "details") setMobileView("chat");
+      else if (mobileViewRef.current === "chat") setMobileView("rooms");
+    };
+    window.addEventListener("orbit:mobile-back", onBack);
+    window.addEventListener("popstate", onPopState);
+    return () => { window.removeEventListener("orbit:mobile-back", onBack); window.removeEventListener("popstate", onPopState); };
+  }, [mobile, showAccount, showLogin, showSearch, showInvite, showForward, showRoom, showSpace, showSpaceRooms]);
+  const openMobileRoom = id => {
+    setSelectedId(id);
+    if (!mobile) return;
+    if (mobileViewRef.current !== "chat") pushOrbitHistory("chat");
+    setMobileView("chat");
+  };
+  const openMobileDetails = () => {
+    if (!mobile) { setDetailsCollapsed(value => !value); return; }
+    if (mobileViewRef.current !== "details") pushOrbitHistory("details");
+    setMobileView("details");
+  };
   useEffect(() => { roomsRef.current = rooms; window.orbitAllRooms = rooms; }, [rooms]);
   useEffect(() => { callSessionRef.current = callSession; }, [callSession]);
   useEffect(() => {
@@ -4048,7 +4481,7 @@ function App() {
     setRooms(current => [optimisticJoinedRoomsRef.current.get(invite.id), ...current.filter(item => item.id !== invite.id)]);
     setViewMode(invite.isSpace ? "spaces" : invite.isGroup ? "groups" : "messages");
     if (invite.isSpace) setActiveSpaceId(invite.id);
-    setSelectedId(invite.id);
+    openMobileRoom(invite.id);
     await refresh(connected.client);
   } catch (error) {
     pendingJoinRoomIdsRef.current.delete(invite.id);
@@ -4081,7 +4514,7 @@ function App() {
     }
     if (type === "secret") { if (typeof crypto.loadSessionBackupPrivateKeyFromSecretStorage === "function") { try { await crypto.loadSessionBackupPrivateKeyFromSecretStorage(); } catch (error) { const stored = await crypto.isKeyBackupKeyStored?.(version); if (!stored) throw error; } } }
     const progressCallback = p => setCryptoState(s => ({ ...s, restoreStage: p?.stage || s.restoreStage, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })); const result = type === "passphrase" ? await crypto.restoreKeyBackupWithPassphrase(passphrase, { progressCallback }) : await crypto.restoreKeyBackup({ progressCallback }); try { await crypto.bootstrapCrossSigning?.({ authUploadDeviceSigningKeys: async () => ({}) }); } catch {} const retried = await retryLoadedRoomDecryption(connected.client); await refresh(connected.client); setCryptoState(s => ({ ...s, restoring: false, restoreProgress: 100, restoreStage: "done", keyRestored: true })); Toast.success(`密钥恢复完成，导入 ${result?.imported ?? 0} 个会话，已重试解密 ${retried} 条已加载消息。`); } catch (error) { const raw = error?.message || "密钥恢复失败"; const mismatch = /does not match|mismatch|match.*decryption key/i.test(raw); const message = mismatch ? `恢复密钥与服务器备份版本 ${version} 不匹配。请确认这是该账号当前 Secret Storage 的恢复密钥；如果备份曾重置，请从 Element“设置 → 安全与隐私”获取最新密钥。` : raw; setCryptoState(s => ({ ...s, restoring: false, restoreStage: "error", error: message })); Toast.error(message); } };
-  const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); setSyncing(true); setTimeout(() => setSyncing(false), 15000); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setPresence("offline"); setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const authExpired = /unknown token|M_UNKNOWN_TOKEN|401/i.test(text); const message = authExpired ? (client.getRefreshToken?.() ? "Matrix 访问令牌过期，正在尝试刷新" : "Matrix 登录状态已失效，请重新登录") : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired && !client.getRefreshToken?.()) { client.stopClient?.(); window.orbitMatrixClient = null; localStorage.removeItem(MATRIX_SESSION_STORAGE_KEY); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); } }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room, toStartOfTimeline) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const selectedRoom = room?.roomId === selectedIdRef.current; const scrollNode = selectedRoom ? document.querySelector(".message-scroll") : null; const nearBottom = Boolean(scrollNode && scrollNode.scrollHeight - scrollNode.scrollTop - scrollNode.clientHeight <= 140); if (selectedRoom && !document.hidden && nearBottom) { Promise.resolve(markRoomRead(client, room?.roomId, event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && !toStartOfTimeline && eventId && (room?.roomId !== selectedIdRef.current || document.hidden || !document.hasFocus?.() || !nearBottom); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); if (!hasDecryptedNotificationContent(event)) { const timer = setTimeout(() => { orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body: "收到加密消息", compact: true }); }, 1400); orbitPendingEncryptedNotifications.set(eventId, { room, eventId, title, timer }); } else { markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body }); } } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", () => { queueRefresh(client); }); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user?.presence === "offline" ? "online" : (user?.presence || "online")); queueRefresh(client); }); client.on("Event.decrypted", event => { queueRefresh(client); const eventId = event?.getId?.(); const pending = eventId && orbitPendingEncryptedNotifications.get(eventId); if (!pending) return; clearTimeout(pending.timer); orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room: pending.room, roomId: pending.room?.roomId, eventId, title: pending.title, body: notificationBody(event) }); }); queueRefresh(client); setShowLogin(false); };
+  const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); setSyncing(true); setTimeout(() => setSyncing(false), 15000); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setPresence("offline"); setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const authExpired = /unknown token|M_UNKNOWN_TOKEN|401/i.test(text); const message = authExpired ? (client.getRefreshToken?.() ? "Matrix 访问令牌过期，正在尝试刷新" : "Matrix 登录状态已失效，请重新登录") : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired && !client.getRefreshToken?.()) { client.stopClient?.(); window.orbitMatrixClient = null; localStorage.removeItem(MATRIX_SESSION_STORAGE_KEY); setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); } }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room, toStartOfTimeline) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const selectedRoom = room?.roomId === selectedIdRef.current; const scrollNode = selectedRoom ? document.querySelector(".message-scroll") : null; const nearBottom = Boolean(scrollNode && scrollNode.scrollHeight - scrollNode.scrollTop - scrollNode.clientHeight <= 140); if (selectedRoom && !document.hidden && nearBottom) { Promise.resolve(markRoomRead(client, room?.roomId, event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && !toStartOfTimeline && eventId && eventShouldNotify(client, event) && (room?.roomId !== selectedIdRef.current || document.hidden || !document.hasFocus?.() || !nearBottom); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); if (!hasDecryptedNotificationContent(event)) { const timer = setTimeout(() => { orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body: "收到加密消息", compact: true }); }, 1400); orbitPendingEncryptedNotifications.set(eventId, { room, eventId, title, timer }); } else { markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body }); } } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", () => { queueRefresh(client); }); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user?.presence === "offline" ? "online" : (user?.presence || "online")); queueRefresh(client); }); client.on("Event.decrypted", event => { queueRefresh(client); const eventId = event?.getId?.(); const pending = eventId && orbitPendingEncryptedNotifications.get(eventId); if (!pending) return; clearTimeout(pending.timer); orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId) || !eventShouldNotify(client, event)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room: pending.room, roomId: pending.room?.roomId, eventId, title: pending.title, body: notificationBody(event) }); }); queueRefresh(client); setShowLogin(false); };
   React.useEffect(() => { const session = readMatrixSession(); if (!session) return; (async () => { try { loadPersistedRecoveryKey(session.userId); const resolved = await resolveHomeserver(session.homeserver); const client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, session); await initCryptoSafely(client); try { await client.getCrypto?.()?.loadSessionBackupPrivateKeyFromSecretStorage?.(); } catch {} window.orbitMatrixClient = client; connectedHandler({ client, userId: session.userId, homeserver: resolved.homeserver }); startOrbitSync(client, resolved); } catch { localStorage.removeItem(MATRIX_SESSION_STORAGE_KEY); } })(); }, []);
   React.useEffect(() => {
     const url = new URL(window.location.href);
@@ -4471,10 +4904,10 @@ function App() {
     }
   };
   const jumpTo = async eventId => { if (!eventId) return; const safe = String(eventId).replace(/[^a-zA-Z0-9_-]/g, "_"); let node = document.getElementById(`event-${safe}`); if (!node && room) { try { await connected.client.scrollback(room.matrixRoom, 100); await refresh(connected.client); await new Promise(resolve => setTimeout(resolve, 80)); node = document.getElementById(`event-${safe}`); } catch {} } if (node) { node.scrollIntoView({ behavior: "smooth", block: "center" }); node.classList.add("message-highlight"); setTimeout(() => node.classList.remove("message-highlight"), 1600); } else Toast.info("原消息不在当前服务器返回的历史范围内"); };
-  window.orbitNavigateToMessage = (roomId, eventId) => { if (!roomId) return; const target = (roomsRef.current || rooms).find(entry => entry.id === roomId) || (window.orbitAllRooms || []).find(entry => entry.id === roomId); if (target?.isDirect) setViewMode("messages"); else if (target?.isGroup) setViewMode("groups"); else if (target?.isSpace) { setViewMode("spaces"); setActiveSpaceId(target.id); } setSelectedId(roomId); markRead(roomId); setTimeout(() => { const safe = String(eventId || "").replace(/[^a-zA-Z0-9_-]/g, "_"); const node = eventId && document.getElementById(`event-${safe}`); if (node) { node.scrollIntoView({ behavior: "smooth", block: "center" }); node.classList.add("message-highlight"); setTimeout(() => node.classList.remove("message-highlight"), 1600); } }, 180); };
-  const leaveRoom = async () => { if (!room || !confirm(`确定离开「${room.name}」吗？`)) return; try { await connected.client.leave(room.id); setSelectedId(null); refresh(connected.client); Toast.success("已离开房间"); } catch (error) { Toast.error(`离开房间失败：${error?.message || "未知错误"}`); } };
+  window.orbitNavigateToMessage = (roomId, eventId) => { if (!roomId) return; const target = (roomsRef.current || rooms).find(entry => entry.id === roomId) || (window.orbitAllRooms || []).find(entry => entry.id === roomId); if (target?.isDirect) setViewMode("messages"); else if (target?.isGroup) setViewMode("groups"); else if (target?.isSpace) { setViewMode("spaces"); setActiveSpaceId(target.id); } openMobileRoom(roomId); markRead(roomId); setTimeout(() => { const safe = String(eventId || "").replace(/[^a-zA-Z0-9_-]/g, "_"); const node = eventId && document.getElementById(`event-${safe}`); if (node) { node.scrollIntoView({ behavior: "smooth", block: "center" }); node.classList.add("message-highlight"); setTimeout(() => node.classList.remove("message-highlight"), 1600); } }, 180); };
+  const leaveRoom = async () => { if (!room || !confirm(`确定离开「${room.name}」吗？`)) return; try { await connected.client.leave(room.id); setSelectedId(null); if (mobile) setMobileView("rooms"); refresh(connected.client); Toast.success("已离开房间"); } catch (error) { Toast.error(`离开房间失败：${error?.message || "未知错误"}`); } };
   const logout = async () => { stopOrbitRingtone(ringtoneRef); if (callSessionRef.current?.mode === "element") { hangupElementCall(callSessionRef.current.embed); disposeElementCallEmbed(callSessionRef.current.embed); } hangupOrbitCall(callSessionRef.current?.call); callSessionRef.current = null; setCallSession(null); try { await connected.client.logout(); } catch {} connected.client.stopClient(); pendingJoinRoomIdsRef.current.clear(); optimisticJoinedRoomsRef.current.clear(); window.orbitMatrixClient = null; localStorage.removeItem(MATRIX_SESSION_STORAGE_KEY); try { localStorage.removeItem(recoveryStorageKey(connected.userId)); localStorage.removeItem(localVerificationKey(connected.client)); } catch {} setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); Toast.success("已退出 Matrix"); };
-  if (!connected) return h("div", { className: "app-shell" }, h("div", { className: "sidebar landing-sidebar" }, h("div", { className: "brand-row" }, h("div", { className: "brand" }, h("div", { className: "brand-mark" }, "O"), h("div", null, "Orbit", h("div", { className: "workspace-pill" }, "Matrix 工作台")))), h("div", { className: "sidebar-footer" }, h("div", { className: "connection-state" }, h("span", { className: "offline-dot" }), "未连接"))), h("main", { className: "main-panel" }, h("div", { className: "login-landing" }, h("div", { className: "landing-mark" }, "O"), h("div", { className: "landing-title" }, "连接你的 Matrix 世界"), h("div", { className: "landing-copy" }, "登录后同步真实房间、消息和成员。"), h("button", { className: "primary-btn landing-button", onClick: () => setShowLogin(true) }, "连接 Matrix 账户"))), showLogin && h(LoginDialog, { onConnected: connectedHandler, onClose: () => setShowLogin(false) }));
+  if (!connected) return h("div", { className: "app-shell", "data-orbit-view": "landing" }, h("div", { className: "sidebar landing-sidebar" }, h("div", { className: "brand-row" }, h("div", { className: "brand" }, h("div", { className: "brand-mark" }, "O"), h("div", null, "Orbit", h("div", { className: "workspace-pill" }, "Matrix 工作台")))), h("div", { className: "sidebar-footer desktop-only" }, h("div", { className: "connection-state" }, h("span", { className: "offline-dot" }), "未连接"))), h("main", { className: "main-panel" }, h("div", { className: "login-landing" }, h("div", { className: "landing-mark" }, "O"), h("div", { className: "landing-title" }, "连接你的 Matrix 世界"), h("div", { className: "landing-copy" }, "登录后同步真实房间、消息和成员。"), h("button", { className: "primary-btn landing-button", onClick: () => setShowLogin(true) }, "连接 Matrix 账户"))), showLogin && h(LoginDialog, { onConnected: connectedHandler, onClose: () => setShowLogin(false) }));
   const setSelectingState = active => {
     if (active === false) {
       setSelecting(false);
@@ -4484,19 +4917,21 @@ function App() {
     setSelecting(true);
   };
   const onReact = react;
-  return h("div", { className: "app-shell" }, h(Sidebar, { rooms: visibleRooms, allRooms: rooms, invites, spaces, selectedId, connected, presence, viewMode, activeSpaceId, onViewMode: mode => { setViewMode(mode); const first = mode === "spaces" ? null : rooms.find(item => mode === "groups" ? item.isGroup : item.isDirect); if (first) setSelectedId(first.id); }, onSpaceSelect: id => { setActiveSpaceId(id); const child = spaceChildIds(spaces.find(item => item.id === id)?.matrixRoom)[0]; setSelectedId(child || null); }, onSelect: id => { setSelectedId(id); markRead(id); }, onAcceptInvite: acceptInvite, onDeclineInvite: declineInvite, onCreate: () => setShowRoom(true), onCreateSpace: () => setShowSpace(true), onManageSpace: () => activeSpaceId && setShowSpaceRooms(true), onAccount: () => setShowAccount(true), onLogout: logout }), syncing && h("div", { className: "sync-indicator" }, "正在同步 Matrix…"), h(Chat, { room, messages: selectedId ? (messages[selectedId] || []) : [], client: connected.client, detailsCollapsed, onLoadMore: loadMore, onSearch: () => setShowSearch(true), onSend: send, onTyping: typing, onReply: item => { setReplyTo(item); setThreadRoot(null); setEditing(null); }, onReact, onThread: item => { const loaded = messages[selectedId] || []; let root = item; const seen = new Set(); while (root && (root.threadRoot || root.replyTo) && !seen.has(root.id)) { seen.add(root.id); const parentId = root.threadRoot || root.replyTo; root = loaded.find(entry => entry.id === parentId) || root; if (root.id === item.id) break; } setThreadRoot(root); setReplyTo(null); setEditing(null); }, onEdit: item => { setEditing(item); setReplyTo(null); setThreadRoot(null); }, onRedact: redact, onJumpTo: jumpTo, onForward, onEmojiSelect: sendEmoji, replyTo, threadRoot, editing, onCancelReply: () => setReplyTo(null), onCancelThread: () => setThreadRoot(null), onCancelEdit: () => setEditing(null), onUpload: upload, selecting, forwardItems, onSelectForward: toggleForwardItem, onStartSelecting: setSelectingState, pinnedEventIds: room?.pinnedEventIds || [], onTogglePinMessage: togglePinMessage, onStartCall: startCall, activeCall: callSession, onOpenDetails: () => setDetailsCollapsed(value => !value) }), h(Details, { room, client: connected.client, onInvite: () => setShowInvite(true), onLeave: leaveRoom, collapsed: detailsCollapsed, onToggle: () => setDetailsCollapsed(value => !value), onRoomUpdated: () => refresh(connected.client) }), forwardItems.length > 0 && h("div", { className: "forward-bar" }, h("span", null, `已选择 ${forwardItems.length} 条消息`), h(UiButton, { size: "small", variant: "primary", onClick: () => setShowForward(true) }, "打开转发"), h(UiButton, { size: "small", className: "ghost-btn", onClick: () => setSelectingState(false) }, "清除")), selecting && forwardItems.length === 0 && h("div", { className: "forward-bar forward-bar-empty" }, h("span", null, "已进入多选模式，点击消息进行选择"), h(UiButton, { size: "small", className: "ghost-btn", onClick: () => setSelectingState(false) }, "取消多选")), showForward && h(ForwardDialog, { client: connected.client, rooms, items: forwardItems, onClose: () => { setShowForward(false); setSelectingState(false); } }), showRoom && h(RoomDialog, { client: connected.client, space: viewMode === "spaces" ? spaces.find(item => item.id === activeSpaceId) : null, onClose: () => setShowRoom(false), onCreated: roomId => { setSelectedId(roomId); refresh(connected.client); } }), showSpace && h(SpaceDialog, { client: connected.client, onClose: () => setShowSpace(false), onCreated: roomId => { setActiveSpaceId(roomId); refresh(connected.client); } }), showSpaceRooms && activeSpaceId && h(SpaceRoomsDialog, { client: connected.client, space: spaces.find(item => item.id === activeSpaceId), rooms, onClose: () => setShowSpaceRooms(false), onChanged: () => refresh(connected.client) }), showInvite && room && h(InviteDialog, { client: connected.client, room, onClose: () => setShowInvite(false) }), showSearch && room && h(SearchDialog, { client: connected.client, room, onClose: () => setShowSearch(false) }), showAccount && h(AccountDialog, { client: connected.client, cryptoState, onRestore: restoreKeys, onClose: () => setShowAccount(false) }), callSession && h(CallOverlay, { session: callSession, client: connected.client, onHangup: hangupCall, onAnswer: answerCall, onToggleMute: toggleCallMute, onToggleVideo: toggleCallVideo }));
+  return h("div", { className: "app-shell", "data-orbit-view": mobile ? mobileView : undefined }, h(Sidebar, { rooms: visibleRooms, allRooms: rooms, invites, spaces, selectedId, connected, presence, viewMode, activeSpaceId, onViewMode: mode => { setViewMode(mode); if (mobile) { setMobileView("rooms"); return; } const first = mode === "spaces" ? null : rooms.find(item => mode === "groups" ? item.isGroup : item.isDirect); if (first) setSelectedId(first.id); }, onSpaceSelect: id => { setActiveSpaceId(id); const child = spaceChildIds(spaces.find(item => item.id === id)?.matrixRoom)[0]; setSelectedId(child || null); if (mobile) setMobileView("rooms"); }, onSelect: id => { markRead(id); openMobileRoom(id); }, onAcceptInvite: acceptInvite, onDeclineInvite: declineInvite, onCreate: () => { if (mobile) pushOrbitHistory(mobileView, true); setShowRoom(true); }, onCreateSpace: () => { if (mobile) pushOrbitHistory(mobileView, true); setShowSpace(true); }, onManageSpace: () => { if (activeSpaceId) { if (mobile) pushOrbitHistory(mobileView, true); setShowSpaceRooms(true); } }, onAccount: () => { if (mobile) pushOrbitHistory(mobileView, true); setShowAccount(true); }, onLogout: logout }), syncing && h("div", { className: "sync-indicator" }, "正在同步 Matrix…"), h(Chat, { room, messages: selectedId ? (messages[selectedId] || []) : [], client: connected.client, detailsCollapsed, onLoadMore: loadMore, onSearch: () => { if (mobile) pushOrbitHistory(mobileView, true); setShowSearch(true); }, onSend: send, onTyping: typing, onReply: item => { setReplyTo(item); setThreadRoot(null); setEditing(null); }, onReact, onThread: item => { const loaded = messages[selectedId] || []; let root = item; const seen = new Set(); while (root && (root.threadRoot || root.replyTo) && !seen.has(root.id)) { seen.add(root.id); const parentId = root.threadRoot || root.replyTo; root = loaded.find(entry => entry.id === parentId) || root; if (root.id === item.id) break; } setThreadRoot(root); setReplyTo(null); setEditing(null); }, onEdit: item => { setEditing(item); setReplyTo(null); setThreadRoot(null); }, onRedact: redact, onJumpTo: jumpTo, onForward, onEmojiSelect: sendEmoji, replyTo, threadRoot, editing, onCancelReply: () => setReplyTo(null), onCancelThread: () => setThreadRoot(null), onCancelEdit: () => setEditing(null), onUpload: upload, selecting, forwardItems, onSelectForward: toggleForwardItem, onStartSelecting: setSelectingState, pinnedEventIds: room?.pinnedEventIds || [], onTogglePinMessage: togglePinMessage, onStartCall: startCall, activeCall: callSession, onOpenDetails: openMobileDetails, onBack: () => { if (history.state?.orbit) history.back(); else setMobileView("rooms"); } }), h(Details, { room, client: connected.client, onInvite: () => { if (mobile) pushOrbitHistory(mobileView, true); setShowInvite(true); }, onLeave: leaveRoom, collapsed: mobile ? mobileView !== "details" : detailsCollapsed, onToggle: () => { if (mobile) { if (history.state?.orbit) history.back(); else setMobileView("chat"); } else setDetailsCollapsed(value => !value); }, onRoomUpdated: () => refresh(connected.client) }), forwardItems.length > 0 && h("div", { className: "forward-bar" }, h("span", null, `已选择 ${forwardItems.length} 条消息`), h(UiButton, { size: "small", variant: "primary", onClick: () => setShowForward(true) }, mobile ? "转发" : "打开转发"), h(UiButton, { size: "small", className: "ghost-btn", onClick: () => setSelectingState(false) }, "清除")), selecting && forwardItems.length === 0 && h("div", { className: "forward-bar forward-bar-empty" }, h("span", null, "已进入多选模式，点击消息进行选择"), h(UiButton, { size: "small", className: "ghost-btn", onClick: () => setSelectingState(false) }, "取消多选")), showForward && h(ForwardDialog, { client: connected.client, rooms, items: forwardItems, onClose: () => { setShowForward(false); setSelectingState(false); } }), showRoom && h(RoomDialog, { client: connected.client, space: viewMode === "spaces" ? spaces.find(item => item.id === activeSpaceId) : null, onClose: () => setShowRoom(false), onCreated: roomId => { openMobileRoom(roomId); refresh(connected.client); } }), showSpace && h(SpaceDialog, { client: connected.client, onClose: () => setShowSpace(false), onCreated: roomId => { setActiveSpaceId(roomId); refresh(connected.client); } }), showSpaceRooms && activeSpaceId && h(SpaceRoomsDialog, { client: connected.client, space: spaces.find(item => item.id === activeSpaceId), rooms, onClose: () => setShowSpaceRooms(false), onChanged: () => refresh(connected.client) }), showInvite && room && h(InviteDialog, { client: connected.client, room, onClose: () => setShowInvite(false) }), showSearch && room && h(SearchDialog, { client: connected.client, room, onClose: () => setShowSearch(false) }), showAccount && h(AccountDialog, { client: connected.client, cryptoState, onRestore: restoreKeys, onLogout: logout, onClose: () => setShowAccount(false) }), callSession && h(CallOverlay, { session: callSession, client: connected.client, onHangup: hangupCall, onAnswer: answerCall, onToggleMute: toggleCallMute, onToggleVideo: toggleCallVideo }));
 }
 
-function AccountDialog({ client, onClose, cryptoState, onRestore }) {
+function AccountDialog({ client, onClose, cryptoState, onRestore, onLogout }) {
+  const mobile = useOrbitMobile();
   const [active, setActive] = useState("general");
+  const [mobilePane, setMobilePane] = useState(false);
   const [displayName, setDisplayName] = useState(() => client.getUser?.(client.getUserId?.())?.displayName || "");
   const [notificationPermission, setNotificationPermission] = useState(() => typeof Notification === "undefined" ? "unsupported" : Notification.permission);
   const saveName = async () => { const value = displayName.trim(); if (!value) return; try { await client.setDisplayName?.(value); Toast.success("昵称已更新"); } catch (error) { Toast.error(`昵称更新失败：${error?.message || "请检查账户权限"}`); } };
   const enableNotifications = async () => { if (typeof Notification === "undefined") return Toast.error("当前浏览器不支持桌面通知"); const result = await Notification.requestPermission(); setNotificationPermission(result); Toast[result === "granted" ? "success" : "warning"](result === "granted" ? "桌面通知已开启" : "桌面通知未授权"); };
-  if (active === "security") return h(LegacyAccountDialog, { client, onClose, onBack: () => setActive("general"), cryptoState, onRestore });
+  if (active === "security") return h(LegacyAccountDialog, { client, onClose, onBack: () => { setActive("general"); setMobilePane(false); }, cryptoState, onRestore });
   const nav = [{ id: "general", label: "常规", hint: "界面与消息" }, { id: "account", label: "账号", hint: "资料与身份" }, { id: "notifications", label: "通知", hint: "提醒方式" }, { id: "security", label: "设备与安全", hint: "加密与设备" }, { id: "emoji", label: "表情与分类", hint: "云端目录" }, { id: "ai", label: "AI 助手", hint: "可选能力" }, { id: "developer", label: "开发工具", hint: "连接信息" }, { id: "about", label: "关于", hint: "版本信息" }];
-  const panel = active === "general" ? h("div", { className: "settings-panel-content" }, h("h3", null, "常规"), h("p", null, "保持清晰、克制的企业工作台体验。"), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "外观主题"), h("span", null, "浅色 · 企业蓝")), h("span", { className: "settings-value-chip" }, "当前")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "消息排版"), h("span", null, "紧凑布局，长文本保留原始换行")), h("span", { className: "settings-value-chip" }, "紧凑")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "发送方式"), h("span", null, "Enter 发送 · Shift + Enter 换行")), h("span", { className: "settings-value-chip" }, "默认"))) : active === "account" ? h("div", { className: "settings-panel-content" }, h("h3", null, "账号"), h("p", null, "你的资料会通过 Matrix 账户接口同步到其他客户端。"), h("label", { className: "settings-field-label" }, "显示昵称", h(Input, { value: displayName, onChange: setDisplayName, placeholder: "输入显示昵称" })), h(UiButton, { variant: "primary", onClick: saveName }, "保存昵称"), h("div", { className: "settings-account-id" }, h("span", null, "Matrix ID"), h("code", null, client.getUserId?.() || "未知"))) : active === "notifications" ? h("div", { className: "settings-panel-content" }, h("h3", null, "通知"), h("p", null, "只在后台或当前房间之外提醒新消息。"), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "桌面通知"), h("span", null, notificationPermission === "granted" ? "浏览器通知已授权" : "需要授权后接收提醒")), h(UiButton, { size: "small", onClick: enableNotifications }, notificationPermission === "granted" ? "已开启" : "开启")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "未读红点"), h("span", null, "房间列表会显示未读数量")), h("span", { className: "settings-value-chip" }, "已启用"))) : active === "emoji" ? h("div", { className: "settings-panel-content" }, h("h3", null, "表情与分类"), h("p", null, "从云端目录加载分类，发送时使用标准 Matrix 图片事件，GIF 保留动画。"), h("div", { className: "settings-account-id" }, h("span", null, "目录地址"), h("code", null, "image.527012.xyz/index.json")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "已加载分类"), h("span", null, "QQ、钉钉、月薪喵、B 站等")), h("span", { className: "settings-value-chip" }, "云端"))) : active === "ai" ? h("div", { className: "settings-panel-content" }, h("h3", null, "AI 助手"), h("p", null, "当前未配置 AI 服务。配置后可在不影响 Matrix 数据的前提下启用辅助能力。"), h("div", { className: "settings-empty-state" }, "未配置")) : active === "developer" ? h("div", { className: "settings-panel-content" }, h("h3", null, "开发工具"), h("div", { className: "settings-account-id" }, h("span", null, "Homeserver"), h("code", null, client.getHomeserverUrl?.() || "未知")), h("div", { className: "settings-account-id" }, h("span", null, "设备 ID"), h("code", null, client.getDeviceId?.() || "未知")), h("div", { className: "settings-account-id" }, h("span", null, "Matrix SDK"), h("code", null, "matrix-js-sdk 42.3.0"))) : h("div", { className: "settings-panel-content" }, h("h3", null, "关于"), h("p", null, "Orbit 是基于 Matrix 的企业级聊天工作台。"), h("div", { className: "settings-about-version" }, "Orbit Web · Matrix Client-Server API · E2EE Rust Crypto"));
-  return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card settings-card" }, h("div", { className: "modal-head settings-card-head" }, h("div", null, h("div", { className: "modal-title" }, "我的设置"), h("div", { className: "modal-copy" }, "按分类管理账户、通知和设备安全。")), h(UiButton, { className: "icon-button", type: "text", onClick: onClose, "aria-label": "关闭" }, "×")), h("div", { className: "settings-layout" }, h("nav", { className: "settings-sidebar", "aria-label": "设置分类" }, nav.map(item => h("button", { type: "button", key: item.id, className: `settings-nav-item ${active === item.id ? "active" : ""}`, onClick: () => setActive(item.id) }, h("span", null, item.label), h("small", null, item.hint)))), h("section", { className: "settings-panel" }, panel))));
+  const panel = active === "general" ? h("div", { className: "settings-panel-content" }, h("h3", null, "常规"), h("p", null, "保持清晰、克制的企业工作台体验。"), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "外观主题"), h("span", null, "浅色 · 企业蓝")), h("span", { className: "settings-value-chip" }, "当前")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "消息排版"), h("span", null, "紧凑布局，长文本保留原始换行")), h("span", { className: "settings-value-chip" }, "紧凑")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "发送方式"), h("span", null, mobile ? "点发送按钮发送，键盘换行" : "Enter 发送 · Shift + Enter 换行")), h("span", { className: "settings-value-chip" }, mobile ? "按钮发送" : "默认"))) : active === "account" ? h("div", { className: "settings-panel-content" }, h("h3", null, "账号"), h("p", null, "你的资料会通过 Matrix 账户接口同步到其他客户端。"), h("label", { className: "settings-field-label" }, "显示昵称", h(Input, { value: displayName, onChange: setDisplayName, placeholder: "输入显示昵称" })), h(UiButton, { variant: "primary", onClick: saveName }, "保存昵称"), h("div", { className: "settings-account-id" }, h("span", null, "Matrix ID"), h("code", null, client.getUserId?.() || "未知")), onLogout && h("button", { type: "button", className: "orbit-logout-btn", onClick: onLogout }, "退出登录")) : active === "notifications" ? h("div", { className: "settings-panel-content" }, h("h3", null, "通知"), h("p", null, "只在后台或当前房间之外提醒新消息。"), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "消息通知"), h("span", null, notificationPermission === "granted" ? "浏览器通知已授权" : "需要授权后接收提醒")), h(UiButton, { size: "small", onClick: enableNotifications }, notificationPermission === "granted" ? "已开启" : "开启")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "未读红点"), h("span", null, "房间列表会显示未读数量")), h("span", { className: "settings-value-chip" }, "已启用"))) : active === "emoji" ? h("div", { className: "settings-panel-content" }, h("h3", null, "表情与分类"), h("p", null, "从云端目录加载分类，发送时使用标准 Matrix 图片事件，GIF 保留动画。"), h("div", { className: "settings-account-id" }, h("span", null, "目录地址"), h("code", null, "image.527012.xyz/index.json")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "已加载分类"), h("span", null, "QQ、钉钉、月薪喵、B 站等")), h("span", { className: "settings-value-chip" }, "云端"))) : active === "ai" ? h("div", { className: "settings-panel-content" }, h("h3", null, "AI 助手"), h("p", null, "当前未配置 AI 服务。配置后可在不影响 Matrix 数据的前提下启用辅助能力。"), h("div", { className: "settings-empty-state" }, "未配置")) : active === "developer" ? h("div", { className: "settings-panel-content" }, h("h3", null, "开发工具"), h("div", { className: "settings-account-id" }, h("span", null, "Homeserver"), h("code", null, client.getHomeserverUrl?.() || "未知")), h("div", { className: "settings-account-id" }, h("span", null, "设备 ID"), h("code", null, client.getDeviceId?.() || "未知")), h("div", { className: "settings-account-id" }, h("span", null, "Matrix SDK"), h("code", null, "matrix-js-sdk 42.3.0"))) : h("div", { className: "settings-panel-content" }, h("h3", null, "关于"), h("p", null, "Orbit 是基于 Matrix 的企业级聊天工作台。"), h("div", { className: "settings-about-version" }, "Orbit Web · Matrix Client-Server API · E2EE Rust Crypto"));
+  return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card settings-card" }, h("div", { className: "modal-head settings-card-head" }, h("div", null, h("div", { className: "modal-title" }, mobile && mobilePane ? (nav.find(item => item.id === active)?.label || "设置") : "我的设置"), h("div", { className: "modal-copy" }, mobile && mobilePane ? (nav.find(item => item.id === active)?.hint || "") : "按分类管理账户、通知和设备安全。")), h("div", { className: "modal-head-actions" }, mobile && mobilePane && h(UiButton, { className: "icon-button", type: "text", onClick: () => setMobilePane(false), "aria-label": "返回设置分类" }, h(Icon, { name: "chevronLeft", size: 20 })), h(UiButton, { className: "icon-button", type: "text", onClick: onClose, "aria-label": "关闭" }, "×"))), h("div", { className: `settings-layout ${mobile ? (mobilePane ? "is-pane" : "is-nav") : ""}` }, h("nav", { className: "settings-sidebar", "aria-label": "设置分类" }, nav.map(item => h("button", { type: "button", key: item.id, className: `settings-nav-item ${active === item.id ? "active" : ""}`, onClick: () => { setActive(item.id); if (mobile) setMobilePane(true); } }, h("span", null, item.label), h("small", null, item.hint)))), h("section", { className: "settings-panel" }, panel))));
 }
 
 createRoot(document.getElementById("root")).render(h(App));

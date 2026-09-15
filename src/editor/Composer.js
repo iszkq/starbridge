@@ -35,10 +35,11 @@ function clipboardFiles(data) {
     .filter(Boolean);
 }
 
-export const PlainComposer = React.forwardRef(function PlainComposer({ value, onChange, onKeyDown, onFiles, placeholder }, ref) {
+export const PlainComposer = React.forwardRef(function PlainComposer({ value, onChange, onKeyDown, onFiles, placeholder, onFocus, onBlur, enterKeyHint }, ref) {
   const nodeRef = useRef(null);
   useImperativeHandle(ref, () => ({
     focus: () => nodeRef.current?.focus(),
+    blur: () => nodeRef.current?.blur(),
     insertText: text => {
       const node = nodeRef.current;
       if (!node) return;
@@ -46,6 +47,18 @@ export const PlainComposer = React.forwardRef(function PlainComposer({ value, on
       const next = `${String(value || "").slice(0, start)}${String(text || "")}${String(value || "").slice(node.selectionEnd ?? start)}`;
       onChange?.(next, "");
       requestAnimationFrame(() => { node.focus(); const cursor = start + String(text || "").length; node.setSelectionRange(cursor, cursor); });
+    },
+    insertEmoji: (item) => {
+      const token = `:${String(item?.name || item?.shortcode || "表情").replace(/^:+|:+$/g, "")}: `;
+      const node = nodeRef.current;
+      const current = String(value || "");
+      if (!node) { onChange?.(`${current}${token}`, ""); return true; }
+      const start = node.selectionStart ?? current.length;
+      const end = node.selectionEnd ?? start;
+      const next = `${current.slice(0, start)}${token}${current.slice(end)}`;
+      onChange?.(next, "");
+      requestAnimationFrame(() => { node.focus(); const cursor = start + token.length; node.setSelectionRange(cursor, cursor); });
+      return true;
     },
     clear: () => onChange?.("", ""),
   }));
@@ -58,7 +71,12 @@ export const PlainComposer = React.forwardRef(function PlainComposer({ value, on
     rows: 1,
     autoComplete: "off",
     spellCheck: false,
+    enterKeyHint: enterKeyHint || "enter",
+    inputMode: "text",
+    "aria-multiline": "true",
     onChange: event => onChange?.(event.currentTarget.value),
+    onFocus: () => onFocus?.(),
+    onBlur: () => onBlur?.(),
     onKeyDown,
     onPaste: event => {
       const files = clipboardFiles(event.clipboardData);
@@ -134,16 +152,22 @@ function flattenPastedHtml(html) {
     .replace(/<\/?(?:p|div)(?:\s[^>]*)?>/gi, "");
 }
 
-export const HaloComposer = React.forwardRef(function HaloComposer({ value, onChange, onKeyDown, onFiles, placeholder, toolbarExtra, emojiFallbackItems = [] }, ref) {
+export const HaloComposer = React.forwardRef(function HaloComposer({ value, onChange, onKeyDown, onFiles, placeholder, toolbarExtra, emojiFallbackItems = [], hideToolbar = false, onFocus, onBlur, enterKeyHint }, ref) {
   const hostRef = useRef(null);
   const editorRef = useRef(null);
   const lastEmittedRef = useRef(String(value || ""));
   const valueRef = useRef(value);
   const onChangeRef = useRef(onChange);
   const fallbackRef = useRef(emojiFallbackItems);
+  const onFocusRef = useRef(onFocus);
+  const onBlurRef = useRef(onBlur);
+  const enterKeyHintRef = useRef(enterKeyHint);
   valueRef.current = value;
   onChangeRef.current = onChange;
   fallbackRef.current = emojiFallbackItems;
+  onFocusRef.current = onFocus;
+  onBlurRef.current = onBlur;
+  enterKeyHintRef.current = enterKeyHint;
   const [, setEditorVersion] = useState(0);
   const [fontSize, setFontSize] = useState("16px");
   const [failed, setFailed] = useState(false);
@@ -182,7 +206,22 @@ export const HaloComposer = React.forwardRef(function HaloComposer({ value, onCh
           content: htmlFromText(valueRef.current),
           extensions: [StarterKit.configure({ heading: { levels: [1, 2, 3] }, codeBlock: true }), OrbitEmoji, Underline, TextStyle, Color.configure({ types: ["textStyle"] }), FontSize, Link.configure({ openOnClick: false, defaultProtocol: "https" }), Placeholder.configure({ placeholder: placeholder || "输入消息…" })],
           editorProps: {
+            attributes: {
+              enterkeyhint: enterKeyHintRef.current || "enter",
+              inputmode: "text",
+              "aria-multiline": "true",
+            },
             transformPastedHTML: html => flattenPastedHtml(html),
+            handleKeyDown: (_view, event) => {
+              if (event.isComposing || event.keyCode === 229) return false;
+              if (enterKeyHintRef.current === "enter" && (event.key === "Enter" || event.key === "NumpadEnter")) {
+                event.preventDefault();
+                event.stopPropagation();
+                editor.commands.setHardBreak();
+                return true;
+              }
+              return false;
+            },
           },
           onUpdate: ({ editor: current }) => {
             const text = serializeEditorText(current);
@@ -191,7 +230,10 @@ export const HaloComposer = React.forwardRef(function HaloComposer({ value, onCh
             onChangeRef.current?.(text, current.getHTML());
           },
           onSelectionUpdate: () => setEditorVersion(version => version + 1),
+          onFocus: () => onFocusRef.current?.(),
+          onBlur: () => onBlurRef.current?.(),
         });
+        editor.view?.dom?.setAttribute?.("enterkeyhint", enterKeyHintRef.current || "enter");
         editorRef.current = editor;
         const currentValue = String(valueRef.current || "");
         lastEmittedRef.current = currentValue;
@@ -221,6 +263,7 @@ export const HaloComposer = React.forwardRef(function HaloComposer({ value, onCh
 
   useImperativeHandle(ref, () => ({
     focus: () => editorRef.current?.chain().focus().run() || hostRef.current?.focus(),
+    blur: () => editorRef.current?.commands.blur() || hostRef.current?.blur?.(),
     setContent: text => {
       const editor = editorRef.current;
       if (!editor) return false;
@@ -267,7 +310,7 @@ export const HaloComposer = React.forwardRef(function HaloComposer({ value, onCh
     },
   }));
 
-  if (failed) return h(PlainComposer, { ref, value, onChange, onKeyDown, onFiles, placeholder });
+  if (failed) return h(PlainComposer, { ref, value, onChange, onKeyDown, onFiles, placeholder, onFocus, onBlur, enterKeyHint });
   const actions = [["粗体", "toggleBold", "bold"], ["斜体", "toggleItalic", "italic"], ["下划线", "toggleUnderline", "underline"], ["删除线", "toggleStrike", "strike"], ["字体大小", "setFontSize", "fontSize"]];
   const actionIcons = { bold: "bold", italic: "italic", underline: "underline", strike: "strike", fontSize: "fontSize" };
   const runFormat = (command, attrs) => {
@@ -281,12 +324,12 @@ export const HaloComposer = React.forwardRef(function HaloComposer({ value, onCh
     chain[command](attrs).run();
     setEditorVersion(version => version + 1);
   };
-  return h("div", { className: "halo-composer-shell" },
+  return h("div", { className: hideToolbar ? "halo-composer-shell is-compact" : "halo-composer-shell", onFocus: () => onFocusRef.current?.() },
     h("div", { ref: hostRef, className: "halo-editor-surface", onKeyDown, onPaste: event => {
       const files = clipboardFiles(event.clipboardData);
       if (files.length) { event.preventDefault(); event.stopPropagation(); onFiles?.(files); }
     } }),
-    h("div", { className: "halo-editor-toolbar" },
+    hideToolbar ? null : h("div", { className: "halo-editor-toolbar" },
       h("div", { className: "halo-editor-format-actions" }, actions.map(([title, command, mark], index) => h(React.Fragment, { key: `${command}-${mark}` }, index === 6 ? h("span", { className: "toolbar-divider", "aria-hidden": "true" }) : null,
         h("button", { type: "button", className: editorRef.current?.isActive?.(mark.startsWith("heading") ? "heading" : mark) ? "is-active" : "", title: mark === "fontSize" ? `${title}：${fontSize}` : title, "aria-label": title, onMouseDown: event => event.preventDefault(), onClick: () => runFormat(command, command === "toggleHeading" ? { level: Number(mark.slice(-1)) } : undefined) }, h(Icon, { name: actionIcons[mark], size: 18 }))))),
       toolbarExtra && h("div", { className: "halo-editor-extra-actions" }, toolbarExtra)

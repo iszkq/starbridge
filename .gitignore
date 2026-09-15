@@ -14,3 +14,10 @@ matrix-sdk.tgz
 .DS_Store
 Thumbs.db
 *.log
+
+# Local scratch/patch files
+_*.py
+_*.txt
+_*.js
+_*.cjs
+patch-voice-overlay.cjs
