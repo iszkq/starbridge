@@ -6,4 +6,4 @@
 - `editor/Composer.js`：Halo/Tiptap 编辑器、纯文本降级编辑器、格式工具栏和编辑器粘贴处理。
 - `mobile/`：窄屏与触控布局、长按手势、键盘安全区和移动端样式。
 
-后续新增 UI 时优先放在 `src/ui`，编辑器能力放在 `src/editor`；`app.js` 只负责房间状态、消息发送和页面组合。拆分采用浏览器原生 ES Module，不增加构建步骤，也不会改变现有 `localhost:4174` 启动方式。
+后续新增 UI 时优先放在 `src/ui`，编辑器能力放在 `src/editor`；移动端交互放在 `src/mobile`。`app.js` 只负责房间状态、消息发送和页面组合。拆分采用浏览器原生 ES Module，不增加构建步骤，也不会改变现有 `localhost:4174` 启动方式。
