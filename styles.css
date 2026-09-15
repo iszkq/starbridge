@@ -3199,3 +3199,56 @@ button { cursor: pointer; }
 .message-row.emoji-message-row .message-actions,
 .message-row.message-grouped .message-actions { display: inline-flex !important; }
 .message-row.message-selecting .message-actions { display: none !important; }
+
+
+/* Voice-message transcript under the compact audio bubble. */
+.voice-message {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  width: min(280px, 78vw);
+  max-width: 100%;
+}
+.message-row.me .voice-message { align-items: flex-end; }
+.voice-message .media-player-audio {
+  width: min(220px, 68vw) !important;
+  max-width: 100% !important;
+}
+.voice-transcript {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: #f5f7fa;
+  color: #1f2329;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.message-row.me .voice-transcript { background: #edf4ff; }
+.voice-transcript.is-loading { color: #667085; }
+.voice-transcript.is-error { color: #b42318; }
+.voice-transcript-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 6px;
+}
+.voice-transcript-actions button,
+.voice-transcript-retry,
+.voice-transcript-toggle {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+.voice-transcript-toggle { color: #1677ff; }
+.voice-transcript-retry { margin-top: 6px; color: #1677ff; }
+.voice-transcript-actions button:hover,
+.voice-transcript-retry:hover,
+.voice-transcript-toggle:hover { color: #0958d9; }

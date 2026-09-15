@@ -7,25 +7,6 @@ function editorEscape(value) {
   return String(value || "").replace(/[&<>\"]/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[character]));
 }
 
-function editorEmojiHtml(value) {
-  const catalog = Array.isArray(window.orbitEmojiItems) ? window.orbitEmojiItems : [];
-  const byName = new Map();
-  catalog.forEach(item => {
-    const name = String(item?.name || "").trim().toLowerCase();
-    const shortcode = String(item?.shortcode || "").replace(/^:+|:+$/g, "").trim().toLowerCase();
-    if (name) byName.set(name, item);
-    if (shortcode) byName.set(shortcode, item);
-  });
-  return String(value || "").split(/(:[^:\s]+:)/g).map(part => {
-    const match = part.match(/^:([^:\s]+):$/);
-    const item = match && byName.get(match[1].toLowerCase());
-    if (!item) return editorEscape(part).replace(/\n/g, "<br>");
-    const token = `:${String(item.name || match[1]).replace(/^:+|:+$/g, "")}:`;
-    const src = item.thumbUrl || item.url || "";
-    return `<span data-emoji-chip data-token="${editorEscape(token)}" data-src="${editorEscape(src)}" data-alt="${editorEscape(item.name || match[1])}"></span>`;
-  }).join("");
-}
-
 function clipboardFiles(data) {
   const direct = [...(data?.files || [])];
   if (direct.length) return direct;
@@ -35,55 +16,222 @@ function clipboardFiles(data) {
     .filter(Boolean);
 }
 
-export const PlainComposer = React.forwardRef(function PlainComposer({ value, onChange, onKeyDown, onFiles, placeholder, onFocus, onBlur, enterKeyHint }, ref) {
+function composerEmojiSrc(item) {
+  const url = String(item?.url || "");
+  const thumb = String(item?.thumbUrl || "");
+  const mime = String(item?.mimeType || item?.mimetype || "").toLowerCase();
+  if (mime.includes("gif") || mime.includes("webp") || mime.includes("apng") || /\.(gif|webp)(?:$|\?)/i.test(url)) return url || thumb;
+  return thumb || url;
+}
+
+function trailingEmojiQuery(before, item, query) {
+  const name = String(item?.name || item?.shortcode || "").replace(/^:+|:+$/g, "").toLowerCase();
+  const explicit = String(query || "").trim();
+  const tail = String(before || "").match(/(:[^:\s]*|[^\s]+)$/)?.[0] || "";
+  if (!tail) return "";
+  const tailBare = tail.replace(/^:+|:+$/g, "").toLowerCase();
+  if (tail.startsWith(":") && (!tailBare || name.startsWith(tailBare))) return tail;
+  if (explicit && tailBare === explicit.toLowerCase() && (!name || name.startsWith(tailBare) || tailBare.length <= 12)) return tail;
+  if (name && tailBare && name.startsWith(tailBare) && tailBare.length <= name.length) return tail;
+  return "";
+}
+
+function htmlFromPlainComposer(value, extraItems = []) {
+  return String(value || "").split(/(:[^:\s]+:)/g).map(part => {
+    const match = part.match(/^:([^:\s]+):$/);
+    const item = match && findEmojiItem(match[1], extraItems);
+    if (!item) return editorEscape(part).replace(/\n/g, "<br>");
+    const token = `:${String(item.name || item.shortcode || match[1]).replace(/^:+|:+$/g, "")}:`;
+    const src = composerEmojiSrc(item);
+    return `<span class="composer-emoji-chip" data-emoji-chip data-token="${editorEscape(token)}" contenteditable="false"><img draggable="false" src="${editorEscape(src)}" alt="${editorEscape(item.name || token)}"></span>`;
+  }).join("");
+}
+
+function readPlainComposer(node) {
+  const walk = current => {
+    if (!current) return "";
+    if (current.nodeType === Node.TEXT_NODE) return current.nodeValue || "";
+    if (current.nodeType !== Node.ELEMENT_NODE) return "";
+    if (current.matches?.("[data-emoji-chip], [data-token], [data-emoji-token]")) {
+      return current.getAttribute("data-token") || current.getAttribute("data-emoji-token") || "";
+    }
+    if (current.tagName === "BR") return "\n";
+    const text = [...current.childNodes].map(walk).join("");
+    if (["DIV", "P"].includes(current.tagName) && current.nextSibling) return `${text}\n`;
+    return text;
+  };
+  return [...(node?.childNodes || [])].map(walk).join("").replace(/\u00a0/g, " ").replace(/\n$/, "");
+}
+
+function placePlainComposerCaret(node, offset) {
+  if (!node) return;
+  const selection = window.getSelection();
+  if (!selection) return;
+  const range = document.createRange();
+  let remaining = Math.max(0, Number(offset) || 0);
+  const visit = current => {
+    if (remaining <= 0) return true;
+    if (current.nodeType === Node.TEXT_NODE) {
+      const size = (current.nodeValue || "").length;
+      if (remaining <= size) {
+        range.setStart(current, remaining);
+        range.collapse(true);
+        remaining = 0;
+        return true;
+      }
+      remaining -= size;
+      return false;
+    }
+    if (current.nodeType === Node.ELEMENT_NODE && current.matches?.("[data-emoji-chip], [data-token], [data-emoji-token]")) {
+      const token = current.getAttribute("data-token") || current.getAttribute("data-emoji-token") || "";
+      if (remaining <= token.length) {
+        range.setStartAfter(current);
+        range.collapse(true);
+        remaining = 0;
+        return true;
+      }
+      remaining -= token.length;
+      return false;
+    }
+    if (current.tagName === "BR") {
+      if (remaining <= 1) {
+        range.setStartAfter(current);
+        range.collapse(true);
+        remaining = 0;
+        return true;
+      }
+      remaining -= 1;
+      return false;
+    }
+    return [...(current.childNodes || [])].some(visit);
+  };
+  if (![...node.childNodes].some(visit)) {
+    range.selectNodeContents(node);
+    range.collapse(false);
+  }
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+export const PlainComposer = React.forwardRef(function PlainComposer({ value, onChange, onKeyDown, onFiles, placeholder, onFocus, onBlur, enterKeyHint, minHeight, maxHeight, fill = false, onOverflowChange, emojiFallbackItems = [] }, ref) {
   const nodeRef = useRef(null);
+  const overflowRef = useRef(false);
+  const composingRef = useRef(false);
+  const onOverflowChangeRef = useRef(onOverflowChange);
+  onOverflowChangeRef.current = onOverflowChange;
+  const syncSize = () => {
+    const node = nodeRef.current;
+    if (!node) return;
+    if (fill) {
+      node.style.height = "100%";
+      node.style.maxHeight = "none";
+      node.style.overflowY = "auto";
+      return;
+    }
+    const min = Math.max(22, Number(minHeight) || 36);
+    const cap = Math.max(min, Number(maxHeight) || 234);
+    node.style.height = "0px";
+    const content = node.scrollHeight;
+    const next = Math.max(min, Math.min(cap, content));
+    node.style.height = `${next}px`;
+    node.style.maxHeight = `${cap}px`;
+    const overflowing = content > cap + 1;
+    node.style.overflowY = overflowing ? "auto" : "hidden";
+    if (overflowRef.current !== overflowing) {
+      overflowRef.current = overflowing;
+      onOverflowChangeRef.current?.(overflowing);
+    }
+  };
+  const emit = () => {
+    const node = nodeRef.current;
+    if (!node) return;
+    const next = readPlainComposer(node);
+    node.classList.toggle("is-empty", !next.trim());
+    onChange?.(next, node.innerHTML);
+    requestAnimationFrame(syncSize);
+  };
+  useEffect(() => {
+    if (composingRef.current) return;
+    const node = nodeRef.current;
+    if (!node) return;
+    if (readPlainComposer(node) === String(value || "")) {
+      node.classList.toggle("is-empty", !String(value || "").trim());
+      syncSize();
+      return;
+    }
+    node.innerHTML = htmlFromPlainComposer(value, emojiFallbackItems);
+    node.classList.toggle("is-empty", !String(value || "").trim());
+    syncSize();
+  }, [value, minHeight, maxHeight, fill, emojiFallbackItems]);
   useImperativeHandle(ref, () => ({
     focus: () => nodeRef.current?.focus(),
     blur: () => nodeRef.current?.blur(),
+    getHeight: () => nodeRef.current?.offsetHeight || 0,
+    syncSize,
     insertText: text => {
       const node = nodeRef.current;
-      if (!node) return;
-      const start = node.selectionStart ?? String(value || "").length;
-      const next = `${String(value || "").slice(0, start)}${String(text || "")}${String(value || "").slice(node.selectionEnd ?? start)}`;
-      onChange?.(next, "");
-      requestAnimationFrame(() => { node.focus(); const cursor = start + String(text || "").length; node.setSelectionRange(cursor, cursor); });
+      const current = readPlainComposer(node) || String(value || "");
+      const next = `${current}${String(text || "")}`;
+      onChange?.(next, htmlFromPlainComposer(next, [item, ...emojiFallbackItems]));
+      requestAnimationFrame(() => { node?.focus(); placePlainComposerCaret(node, next.length); });
     },
-    insertEmoji: (item) => {
-      const token = `:${String(item?.name || item?.shortcode || "表情").replace(/^:+|:+$/g, "")}: `;
+    insertEmoji: (item, { query = "" } = {}) => {
+      const name = String(item?.name || item?.shortcode || "表情").replace(/^:+|:+$/g, "");
+      const token = `:${name}:`;
       const node = nodeRef.current;
-      const current = String(value || "");
-      if (!node) { onChange?.(`${current}${token}`, ""); return true; }
-      const start = node.selectionStart ?? current.length;
-      const end = node.selectionEnd ?? start;
-      const next = `${current.slice(0, start)}${token}${current.slice(end)}`;
-      onChange?.(next, "");
-      requestAnimationFrame(() => { node.focus(); const cursor = start + token.length; node.setSelectionRange(cursor, cursor); });
+      const current = readPlainComposer(node) || String(value || "");
+      const remove = trailingEmojiQuery(current, item, query);
+      const before = remove && current.endsWith(remove) ? current.slice(0, current.length - remove.length) : current;
+      const next = `${before}${token} `;
+      onChange?.(next, htmlFromPlainComposer(next, emojiFallbackItems));
+      requestAnimationFrame(() => {
+        node?.focus();
+        placePlainComposerCaret(node, before.length + token.length + 1);
+        syncSize();
+      });
       return true;
     },
     clear: () => onChange?.("", ""),
-  }));
-  return h("textarea", {
+  }), [value, onChange, minHeight, maxHeight, fill, emojiFallbackItems]);
+  return h("div", {
     ref: nodeRef,
-    className: "rich-editor plain-composer",
-    value: String(value || ""),
-    placeholder,
-    "aria-label": placeholder,
-    rows: 1,
-    autoComplete: "off",
-    spellCheck: false,
-    enterKeyHint: enterKeyHint || "enter",
-    inputMode: "text",
+    className: `rich-editor plain-composer${String(value || "").trim() ? "" : " is-empty"}`,
+    contentEditable: "true",
+    role: "textbox",
     "aria-multiline": "true",
-    onChange: event => onChange?.(event.currentTarget.value),
+    "aria-label": placeholder,
+    "data-placeholder": placeholder || "",
+    enterKeyHint: enterKeyHint || "enter",
+    suppressContentEditableWarning: true,
+    onInput: () => { if (!composingRef.current) emit(); },
+    onCompositionStart: () => { composingRef.current = true; },
+    onCompositionEnd: () => { composingRef.current = false; emit(); },
     onFocus: () => onFocus?.(),
     onBlur: () => onBlur?.(),
-    onKeyDown,
+    onKeyDown: event => {
+      if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent?.isComposing) {
+        if (typeof window !== "undefined" && window.matchMedia?.("(max-width: 900px), (pointer: coarse)")?.matches) {
+          event.preventDefault();
+          document.execCommand("insertLineBreak");
+          emit();
+          return;
+        }
+      }
+      onKeyDown?.(event);
+    },
     onPaste: event => {
       const files = clipboardFiles(event.clipboardData);
-      if (!files.length) return;
+      if (files.length) {
+        event.preventDefault();
+        event.stopPropagation();
+        onFiles?.(files);
+        return;
+      }
+      const text = event.clipboardData?.getData?.("text/plain");
+      if (text == null) return;
       event.preventDefault();
-      event.stopPropagation();
-      onFiles?.(files);
+      document.execCommand("insertText", false, text);
+      emit();
     },
     onDragOver: event => { event.preventDefault(); event.currentTarget.classList.add("drag-active"); },
     onDragLeave: event => event.currentTarget.classList.remove("drag-active"),
@@ -96,7 +244,6 @@ export const PlainComposer = React.forwardRef(function PlainComposer({ value, on
     },
   });
 });
-
 
 function editorLeafText(node) {
   if (node?.type?.name === "orbitEmoji") return node.attrs?.token || `:${node.attrs?.name || "表情"}:`;
@@ -138,7 +285,7 @@ function textToEditorHtml(text, extraItems = []) {
     const item = match && findEmojiItem(match[1], extraItems);
     if (!item) return editorEscape(part).replace(/\n/g, "<br>");
     const token = `:${String(item.name || item.shortcode || match[1]).replace(/^:+|:+$/g, "")}:`;
-    const src = item.thumbUrl || item.url || "";
+    const src = composerEmojiSrc(item);
     return `<span class="editor-emoji-chip" data-emoji-token="${editorEscape(token)}" data-mxc="${editorEscape(item.mxc || "")}" contenteditable="false"><img draggable="false" src="${editorEscape(src)}" alt="${editorEscape(item.name || token)}"><span class="editor-emoji-label">${editorEscape(item.name || token)}</span></span>`;
   }).join("");
   if (!html) return "";
@@ -278,7 +425,7 @@ export const HaloComposer = React.forwardRef(function HaloComposer({ value, onCh
       if (!editor || !item) return false;
       const name = String(item.name || item.shortcode || "表情").replace(/^:+|:+$/g, "");
       const token = `:${name}:`;
-      const src = item.thumbUrl || item.url || "";
+      const src = composerEmojiSrc(item);
       const fullText = serializeEditorText(editor);
       let from = editor.state.selection.from;
       let to = editor.state.selection.to;

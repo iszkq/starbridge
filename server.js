@@ -3,6 +3,40 @@ import { join, normalize } from "node:path";
 const port = Number(Bun.env.PORT || 4174);
 const root = import.meta.dir;
 
+const AIHUBMIX_API_KEY = process.env.AIHUBMIX_API_KEY || "sk-ORD4wbVuj5ThPB0x52633eCc417c43A39b94D49123A7F719";
+const AIHUBMIX_TRANSCRIBE_URLS = [
+  "https://aihubmix.com/v1/audio/transcriptions",
+  "https://api.aihubmix.com/v1/audio/transcriptions",
+];
+
+async function transcribeWithAiHubMix(bytes, filename, mime) {
+  const safeName = String(filename || "audio.webm").replace(/[^A-Za-z0-9._-]/g, "_") || "audio.webm";
+  const type = String(mime || "application/octet-stream").split(";")[0] || "application/octet-stream";
+  let lastError = null;
+  for (const url of AIHUBMIX_TRANSCRIBE_URLS) {
+    const form = new FormData();
+    form.append("file", new Blob([bytes], { type }), safeName);
+    form.append("model", "whisper-large-v3-turbo");
+    form.append("language", "zh");
+    form.append("response_format", "json");
+    try {
+      const upstream = await fetch(url, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${AIHUBMIX_API_KEY}` },
+        body: form,
+        signal: AbortSignal.timeout(60000),
+      });
+      const text = await upstream.text();
+      if (upstream.ok || upstream.status < 500) return { status: upstream.status, text };
+      lastError = text || `HTTP ${upstream.status}`;
+    } catch (error) {
+      lastError = error?.message || error;
+    }
+  }
+  throw new Error(String(lastError || "转文字服务暂时不可用"));
+}
+
+
 Bun.serve({
   port,
   async fetch(request) {
@@ -62,6 +96,26 @@ Bun.serve({
         return new Response(upstream.body, { status: upstream.status, headers });
       } catch (error) {
         return new Response(JSON.stringify({ error: String(error?.message || error) }), { status: 502, headers: { "content-type": "application/json", "access-control-allow-origin": "*" } });
+      }
+    }
+
+    if (url.pathname === "/__stt") {
+      if (request.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "POST,OPTIONS",
+          "access-control-allow-headers": "Content-Type,X-Orbit-Filename",
+          "access-control-max-age": "600"
+        } });
+      }
+      if (request.method !== "POST") return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405, headers: { "content-type": "application/json" } });
+      try {
+        const bytes = await request.arrayBuffer();
+        if (!bytes.byteLength) return new Response(JSON.stringify({ error: "没有可识别的语音" }), { status: 400, headers: { "content-type": "application/json" } });
+        const result = await transcribeWithAiHubMix(bytes, request.headers.get("x-orbit-filename"), request.headers.get("content-type"));
+        return new Response(result.text, { status: result.status, headers: { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*" } });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: String(error?.message || error) }), { status: 502, headers: { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*" } });
       }
     }
 

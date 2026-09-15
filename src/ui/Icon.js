@@ -35,6 +35,8 @@ export default function Icon({ name, size = 17 }) {
     heading2: "M5 5v14M19 5v14M5 12h14",
     heading3: "M5 5v14M19 5v14M5 12h14",
     chevronLeft: "M15 18l-6-6 6-6",
+    chevronDown: "M6 9l6 6 6-6",
+    expand: ["M9 3H4v5", "M15 3h5v5", "M9 21H4v-5", "M15 21h5v-5"],
     more: "M4 11h2v2H4zm7 0h2v2h-2zm7 0h2v2h-2z",
     keyboard: "M4 6h16v12H4z M8 10h.01 M12 10h.01 M16 10h.01 M8 14h8",
     plus: "M12 5v14M5 12h14",

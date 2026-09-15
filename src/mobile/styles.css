@@ -834,8 +834,8 @@ html[data-orbit-mobile="1"] .halo-editor-extra-actions {
 html[data-orbit-mobile="1"] .halo-editor-surface,
 html[data-orbit-mobile="1"] .ProseMirror,
 html[data-orbit-mobile="1"] .plain-composer {
-  min-height: 48px;
-  max-height: 24vh;
+  min-height: 36px;
+  max-height: 234px;
   overflow: auto;
 }
 
@@ -1056,7 +1056,7 @@ html[data-orbit-mobile="1"] .halo-composer-shell.is-compact .halo-editor-surface
 html[data-orbit-mobile="1"] .halo-composer-shell.is-compact .ProseMirror,
 html[data-orbit-mobile="1"] .wechat-composer .plain-composer {
   min-height: 40px !important;
-  max-height: 120px;
+  max-height: 234px;
   padding: 8px 12px !important;
   background: transparent;
 }
@@ -1089,20 +1089,60 @@ html[data-orbit-mobile="1"] .orbit-hold-talk {
   font-size: 15px;
   font-weight: 600;
   letter-spacing: 0.08em;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
 }
 
-html[data-orbit-mobile="1"] .orbit-hold-talk.is-recording {
-  background: #f97066;
-  color: #fff;
-  box-shadow: none;
+html[data-orbit-mobile="1"] .orbit-hold-talk.is-recording,
+html[data-orbit-mobile="1"] .orbit-hold-talk.is-cancel,
+html[data-orbit-mobile="1"] .orbit-hold-talk.is-transcribe {
+  background: #fff;
+  box-shadow: inset 0 0 0 1px #e6e8ee;
 }
 
 html[data-orbit-mobile="1"] .orbit-hold-talk.is-cancel {
-  background: #d92d20;
-  color: #fff;
+  color: #d92d20;
+}
+
+html[data-orbit-mobile="1"] .orbit-hold-talk.is-transcribe {
+  color: #12b76a;
+}
+
+html[data-orbit-mobile="1"] .orbit-hold-wave {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 16px;
+}
+
+html[data-orbit-mobile="1"] .orbit-hold-wave i {
+  display: block;
+  width: 2px;
+  height: 6px;
+  border-radius: 1px;
+  background: currentColor;
+  transform-origin: center bottom;
+  animation: orbit-hold-wave 0.9s ease-in-out infinite;
+}
+
+html[data-orbit-mobile="1"] .orbit-hold-wave i:nth-child(1) { animation-delay: -0.08s; height: 5px; }
+html[data-orbit-mobile="1"] .orbit-hold-wave i:nth-child(2) { animation-delay: -0.18s; height: 10px; }
+html[data-orbit-mobile="1"] .orbit-hold-wave i:nth-child(3) { animation-delay: -0.28s; height: 14px; }
+html[data-orbit-mobile="1"] .orbit-hold-wave i:nth-child(4) { animation-delay: -0.12s; height: 8px; }
+html[data-orbit-mobile="1"] .orbit-hold-wave i:nth-child(5) { animation-delay: -0.36s; height: 16px; }
+html[data-orbit-mobile="1"] .orbit-hold-wave i:nth-child(6) { animation-delay: -0.22s; height: 9px; }
+html[data-orbit-mobile="1"] .orbit-hold-wave i:nth-child(7) { animation-delay: -0.42s; height: 13px; }
+html[data-orbit-mobile="1"] .orbit-hold-wave i:nth-child(8) { animation-delay: -0.16s; height: 7px; }
+html[data-orbit-mobile="1"] .orbit-hold-wave i:nth-child(9) { animation-delay: -0.3s; height: 11px; }
+
+@keyframes orbit-hold-wave {
+  0%, 100% { transform: scaleY(0.35); }
+  50% { transform: scaleY(1); }
 }
 
 html[data-orbit-mobile="1"] .orbit-editor-hold {
@@ -1123,86 +1163,68 @@ html[data-orbit-mobile="1"] .orbit-editor-hold .halo-composer-shell {
 
 html[data-orbit-mobile="1"] .orbit-voice-mask {
   position: fixed;
-  inset: 0;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: calc(52px + var(--orbit-safe-bottom, 0px));
   z-index: 80;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: flex-end;
-  padding: 0 24px calc(108px + var(--orbit-safe-bottom, 0px));
-  background: rgba(16, 24, 40, 0.46);
+  background: rgba(15, 18, 24, 0.42);
   pointer-events: none;
 }
 
-html[data-orbit-mobile="1"] .orbit-voice-cancel-zone {
+html[data-orbit-mobile="1"] .composer-wrap.is-voice-recording {
+  position: relative;
+  z-index: 90;
+}
+
+html[data-orbit-mobile="1"] .orbit-voice-zone {
   position: absolute;
-  top: calc(10px + var(--orbit-safe-top, 0px));
-  left: 20px;
-  right: 20px;
-  height: 52px;
-  border-radius: 26px;
-  display: grid;
-  place-items: center;
-  color: rgba(255, 255, 255, 0.88);
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  background: rgba(255, 255, 255, 0.12);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
-}
-
-html[data-orbit-mobile="1"] .orbit-voice-mask.is-cancel .orbit-voice-cancel-zone {
-  color: #fff;
-  background: rgba(217, 45, 32, 0.94);
-  box-shadow: none;
-}
-
-html[data-orbit-mobile="1"] .orbit-voice-mask-card {
-  min-width: 168px;
-  padding: 18px 22px 16px;
-  border-radius: 16px;
-  background: rgba(29, 41, 57, 0.92);
-  color: #fff;
-  font-size: 14px;
-  font-weight: 600;
-  text-align: center;
-}
-
-html[data-orbit-mobile="1"] .orbit-voice-mask.is-cancel .orbit-voice-mask-card {
-  background: rgba(217, 45, 32, 0.94);
-}
-
-html[data-orbit-mobile="1"] .orbit-voice-waves {
+  bottom: 22px;
+  width: min(136px, 34vw);
+  height: min(136px, 34vw);
+  border-radius: 50%;
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: center;
-  gap: 5px;
-  height: 28px;
-  margin-bottom: 10px;
+  color: rgba(255, 255, 255, 0.94);
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  background: rgba(72, 76, 84, 0.58);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  transition: background 0.16s ease, transform 0.16s ease, color 0.16s ease;
 }
 
-html[data-orbit-mobile="1"] .orbit-voice-waves i {
-  width: 3px;
-  height: 12px;
-  border-radius: 99px;
-  background: #fff;
-  transform-origin: center bottom;
-  animation: orbit-voice-wave 0.9s ease-in-out infinite;
+html[data-orbit-mobile="1"] .orbit-voice-zone.is-cancel {
+  left: 18px;
 }
 
-html[data-orbit-mobile="1"] .orbit-voice-waves i:nth-child(1) { height: 10px; animation-delay: 0s; }
-html[data-orbit-mobile="1"] .orbit-voice-waves i:nth-child(2) { height: 22px; animation-delay: 0.12s; }
-html[data-orbit-mobile="1"] .orbit-voice-waves i:nth-child(3) { height: 16px; animation-delay: 0.24s; }
-html[data-orbit-mobile="1"] .orbit-voice-waves i:nth-child(4) { height: 26px; animation-delay: 0.08s; }
-
-html[data-orbit-mobile="1"] .orbit-voice-mask.is-cancel .orbit-voice-waves i {
-  animation: none;
-  opacity: 0.55;
+html[data-orbit-mobile="1"] .orbit-voice-zone.is-transcribe {
+  right: 18px;
 }
 
-@keyframes orbit-voice-wave {
-  0%, 100% { transform: scaleY(0.45); opacity: 0.7; }
-  50% { transform: scaleY(1); opacity: 1; }
+html[data-orbit-mobile="1"] .orbit-voice-zone.is-active {
+  color: #fff;
+  transform: scale(1.04);
+}
+
+html[data-orbit-mobile="1"] .orbit-voice-zone.is-cancel.is-active {
+  background: #e45454;
+}
+
+html[data-orbit-mobile="1"] .orbit-voice-zone.is-transcribe.is-active {
+  background: #2bb673;
+}
+
+html[data-orbit-mobile="1"] .orbit-voice-hint {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 42%;
+  text-align: center;
+  color: #fff;
+  font-size: 15px;
+  font-weight: 650;
 }
 
 html[data-orbit-mobile="1"] .composer-wrap > .ant-popover:has(.emoji-popover) {
@@ -1252,7 +1274,7 @@ html[data-orbit-mobile="1"] .composer-wrap {
 }
 
 html[data-orbit-mobile="1"] .wechat-composer {
-  align-items: center;
+  align-items: end;
   grid-template-columns: 36px minmax(0, 1fr) 36px auto;
   gap: 6px;
   padding: 0;
@@ -1267,25 +1289,36 @@ html[data-orbit-mobile="1"] .wechat-composer .tool-button {
   height: 36px;
 }
 
-html[data-orbit-mobile="1"] .halo-composer-shell.is-compact {
+html[data-orbit-mobile="1"] .halo-composer-shell.is-compact,
+html[data-orbit-mobile="1"] .orbit-editor-hold {
   display: flex;
   align-items: center;
+  min-width: 0;
   min-height: 36px;
+  border: 0;
   border-radius: 6px;
+  background: #fff;
+  box-shadow: inset 0 0 0 1px #d0d5dd;
+  overflow: hidden;
+}
+
+html[data-orbit-mobile="1"] .wechat-composer .plain-composer {
+  background: #fff !important;
+  color: #1d2939;
 }
 
 html[data-orbit-mobile="1"] .halo-composer-shell.is-compact .halo-editor-surface {
   flex: 1;
   min-height: 36px !important;
-  max-height: 88px;
+  max-height: 234px;
   padding: 0 !important;
 }
 
 html[data-orbit-mobile="1"] .halo-composer-shell.is-compact .halo-editor-surface > .tiptap.ProseMirror,
 html[data-orbit-mobile="1"] .halo-composer-shell.is-compact .ProseMirror,
 html[data-orbit-mobile="1"] .wechat-composer .plain-composer {
-  min-height: 22px !important;
-  max-height: 88px;
+  min-height: 36px !important;
+  max-height: 234px;
   padding: 7px 12px !important;
   line-height: 22px;
 }
@@ -1301,8 +1334,8 @@ html[data-orbit-mobile="1"] .wechat-composer .send-button.ant-btn {
 
 html[data-orbit-mobile="1"] .orbit-hold-talk {
   height: 36px;
-  line-height: 36px;
-  padding: 0;
+  line-height: 1;
+  padding: 0 10px;
 }
 
 
@@ -1839,4 +1872,168 @@ html[data-orbit-mobile="1"] .orbit-forward-send:disabled {
 
 html[data-orbit-mobile="1"] .modal-backdrop.forward-backdrop {
   padding: 0;
+}
+
+
+html[data-orbit-mobile="1"] .voice-message {
+  width: min(280px, 78vw);
+  max-width: 100%;
+}
+html[data-orbit-mobile="1"] .message-row.me .voice-message {
+  margin-left: auto;
+}
+html[data-orbit-mobile="1"] .voice-transcript {
+  font-size: 14px;
+}
+html[data-orbit-mobile="1"] .voice-transcript-toggle,
+html[data-orbit-mobile="1"] .voice-transcript-retry,
+html[data-orbit-mobile="1"] .voice-transcript-actions button {
+  min-height: 32px;
+  padding: 4px 2px;
+}
+
+html[data-orbit-mobile="1"] .attachment-wrap:has(.voice-message) {
+  width: auto !important;
+  max-width: min(78vw, 280px) !important;
+}
+
+
+html[data-orbit-mobile="1"] .orbit-composer-left {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  align-self: stretch;
+  gap: 2px;
+  min-height: 36px;
+}
+html[data-orbit-mobile="1"] .wechat-composer.is-overflow .orbit-composer-left {
+  justify-content: space-between;
+}
+html[data-orbit-mobile="1"] .composer-expand-btn {
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  color: #475467;
+}
+html[data-orbit-mobile="1"] .halo-composer-shell.is-compact,
+html[data-orbit-mobile="1"] .orbit-editor-hold {
+  align-items: stretch;
+  align-self: end;
+  max-height: 234px;
+  overflow: hidden;
+}
+html[data-orbit-mobile="1"] .wechat-composer .plain-composer {
+  min-height: 36px !important;
+  max-height: 234px !important;
+  overflow-x: hidden;
+  resize: none;
+  field-sizing: fixed;
+  scrollbar-width: thin;
+}
+html[data-orbit-mobile="1"] .wechat-composer .plain-composer::-webkit-scrollbar {
+  width: 4px;
+}
+html[data-orbit-mobile="1"] .wechat-composer .plain-composer::-webkit-scrollbar-thumb {
+  border-radius: 99px;
+  background: #d0d5dd;
+}
+html[data-orbit-mobile="1"] .orbit-composer-full {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  padding-top: var(--orbit-safe-top);
+  padding-bottom: calc(var(--orbit-safe-bottom) + var(--orbit-keyboard));
+}
+html[data-orbit-mobile="1"] .orbit-composer-full.is-emoji-open {
+  padding-bottom: 0;
+}
+html[data-orbit-mobile="1"] .orbit-composer-full-close {
+  flex: 0 0 48px;
+  width: 48px;
+  height: 48px;
+  margin: 2px 4px 0;
+  padding: 0;
+  border: 0;
+  border-radius: 12px;
+  color: #1d2939;
+  background: transparent;
+  display: inline-grid;
+  place-items: center;
+}
+html[data-orbit-mobile="1"] .orbit-composer-full-close:active {
+  background: #f2f4f7;
+}
+html[data-orbit-mobile="1"] .orbit-composer-full-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  padding: 0 16px 8px;
+}
+html[data-orbit-mobile="1"] .orbit-composer-full-body .plain-composer {
+  flex: 1;
+  width: 100%;
+  height: 100% !important;
+  min-height: 0 !important;
+  max-height: none !important;
+  padding: 4px 0 12px !important;
+  border: 0;
+  outline: none;
+  resize: none;
+  box-shadow: none !important;
+  background: transparent !important;
+  color: #1d2939;
+  font-size: 16px;
+  line-height: 1.55;
+  overflow-y: auto;
+}
+html[data-orbit-mobile="1"] .orbit-composer-full-footer {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 8px 8px;
+}
+html[data-orbit-mobile="1"] .orbit-composer-full .composer-side-btn,
+html[data-orbit-mobile="1"] .orbit-composer-full .composer-emoji-button,
+html[data-orbit-mobile="1"] .orbit-composer-full .tool-button {
+  width: 40px;
+  min-width: 40px;
+  height: 40px;
+  color: #1d2939;
+}
+html[data-orbit-mobile="1"] .orbit-composer-full .orbit-emoji-panel {
+  width: 100%;
+  height: min(42vh, 320px);
+  margin: 0;
+  padding-bottom: var(--orbit-safe-bottom);
+  border-top: 1px solid #eceef2;
+}
+
+html[data-orbit-mobile="1"] .plain-composer[contenteditable="true"] {
+  white-space: pre-wrap;
+  word-break: break-word;
+  outline: none;
+}
+html[data-orbit-mobile="1"] .plain-composer.is-empty:before {
+  content: attr(data-placeholder);
+  color: #98a2b3;
+  pointer-events: none;
+}
+html[data-orbit-mobile="1"] .plain-composer .composer-emoji-chip {
+  display: inline-block;
+  width: 22px;
+  height: 22px;
+  margin: 0 1px;
+  vertical-align: -5px;
+}
+html[data-orbit-mobile="1"] .plain-composer .composer-emoji-chip img {
+  width: 22px;
+  height: 22px;
+  object-fit: contain;
+  pointer-events: none;
 }
