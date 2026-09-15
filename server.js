@@ -10,7 +10,7 @@ const AIHUBMIX_TRANSCRIBE_URLS = [
 ];
 
 async function transcribeWithAiHubMix(bytes, filename, mime) {
-  const safeName = String(filename || "audio.webm").replace(/[^A-Za-z0-9._-]/g, "_") || "audio.webm";
+  const safeName = String(filename || "audio.wav").replace(/[^A-Za-z0-9._-]/g, "_") || "audio.wav";
   const type = String(mime || "application/octet-stream").split(";")[0] || "application/octet-stream";
   let lastError = null;
   for (const url of AIHUBMIX_TRANSCRIBE_URLS) {
@@ -24,7 +24,7 @@ async function transcribeWithAiHubMix(bytes, filename, mime) {
         method: "POST",
         headers: { Authorization: `Bearer ${AIHUBMIX_API_KEY}` },
         body: form,
-        signal: AbortSignal.timeout(60000),
+        signal: AbortSignal.timeout(18000),
       });
       const text = await upstream.text();
       if (upstream.ok || upstream.status < 500) return { status: upstream.status, text };

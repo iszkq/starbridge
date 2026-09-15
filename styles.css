@@ -200,7 +200,7 @@ button { cursor: pointer; }
 .relation-context-arrow { margin-left: 3px; color: #98a2b3; font-size: 16px; line-height: 16px; }
 .relation-thread { border-left-color: #8c9cf4; background: #f5f4ff; }
 .relation-thread .relation-context-label { color: #5b5fc7; }
-.message-emoji-image { width: auto !important; max-width: none !important; max-height: 40px !important; height: 40px !important; padding: 0; border: 0; background: transparent; object-fit: contain; }
+.message-emoji-image { width: auto !important; max-width: 40px !important; max-height: 40px !important; height: auto !important; padding: 0; border: 0; background: transparent; object-fit: contain; }
 .message-emoji-image + .attachment-caption { display: none; }
 
 /* Emoji-only sends may be several Matrix image events when they contain
@@ -217,7 +217,7 @@ button { cursor: pointer; }
 .message-row.emoji-message-row .attachment-wrap { width: auto; margin: 0; }
 .message-row.emoji-message-row .message-image { margin: 0; }
 .message-emoji-row-media { display: inline-flex; align-items: center; gap: 4px; max-width: min(100%, 560px); overflow-x: auto; padding: 0; }
-.message-emoji-tile { width: 40px; height: 40px; object-fit: contain; flex: 0 0 40px; cursor: pointer; border-radius: 6px; }
+.message-emoji-tile { width: 40px; height: 40px; object-fit: contain; flex: 0 0 auto; cursor: pointer; border-radius: 4px; }
 .document-update-hint { margin-top: 3px; color: var(--muted-text, #7b8494); font-size: 11px; line-height: 1.35; }
 
 .emoji-browser { display: grid; grid-template-columns: 118px minmax(0, 1fr); gap: 10px; margin-top: 10px; min-height: 280px; }
@@ -371,8 +371,8 @@ button { cursor: pointer; }
 .editor-emoji-chip { display: inline-flex; align-items: center; gap: 3px; margin: 0 2px; padding: 1px 4px; border-radius: 5px; vertical-align: -4px; background: #f2f4f7; color: #667085; font-size: 11px; user-select: text; -webkit-user-drag: element; cursor: pointer; }
 .ProseMirror-selectednode.editor-emoji-chip { outline: 2px solid #91b4ff; outline-offset: 1px; background: #e8f1ff; }
 .editor-emoji-chip img { width: 24px; height: 24px; object-fit: contain; }
-.formatted-message img { width: 42px; height: 42px; object-fit: contain; vertical-align: middle; margin: 0 2px; }
-.formatted-message { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 2px; min-height: 44px; }
+.formatted-message img:not(.inline-message-emoji) { width: auto; height: auto; object-fit: contain; vertical-align: middle; margin: 0 2px; }
+.formatted-message { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 2px; }
 .send-button.ant-btn { height: 32px; border-radius: 6px; padding: 0 16px; }
 .details-title-actions .ant-btn { min-width: 48px; border-radius: 6px; }
 .details-title-actions .ant-btn-dangerous { color: #ff4d4f; }
@@ -482,9 +482,28 @@ button { cursor: pointer; }
 
 /* Message detail surfaces */
 .message-bubble { white-space: pre-wrap; }
-.inline-message-emoji { width: 30px; height: 30px; object-fit: contain; display: inline-block; vertical-align: -8px; margin: 0 2px; }
+.inline-message-emoji { width: 40px; height: 40px; object-fit: contain; display: inline-block; vertical-align: -10px; margin: 0 1px; }
 .formatted-message { white-space: normal; line-height: 1.55; }
 .formatted-message .inline-message-image, .formatted-message img { max-width: min(480px, 60vw); max-height: 360px; object-fit: contain; cursor: zoom-in; border-radius: 6px; vertical-align: middle; }
+.formatted-message img.inline-message-emoji,
+.message-bubble img.inline-message-emoji {
+  width: 40px !important;
+  height: 40px !important;
+  max-width: 40px !important;
+  max-height: 40px !important;
+  margin: 0 1px;
+  vertical-align: -3px;
+  border-radius: 0;
+  cursor: default;
+}
+.message-bubble.emoji-only-bubble,
+.message-row.me .message-bubble.emoji-only-bubble {
+  padding: 0;
+  min-height: 0;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
 .inline-media-placeholder { display: inline-block; width: 36px; height: 30px; color: #98a2b3; text-align: center; }
 .reply-reference { display: flex; align-items: center; gap: 9px; width: min(520px, 100%); margin-top: 6px; padding: 7px 10px; border: 1px solid #dbe7fb; border-left: 3px solid #3370ff; border-radius: 8px; background: linear-gradient(90deg,#f5f8ff,#fbfcff); box-shadow: none; }
 .reply-reference:hover { background: #edf4ff; border-color: #b7d3ff; box-shadow: 0 2px 8px rgba(51,112,255,.1); }
@@ -1217,7 +1236,7 @@ button { cursor: pointer; }
 .message-actions > button:nth-of-type(3)::before { content: "✎"; font-size: 13px; }
 .message-actions > button:nth-of-type(4)::before { content: "↶"; font-size: 14px; }
 .message-actions > button:hover { color: #356df3; background: #eaf1ff; }
-.document-card { width: 320px; min-width: 320px; max-width: calc(100vw - 32px); padding: 14px 15px 0; }
+.document-card { width: min(320px, 100%); min-width: 0; max-width: 100%; padding: 14px 15px 0; }
 .attachment-wrap { max-width: min(100%, 560px); align-self: flex-start; }
 .message-row.me .attachment-wrap { align-self: flex-end; }
 .message-image { max-width: min(420px, 100%); }
@@ -1765,8 +1784,8 @@ button { cursor: pointer; }
 .document-card .document-main { text-align: left; }
 .document-card .document-actions { text-align: center; }
 .document-card:has(.document-icon-file) {
-  width: 292px;
-  min-width: 292px;
+  width: min(292px, 100%);
+  min-width: 0;
 }
 .document-card:has(.document-icon-file) .document-icon {
   background: #64748b;

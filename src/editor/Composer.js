@@ -20,8 +20,8 @@ function composerEmojiSrc(item) {
   const url = String(item?.url || "");
   const thumb = String(item?.thumbUrl || "");
   const mime = String(item?.mimeType || item?.mimetype || "").toLowerCase();
-  if (mime.includes("gif") || mime.includes("webp") || mime.includes("apng") || /\.(gif|webp)(?:$|\?)/i.test(url)) return url || thumb;
-  return thumb || url;
+  if (mime.includes("gif") || mime.includes("webp") || mime.includes("apng") || /\.(gif|webp|apng|avif)(?:$|\?)/i.test(url) || /\.(gif|webp|apng|avif)(?:$|\?)/i.test(thumb)) return url || thumb;
+  return url || thumb;
 }
 
 function trailingEmojiQuery(before, item, query) {
@@ -29,6 +29,9 @@ function trailingEmojiQuery(before, item, query) {
   const explicit = String(query || "").trim();
   const tail = String(before || "").match(/(:[^:\s]*|[^\s]+)$/)?.[0] || "";
   if (!tail) return "";
+  // A completed :shortcode: chip is already an emoji atom. Never treat it as
+  // an unfinished query, otherwise inserting the next emoji deletes the last one.
+  if (/^:[^:\s]+:$/.test(tail)) return "";
   const tailBare = tail.replace(/^:+|:+$/g, "").toLowerCase();
   if (tail.startsWith(":") && (!tailBare || name.startsWith(tailBare))) return tail;
   if (explicit && tailBare === explicit.toLowerCase() && (!name || name.startsWith(tailBare) || tailBare.length <= 12)) return tail;
@@ -183,7 +186,7 @@ export const PlainComposer = React.forwardRef(function PlainComposer({ value, on
       const remove = trailingEmojiQuery(current, item, query);
       const before = remove && current.endsWith(remove) ? current.slice(0, current.length - remove.length) : current;
       const next = `${before}${token} `;
-      onChange?.(next, htmlFromPlainComposer(next, emojiFallbackItems));
+      onChange?.(next, htmlFromPlainComposer(next, [item, ...emojiFallbackItems]));
       requestAnimationFrame(() => {
         node?.focus();
         placePlainComposerCaret(node, before.length + token.length + 1);
@@ -247,6 +250,12 @@ export const PlainComposer = React.forwardRef(function PlainComposer({ value, on
 
 function editorLeafText(node) {
   if (node?.type?.name === "orbitEmoji") return node.attrs?.token || `:${node.attrs?.name || "表情"}:`;
+  if (node?.type?.name === "hardBreak") return "\n";
+  return "";
+}
+
+function editorQueryLeafText(node) {
+  if (node?.type?.name === "orbitEmoji") return "\uFFFC";
   if (node?.type?.name === "hardBreak") return "\n";
   return "";
 }
@@ -426,23 +435,18 @@ export const HaloComposer = React.forwardRef(function HaloComposer({ value, onCh
       const name = String(item.name || item.shortcode || "表情").replace(/^:+|:+$/g, "");
       const token = `:${name}:`;
       const src = composerEmojiSrc(item);
-      const fullText = serializeEditorText(editor);
       let from = editor.state.selection.from;
       let to = editor.state.selection.to;
-      if (replaceQuery) {
-        const explicit = String(query || "").trim();
-        if (explicit && new RegExp(`${explicit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "iu").test(fullText)) {
-          const queryMatch = fullText.match(new RegExp(`${explicit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "iu"));
-          const removeLength = queryMatch?.[0]?.length || explicit.length;
-          const docEnd = Math.max(1, editor.state.doc.content.size - 1);
-          to = docEnd;
-          from = Math.max(0, to - removeLength);
-          const textBeforeQuery = fullText.slice(0, Math.max(0, fullText.length - removeLength));
-          if (textBeforeQuery.endsWith(":")) from -= 1;
-        } else {
-          const before = editor.state.doc.textBetween(0, editor.state.selection.from, "\n", editorLeafText);
-          const match = before.match(/(?:^|\s)(?::[^:\s]*|[\p{L}\p{N}_-]{1,32})$/u);
-          if (match) from -= match[0].length - (match[0].startsWith(" ") ? 1 : 0);
+      if (replaceQuery && from === to) {
+        // Measure only the text immediately before the caret. Emoji atoms are
+        // replaced with a single placeholder so a previous :shortcode: cannot
+        // be mistaken for an unfinished query, and string length stays aligned
+        // with ProseMirror positions.
+        const before = editor.state.doc.textBetween(0, from, "\n", editorQueryLeafText).replace(/\uFFFC/g, " ");
+        const remove = trailingEmojiQuery(before, item, query);
+        if (remove) {
+          const start = editor.state.selection.$from.start();
+          from = Math.max(start, from - remove.length);
         }
       }
       const chain = editor.chain().focus();
