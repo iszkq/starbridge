@@ -892,7 +892,6 @@ html[data-orbit-mobile="1"] .sync-indicator { top: calc(10px + var(--orbit-safe-
 
 html[data-orbit-mobile="1"].is-orbit-lightbox,
 html[data-orbit-mobile="1"].is-orbit-lightbox body {
-  touch-action: none;
   overflow: hidden;
 }
 html[data-orbit-mobile="1"].is-orbit-swiping-back,
@@ -903,14 +902,38 @@ html[data-orbit-mobile="1"] .media-lightbox {
   padding: calc(10px + var(--orbit-safe-top)) 12px calc(12px + var(--orbit-safe-bottom));
   gap: 8px;
   overflow: hidden;
-  touch-action: none;
   overscroll-behavior: none;
+}
+html[data-orbit-mobile="1"] .media-lightbox-toolbar,
+html[data-orbit-mobile="1"] .media-lightbox-actions,
+html[data-orbit-mobile="1"] .media-lightbox-toolbar .ant-btn,
+html[data-orbit-mobile="1"] .media-lightbox-close {
+  pointer-events: auto;
+  touch-action: manipulation;
 }
 html[data-orbit-mobile="1"] .media-lightbox-toolbar {
   position: relative;
-  z-index: 30;
+  z-index: 50;
   width: 100%;
   flex: 0 0 auto;
+}
+html[data-orbit-mobile="1"] .media-lightbox-edge {
+  top: 72px;
+  z-index: 40;
+  width: 52px;
+  opacity: 1;
+  pointer-events: none;
+}
+html[data-orbit-mobile="1"] .media-lightbox-edge-prev { left: 4px; }
+html[data-orbit-mobile="1"] .media-lightbox-edge-next { right: 4px; }
+html[data-orbit-mobile="1"] .media-lightbox-edge button {
+  pointer-events: auto;
+  touch-action: manipulation;
+  width: 44px;
+  height: 44px;
+  font-size: 30px;
+  opacity: 1;
+  background: rgba(0, 0, 0, .55);
 }
 html[data-orbit-mobile="1"] .media-lightbox-stage {
   width: 100%;

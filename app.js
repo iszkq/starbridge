@@ -34,7 +34,7 @@ window.fetch = (input, init) => {
 };
 
 installOrbitMobile();
-const ORBIT_APP_VERSION = "332";
+const ORBIT_APP_VERSION = "334";
 window.orbitAppVersion = ORBIT_APP_VERSION;
 const { Input: AntInput, Avatar: AntAvatar, Button: AntButton, Popover: AntPopover, Checkbox: AntCheckbox, message: antMessage } = Antd;
 const TextArea = AntInput.TextArea;
@@ -2278,10 +2278,15 @@ function MediaLightbox({ viewer, onClose }) {
     const viewport = document.querySelector("meta[name=\"viewport\"]");
     const prevViewport = viewport?.getAttribute("content") || "";
     if (viewport && !/maximum-scale/.test(prevViewport)) viewport.setAttribute("content", prevViewport + ", maximum-scale=1, user-scalable=no");
+    const isChromeTarget = event => event.target?.closest?.(".media-lightbox-toolbar, .media-lightbox-edge, .ant-btn");
     const preventBrowserZoom = event => {
-      if (event.touches?.length > 1 || scaleRef.current > 1) event.preventDefault();
+      if (isChromeTarget(event)) return;
+      if (event.touches?.length > 1 || (event.type === "touchmove" && scaleRef.current > 1)) event.preventDefault();
     };
-    const preventGesture = event => event.preventDefault();
+    const preventGesture = event => {
+      if (isChromeTarget(event)) return;
+      event.preventDefault();
+    };
     const pointerList = () => [...pointersRef.current.values()];
     const onPointerDown = event => {
       if (event.pointerType === "mouse" && event.button !== 0) return;
@@ -2347,11 +2352,11 @@ function MediaLightbox({ viewer, onClose }) {
       else setDraggingClass(false);
       gestureRef.current = null;
     };
-    overlay.addEventListener("touchstart", preventBrowserZoom, { passive: false });
-    overlay.addEventListener("touchmove", preventBrowserZoom, { passive: false });
-    overlay.addEventListener("gesturestart", preventGesture, { passive: false });
-    overlay.addEventListener("gesturechange", preventGesture, { passive: false });
-    overlay.addEventListener("gestureend", preventGesture, { passive: false });
+    stage.addEventListener("touchstart", preventBrowserZoom, { passive: false });
+    stage.addEventListener("touchmove", preventBrowserZoom, { passive: false });
+    stage.addEventListener("gesturestart", preventGesture, { passive: false });
+    stage.addEventListener("gesturechange", preventGesture, { passive: false });
+    stage.addEventListener("gestureend", preventGesture, { passive: false });
     stage.addEventListener("pointerdown", onPointerDown);
     window.addEventListener("pointermove", onPointerMove, { passive: false });
     window.addEventListener("pointerup", onPointerUp);
@@ -2359,11 +2364,11 @@ function MediaLightbox({ viewer, onClose }) {
     return () => {
       root.classList.remove("is-orbit-lightbox");
       if (viewport) viewport.setAttribute("content", prevViewport);
-      overlay.removeEventListener("touchstart", preventBrowserZoom);
-      overlay.removeEventListener("touchmove", preventBrowserZoom);
-      overlay.removeEventListener("gesturestart", preventGesture);
-      overlay.removeEventListener("gesturechange", preventGesture);
-      overlay.removeEventListener("gestureend", preventGesture);
+      stage.removeEventListener("touchstart", preventBrowserZoom);
+      stage.removeEventListener("touchmove", preventBrowserZoom);
+      stage.removeEventListener("gesturestart", preventGesture);
+      stage.removeEventListener("gesturechange", preventGesture);
+      stage.removeEventListener("gestureend", preventGesture);
       stage.removeEventListener("pointerdown", onPointerDown);
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerup", onPointerUp);
@@ -2377,8 +2382,8 @@ function MediaLightbox({ viewer, onClose }) {
   const moveDrag = event => { if (!gestureRef.current || gestureRef.current.type !== "pan" || pointersRef.current.size) return; paint(scaleRef.current, { x: gestureRef.current.offset.x + event.clientX - gestureRef.current.x, y: gestureRef.current.offset.y + event.clientY - gestureRef.current.y }); };
   const endDrag = () => { if (pointersRef.current.size) return; if (gestureRef.current?.type === "pan") commit(); else setDraggingClass(false); };
   return createPortal(h("div", { ref: overlayRef, className: "media-lightbox", role: "dialog", "aria-modal": "true", onMouseDown: event => event.target === event.currentTarget && close(event) },
-    h("div", { className: "media-lightbox-toolbar", onMouseDown: event => event.stopPropagation(), onClick: event => event.stopPropagation() }, h("span", null, viewer.gallery?.length > 1 ? (Number(viewer.index) + 1) + "/" + viewer.gallery.length + " · " : "", viewer.alt || "图片预览"), h("div", { className: "media-lightbox-actions" }, h(UiButton, { size: "small", htmlType: "button", title: "缩小", onClick: () => adjustScale(-0.2) }, "−"), h("span", { ref: zoomLabelRef, className: "media-zoom-value" }, Math.round(scale * 100) + "%"), h(UiButton, { size: "small", htmlType: "button", title: "放大", onClick: () => adjustScale(0.2) }, "+"), h(UiButton, { size: "small", htmlType: "button", title: "重置缩放", onClick: () => { setScale(1); setOffset({ x: 0, y: 0 }); } }, "1:1"), h(UiButton, { size: "small", htmlType: "button", onClick: () => setRotation(value => value - 90) }, "↶"), h(UiButton, { size: "small", htmlType: "button", onClick: () => setRotation(value => value + 90) }, "↷"), h(UiButton, { size: "small", htmlType: "button", className: "media-lightbox-close", onClick: close }, "关闭"))),
-    viewer.gallery?.length > 1 && h(React.Fragment, null, h("div", { className: "media-lightbox-edge media-lightbox-edge-prev" }, h("button", { type: "button", onClick: () => navigate(-1), "aria-label": "上一张", title: "上一张" }, "‹")), h("div", { className: "media-lightbox-edge media-lightbox-edge-next" }, h("button", { type: "button", onClick: () => navigate(1), "aria-label": "下一张", title: "下一张" }, "›"))),
+    h("div", { className: "media-lightbox-toolbar", onPointerDown: event => event.stopPropagation(), onMouseDown: event => event.stopPropagation(), onClick: event => event.stopPropagation() }, h("span", null, viewer.gallery?.length > 1 ? (Number(viewer.index) + 1) + "/" + viewer.gallery.length + " · " : "", viewer.alt || "图片预览"), h("div", { className: "media-lightbox-actions" }, viewer.gallery?.length > 1 && h(UiButton, { size: "small", htmlType: "button", title: "上一张", onClick: () => navigate(-1) }, "‹"), viewer.gallery?.length > 1 && h(UiButton, { size: "small", htmlType: "button", title: "下一张", onClick: () => navigate(1) }, "›"), h(UiButton, { size: "small", htmlType: "button", title: "缩小", onClick: () => adjustScale(-0.2) }, "−"), h("span", { ref: zoomLabelRef, className: "media-zoom-value" }, Math.round(scale * 100) + "%"), h(UiButton, { size: "small", htmlType: "button", title: "放大", onClick: () => adjustScale(0.2) }, "+"), h(UiButton, { size: "small", htmlType: "button", title: "重置缩放", onClick: () => { setScale(1); setOffset({ x: 0, y: 0 }); } }, "1:1"), h(UiButton, { size: "small", htmlType: "button", onClick: () => setRotation(value => value - 90) }, "↶"), h(UiButton, { size: "small", htmlType: "button", onClick: () => setRotation(value => value + 90) }, "↷"), h(UiButton, { size: "small", htmlType: "button", className: "media-lightbox-close", onClick: close }, "关闭"))),
+    viewer.gallery?.length > 1 && h(React.Fragment, null, h("div", { className: "media-lightbox-edge media-lightbox-edge-prev", onPointerDown: event => event.stopPropagation() }, h("button", { type: "button", onPointerDown: event => event.stopPropagation(), onClick: event => { event.preventDefault(); event.stopPropagation(); navigate(-1); }, "aria-label": "上一张", title: "上一张" }, "‹")), h("div", { className: "media-lightbox-edge media-lightbox-edge-next", onPointerDown: event => event.stopPropagation() }, h("button", { type: "button", onPointerDown: event => event.stopPropagation(), onClick: event => { event.preventDefault(); event.stopPropagation(); navigate(1); }, "aria-label": "下一张", title: "下一张" }, "›"))),
     h("div", { ref: stageRef, className: "media-lightbox-stage", onWheel: event => { event.preventDefault(); adjustScale(event.deltaY > 0 ? -0.1 : 0.1); }, onMouseDown: event => event.target === event.currentTarget ? close(event) : beginDrag(event), onMouseMove: moveDrag, onMouseUp: endDrag, onMouseLeave: endDrag }, h("img", { ref: imageRef, className: "media-lightbox-image", src: viewer.src, alt: viewer.alt || "图片预览", draggable: false }))), document.body);
 }
 
