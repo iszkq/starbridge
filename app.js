@@ -34,7 +34,7 @@ window.fetch = (input, init) => {
 };
 
 installOrbitMobile();
-const ORBIT_APP_VERSION = "340";
+const ORBIT_APP_VERSION = "341";
 window.orbitAppVersion = ORBIT_APP_VERSION;
 const { Input: AntInput, Avatar: AntAvatar, Button: AntButton, Popover: AntPopover, Checkbox: AntCheckbox, message: antMessage } = Antd;
 const TextArea = AntInput.TextArea;
@@ -863,15 +863,18 @@ async function decodeOggOpusWithWorker(blob) {
   });
 }
 
-async function transcodeVoiceToWavUrl(src) {
+async function transcodeVoiceToWavUrl(src, declaredMime = "") {
   const blob = src instanceof Blob ? src : await fetch(src).then(response => {
     if (!response.ok) throw new Error("语音加载失败");
     return response.blob();
   });
+  const audio = await normalizeAudioBlob(blob, declaredMime);
   let decoded = null;
-  try { decoded = await decodeAudioToMono(blob); }
-  catch {
-    decoded = await decodeOggOpusWithWorker(blob);
+  try { decoded = await decodeAudioToMono(audio); }
+  catch (error) {
+    const header = new Uint8Array(await audio.slice(0, 32).arrayBuffer());
+    if (sniffAudioMime(header, "") === "audio/ogg") decoded = await decodeOggOpusWithWorker(audio);
+    else throw error;
   }
   const wav = encodeWavFile(decoded.samples, decoded.sampleRate, decoded.durationMs);
   return URL.createObjectURL(wav);
@@ -962,14 +965,54 @@ function writeCachedVoiceText(eventId, value) {
     localStorage.setItem(VOICE_TEXT_STORE, JSON.stringify(store));
   } catch {}
 }
+function audioMimeFromName(name) {
+  const text = String(name || "").toLowerCase();
+  if (/\.(?:m4a|aac|mp4)(?:$|\?)/.test(text)) return "audio/mp4";
+  if (/\.(?:mp3|mpga)(?:$|\?)/.test(text)) return "audio/mpeg";
+  if (/\.wav(?:$|\?)/.test(text)) return "audio/wav";
+  if (/\.(?:ogg|opus)(?:$|\?)/.test(text)) return "audio/ogg";
+  if (/\.webm(?:$|\?)/.test(text)) return "audio/webm";
+  if (/\.amr(?:$|\?)/.test(text)) return "audio/amr";
+  if (/\.flac(?:$|\?)/.test(text)) return "audio/flac";
+  if (/\.3gp(?:$|\?)/.test(text)) return "audio/3gpp";
+  return "";
+}
+
+function sniffMp4AudioMime(data) {
+  if (data.length < 12) return "";
+  if (!(data[4] === 0x66 && data[5] === 0x74 && data[6] === 0x79 && data[7] === 0x70)) return "";
+  return "audio/mp4";
+}
+
 function sniffAudioMime(bytes, fallback = "") {
   const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
-  if (data.length >= 12 && data[0] === 0x52 && data[1] === 0x49 && data[2] === 0x46 && data[3] === 0x46 && data[8] === 0x57 && data[9] === 0x41 && data[10] === 0x56 && data[11] === 0x45) return "audio/wav";
-  if (data.length >= 4 && data[0] === 0x4f && data[1] === 0x67 && data[2] === 0x67 && data[3] === 0x53) return "audio/ogg";
+  const ascii = (start, length = 4) => String.fromCharCode(...data.slice(start, start + length));
+  if (data.length >= 12 && ascii(0) === "RIFF" && ascii(8) === "WAVE") return "audio/wav";
+  if (data.length >= 4 && ascii(0) === "OggS") return "audio/ogg";
+  if (data.length >= 4 && ascii(0) === "fLaC") return "audio/flac";
+  if (data.length >= 4 && ascii(0) === "caff") return "audio/x-caf";
+  if (data.length >= 5 && ascii(0, 5).startsWith("#!AMR")) return "audio/amr";
   if (data.length >= 3 && data[0] === 0x49 && data[1] === 0x44 && data[2] === 0x33) return "audio/mpeg";
-  if (data.length >= 2 && data[0] === 0xff && (data[1] & 0xe0) === 0xe0) return "audio/mpeg";
   if (data.length >= 4 && data[0] === 0x1a && data[1] === 0x45 && data[2] === 0xdf && data[3] === 0xa3) return "audio/webm";
+  const mp4 = sniffMp4AudioMime(data);
+  if (mp4) return mp4;
+  if (data.length >= 2 && data[0] === 0xff && (data[1] & 0xf6) === 0xf0) return "audio/aac";
+  if (data.length >= 2 && data[0] === 0xff && (data[1] & 0xe0) === 0xe0) return "audio/mpeg";
   return fallback;
+}
+
+function declaredAudioMime(value) {
+  const type = String(value || "").split(";")[0].trim().toLowerCase();
+  return type.startsWith("audio/") ? type : "";
+}
+
+async function normalizeAudioBlob(blob, declaredMime = "") {
+  if (!blob) return blob;
+  const header = new Uint8Array(await blob.slice(0, 32).arrayBuffer());
+  const type = sniffAudioMime(header, "") || declaredAudioMime(declaredMime) || declaredAudioMime(blob.type) || audioMimeFromName(blob.name || declaredMime) || blob.type || "application/octet-stream";
+  if (blob.type === type) return blob;
+  try { if (blob.name) return new File([blob], blob.name, { type }); } catch {}
+  return new Blob([blob], { type });
 }
 
 function sniffImageMime(bytes, fallback = "") {
@@ -1906,11 +1949,11 @@ function useMatrixAsset(client, rawUrl, width = null, height = null, resizeMetho
           if (response.ok) {
             const buffer = await response.arrayBuffer();
             const declaredMime = String(encryptedInfo?.mimetype || response.headers.get("content-type") || "application/octet-stream").split(";")[0];
-            const header = new Uint8Array(buffer.slice(0, 16));
+            const header = new Uint8Array(buffer.slice(0, 32));
             const mimeType = sniffImageMime(header, "") || sniffAudioMime(header, declaredMime) || declaredMime;
             const plainBuffer = encrypted ? await decryptMatrixBuffer(buffer, encryptedInfo) : buffer;
-            const plainHeader = encrypted ? new Uint8Array(plainBuffer.slice(0, 16)) : header;
-            const plainMime = sniffImageMime(plainHeader, "") || sniffAudioMime(plainHeader, mimeType) || mimeType;
+            const plainHeader = encrypted ? new Uint8Array(plainBuffer.slice(0, 32)) : header;
+            const plainMime = sniffImageMime(plainHeader, "") || sniffAudioMime(plainHeader, audioMimeFromName(encryptedInfo?.name) || mimeType) || mimeType;
             const blob = new Blob([plainBuffer], { type: plainMime });
             return { src: URL.createObjectURL(blob), url: candidate, objectUrl: true, refs: 0, lastUsed: Date.now() };
           }
@@ -3769,11 +3812,11 @@ function eventToMessage(event, room, userId) {
       return {
         name: content.body,
         url: content.url || content.file?.url,
-        file: content.file ? { ...content.file, mimetype: content.info?.mimetype, size: content.info?.size } : null,
+        file: content.file ? { ...content.file, mimetype: content.info?.mimetype || content.file?.mimetype || content["org.matrix.msc1767.file"]?.mimetype, size: content.info?.size || content.file?.size } : null,
         info: content.info || null,
         emoji,
         sticker,
-        type: sticker || (msgtype === "m.file" && asImage) ? "m.image" : msgtype,
+        type: sticker || (msgtype === "m.file" && asImage) ? "m.image" : (msgtype === "m.file" && (String(content.info?.mimetype || content.file?.mimetype || content["org.matrix.msc1767.file"]?.mimetype || "").toLowerCase().startsWith("audio/") || /\.(?:ogg|opus|mp3|mp4|m4a|aac|wav|webm|amr|flac|3gp)$/i.test(String(content.body || content.filename || ""))) ? "m.audio" : msgtype),
       };
     })() : null,
   };
@@ -4600,8 +4643,8 @@ function VideoMessagePlayer({ src, poster, className = "", label = "视频文件
   );
 }
 
-function MediaPlayer({ src, poster, type = "video", className = "", label = "媒体文件", size = 0, durationMs = 0 }) {
-  if (type === "audio") return h(AudioMessagePlayer, { src, className, label, durationMs });
+function MediaPlayer({ src, poster, type = "video", className = "", label = "媒体文件", size = 0, durationMs = 0, mimeType = "" }) {
+  if (type === "audio") return h(AudioMessagePlayer, { src, className, label, durationMs, mimeType });
   if (type === "video") return h(VideoMessagePlayer, { src, poster, className, label, size });
   const ref = useRef(null);
   const playerRef = useRef(null);
@@ -4682,7 +4725,7 @@ function formatFileSize(value) {
   return `${amount >= 10 || power === 0 ? Math.round(amount) : amount.toFixed(1)} ${units[power]}`;
 }
 
-function AudioMessagePlayer({ src, className = "", label = "音频文件", durationMs = 0 }) {
+function AudioMessagePlayer({ src, className = "", label = "音频文件", durationMs = 0, mimeType = "" }) {
   const ref = useRef(null);
   const knownDuration = Number(durationMs) > 0 ? Number(durationMs) / 1000 : 0;
   const [playableSrc, setPlayableSrc] = useState(src || "");
@@ -4697,7 +4740,7 @@ function AudioMessagePlayer({ src, className = "", label = "音频文件", durat
   const fallbackToWav = async currentSrc => {
     if (!currentSrc || transcodeRef.current.src === currentSrc && transcodeRef.current.url) return transcodeRef.current.url;
     if (transcodeRef.current.pending) return transcodeRef.current.pending;
-    const pending = transcodeVoiceToWavUrl(currentSrc).then(url => {
+    const pending = transcodeVoiceToWavUrl(currentSrc, mimeType).then(url => {
       if (transcodeRef.current.url && transcodeRef.current.url !== url) URL.revokeObjectURL(transcodeRef.current.url);
       transcodeRef.current = { src: currentSrc, url, pending: null };
       return url;
@@ -4754,7 +4797,7 @@ function AudioMessagePlayer({ src, className = "", label = "音频文件", durat
       audio.removeEventListener("ended", pause);
       audio.removeEventListener("error", failed);
     };
-  }, [playableSrc, src, knownDuration]);
+  }, [playableSrc, src, knownDuration, mimeType]);
 
   const togglePlayback = async () => {
     const audio = ref.current;
@@ -5089,8 +5132,8 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
       h("span", { className: "message-image-meta" }, formatAttachmentSize(item.attachment.info?.size || item.attachment.file?.size) || "图片", h("i", null, item.isMe ? "已发送" : "已接收"))
     )
   ) : null;
-  const media = item.attachment && (imageMedia || fileUrl) && (imageMedia || item.attachment.type === "m.video" ? imageMedia || h(MediaPlayer, { type: "video", className: "message-video", src: fileUrl, poster: thumbUrl, label: item.attachment.name || "视频", size: item.attachment.info?.size || item.attachment.file?.size || 0 }) : item.attachment.type === "m.audio" ? h(MediaPlayer, { type: "audio", className: "message-audio", src: fileUrl, label: item.attachment.name || "音频", durationMs: item.attachment.info?.duration || item.attachment.info?.["org.matrix.msc1767.audio"]?.duration || 0 }) : null);
-  const fetchAttachmentBlob = async () => { if (!resolvedAssetUrl && !rawUrl) throw new Error("附件地址不可用"); const token = client?.getAccessToken?.(); const candidates = mediaRequestCandidates(client, rawUrl, resolvedAssetUrl); let lastError = null; for (const candidate of candidates) { try { const response = await fetch(candidate, { cache: "no-store", headers: token ? { Authorization: `Bearer ${token}` } : undefined }); if (response.ok) { const encryptedBuffer = await response.arrayBuffer(); const plainBuffer = await decryptMatrixBuffer(encryptedBuffer, item.attachment?.file); const declaredType = item.attachment?.file?.mimetype || item.attachment?.info?.mimetype || response.headers.get("content-type") || "application/octet-stream"; const sniffedType = sniffImageMime(new Uint8Array(plainBuffer.slice(0, 16)), "") || sniffAudioMime(new Uint8Array(plainBuffer.slice(0, 16)), declaredType) || declaredType; const blob = new Blob([plainBuffer], { type: sniffedType }); if (blob.size > 0) return blob; } lastError = new Error(`媒体请求失败（${response.status}）`); } catch (error) { lastError = error; } } throw lastError || new Error("媒体请求失败"); };
+  const media = item.attachment && (imageMedia || fileUrl) && (imageMedia || item.attachment.type === "m.video" ? imageMedia || h(MediaPlayer, { type: "video", className: "message-video", src: fileUrl, poster: thumbUrl, label: item.attachment.name || "视频", size: item.attachment.info?.size || item.attachment.file?.size || 0 }) : item.attachment.type === "m.audio" ? h(MediaPlayer, { type: "audio", className: "message-audio", src: fileUrl, label: item.attachment.name || "音频", mimeType: item.attachment.info?.mimetype || item.attachment.file?.mimetype || "", durationMs: item.attachment.info?.duration || item.attachment.info?.["org.matrix.msc1767.audio"]?.duration || 0 }) : null);
+  const fetchAttachmentBlob = async () => { if (!resolvedAssetUrl && !rawUrl) throw new Error("附件地址不可用"); const token = client?.getAccessToken?.(); const candidates = mediaRequestCandidates(client, rawUrl, resolvedAssetUrl); let lastError = null; for (const candidate of candidates) { try { const response = await fetch(candidate, { cache: "no-store", headers: token ? { Authorization: `Bearer ${token}` } : undefined }); if (response.ok) { const encryptedBuffer = await response.arrayBuffer(); const plainBuffer = await decryptMatrixBuffer(encryptedBuffer, item.attachment?.file); const declaredType = item.attachment?.file?.mimetype || item.attachment?.info?.mimetype || audioMimeFromName(item.attachment?.name) || response.headers.get("content-type") || "application/octet-stream"; const sniffedType = sniffImageMime(new Uint8Array(plainBuffer.slice(0, 32)), "") || sniffAudioMime(new Uint8Array(plainBuffer.slice(0, 32)), declaredType) || declaredType; const blob = new Blob([plainBuffer], { type: sniffedType }); if (blob.size > 0) return blob; } lastError = new Error(`媒体请求失败（${response.status}）`); } catch (error) { lastError = error; } } throw lastError || new Error("媒体请求失败"); };
   const transcribeVoiceMessage = async () => {
     if (item.attachment?.type !== "m.audio") return;
     if (voiceTextState === "ready" && voiceText) { setVoiceTextOpen(true); return; }
