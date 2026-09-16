@@ -19,16 +19,27 @@ export function installViewportInsets() {
   window.addEventListener("orientationchange", applyInsets);
   window.addEventListener("focusin", applyInsets);
   window.addEventListener("focusout", applyInsets);
-  if (typeof ResizeObserver === "function") {
-    const observer = new ResizeObserver(applyInsets);
-    const watch = () => {
-      const composer = document.querySelector(".composer-wrap");
-      if (composer) observer.observe(composer);
-    };
-    watch();
-    const mutations = new MutationObserver(watch);
-    mutations.observe(document.documentElement, { childList: true, subtree: true });
-  }
+  if (typeof ResizeObserver !== "function") return;
+  const observer = new ResizeObserver(applyInsets);
+  let observed = null;
+  let watchTimer = 0;
+  const watch = () => {
+    const composer = document.querySelector(".composer-wrap");
+    if (composer === observed) return;
+    if (observed) observer.unobserve(observed);
+    observed = composer || null;
+    if (composer) observer.observe(composer);
+  };
+  watch();
+  const mutations = new MutationObserver(() => {
+    if (watchTimer) return;
+    watchTimer = window.setTimeout(() => {
+      watchTimer = 0;
+      watch();
+      applyInsets();
+    }, 180);
+  });
+  mutations.observe(document.getElementById("root") || document.body, { childList: true, subtree: true });
 }
 
 export function seedOrbitHistory(view = "rooms") {
@@ -100,8 +111,8 @@ export function installSwipeBack() {
   let velocity = 0;
   let commitTimer = 0;
   let pointerId = null;
-  let clickGuard = false;
   let axis = null;
+  let swallowUntil = 0;
 
   const canSwipe = () => {
     if (!isOrbitMobile()) return false;
@@ -115,18 +126,14 @@ export function installSwipeBack() {
   const ignore = event => event.type.startsWith("touch") && "PointerEvent" in window;
 
   const swallowClick = event => {
+    if (Date.now() > swallowUntil) return;
+    swallowUntil = 0;
     event.preventDefault();
     event.stopPropagation();
   };
 
-  const armClickGuard = () => {
-    if (clickGuard) return;
-    clickGuard = true;
-    document.addEventListener("click", swallowClick, true);
-    window.setTimeout(() => {
-      document.removeEventListener("click", swallowClick, true);
-      clickGuard = false;
-    }, 420);
+  const armClickGuard = (ms = 80) => {
+    swallowUntil = Date.now() + ms;
   };
 
   const onStart = event => {
@@ -171,7 +178,6 @@ export function installSwipeBack() {
       }
       if (axis === "h" && dx > 16 && currentBackPanel()) {
         locked = true;
-        armClickGuard();
         document.documentElement.classList.add("is-orbit-swiping-back");
         document.documentElement.classList.remove("is-orbit-swiping-back-snap", "is-orbit-swiping-back-commit");
         try { event.target?.setPointerCapture?.(event.pointerId); } catch {}
@@ -192,18 +198,21 @@ export function installSwipeBack() {
       root.classList.remove("is-orbit-swiping-back");
       root.classList.add("is-orbit-swiping-back-snap");
       root.style.setProperty("--orbit-back-x", "0px");
-      window.setTimeout(resetBackSwipe, 220);
+      window.setTimeout(resetBackSwipe, 140);
       return;
     }
-    armClickGuard();
+    armClickGuard(90);
     root.classList.remove("is-orbit-swiping-back");
     root.classList.add("is-orbit-swiping-back-commit");
     root.style.setProperty("--orbit-back-x", `${window.innerWidth}px`);
     commitTimer = window.setTimeout(() => {
       commitTimer = 0;
-      resetBackSwipe();
       goOrbitBack();
-    }, 200);
+      window.requestAnimationFrame(() => {
+        resetBackSwipe();
+        armClickGuard(60);
+      });
+    }, 90);
   };
 
   const onEnd = event => {
@@ -222,6 +231,7 @@ export function installSwipeBack() {
     finish(x > threshold || (x > 40 && velocity > 0.28));
   };
 
+  document.addEventListener("click", swallowClick, true);
   document.addEventListener("touchstart", onStart, { passive: true });
   document.addEventListener("touchmove", onMove, { passive: false });
   document.addEventListener("touchend", onEnd, { passive: true });

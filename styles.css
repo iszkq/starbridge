@@ -1624,7 +1624,7 @@ button { cursor: pointer; }
 .pending-attachment-list { display: grid; gap: 2px; min-height: 110px; overflow-y: auto; padding: 4px 0 12px; }
 .pending-attachment { position: relative; display: flex; align-items: center; gap: 11px; min-height: 66px; padding: 8px 34px 8px 4px; border-bottom: 1px solid #f0f2f5; background: #fff; }
 .pending-attachment-thumb { width: 48px; height: 48px; flex: 0 0 48px; display: grid; place-items: center; overflow: hidden; border-radius: 6px; background: #eef3f9; }
-.pending-attachment-thumb img, .pending-attachment-thumb video { width: 100%; height: 100%; object-fit: cover; }
+.pending-attachment-thumb img, .pending-attachment-thumb video { width: 100%; height: 100%; object-fit: contain; background: #eef1f5; }
 .pending-file-icon { display: grid; place-items: center; width: 30px; height: 34px; border-radius: 5px; color: #fff; background: #7c8ca5; font-size: 11px; font-weight: 700; }
 .pending-file-icon.doc { background: #4285f4; } .pending-file-icon.pdf { background: #ea4335; } .pending-file-icon.xls { background: #34a853; } .pending-file-icon.ppt { background: #f29900; }
 .pending-attachment-info { min-width: 0; display: grid; gap: 3px; }

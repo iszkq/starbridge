@@ -46,7 +46,7 @@ function htmlFromPlainComposer(value, extraItems = []) {
     if (!item) return editorEscape(part).replace(/\n/g, "<br>");
     const token = `:${String(item.name || item.shortcode || match[1]).replace(/^:+|:+$/g, "")}:`;
     const src = composerEmojiSrc(item);
-    return `<span class="composer-emoji-chip" data-emoji-chip data-token="${editorEscape(token)}" contenteditable="false"><img draggable="false" src="${editorEscape(src)}" alt="${editorEscape(item.name || token)}"></span>`;
+    return `<span class="composer-emoji-chip" data-emoji-chip data-token="${editorEscape(token)}" data-mxc="${editorEscape(item.mxc || "")}" contenteditable="false"><img draggable="false" src="${editorEscape(src)}" alt="${editorEscape(item.name || token)}"></span>`;
   }).join("");
 }
 
@@ -178,7 +178,7 @@ export const PlainComposer = React.forwardRef(function PlainComposer({ value, on
       onChange?.(next, htmlFromPlainComposer(next, [item, ...emojiFallbackItems]));
       requestAnimationFrame(() => { node?.focus(); placePlainComposerCaret(node, next.length); });
     },
-    insertEmoji: (item, { query = "" } = {}) => {
+    insertEmoji: (item, { query = "", mxc = "" } = {}) => {
       const name = String(item?.name || item?.shortcode || "表情").replace(/^:+|:+$/g, "");
       const token = `:${name}:`;
       const node = nodeRef.current;
@@ -186,7 +186,8 @@ export const PlainComposer = React.forwardRef(function PlainComposer({ value, on
       const remove = trailingEmojiQuery(current, item, query);
       const before = remove && current.endsWith(remove) ? current.slice(0, current.length - remove.length) : current;
       const next = `${before}${token} `;
-      onChange?.(next, htmlFromPlainComposer(next, [item, ...emojiFallbackItems]));
+      const chipItem = { ...item, mxc: mxc || item.mxc || "" };
+      onChange?.(next, htmlFromPlainComposer(next, [chipItem, ...emojiFallbackItems]));
       requestAnimationFrame(() => {
         node?.focus();
         placePlainComposerCaret(node, before.length + token.length + 1);

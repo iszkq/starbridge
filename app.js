@@ -7,8 +7,8 @@ import * as MatrixSDK from "https://esm.sh/matrix-js-sdk@42.3.0?bundle&external=
 import { decodeRecoveryKey } from "https://esm.sh/matrix-js-sdk@42.3.0/lib/crypto-api/recovery-key?bundle";
 import { SlidingSync } from "https://esm.sh/matrix-js-sdk@42.3.0/lib/sliding-sync.js?bundle&external=@matrix-org/matrix-sdk-crypto-wasm";
 import Icon from "./src/ui/Icon.js?v=289";
-import { HaloComposer, PlainComposer } from "./src/editor/Composer.js?v=300";
-import { installOrbitMobile, isOrbitMobile, useOrbitMobile, longPressHandlers, mobileMessageGestures, setOrbitMobileView, pushOrbitHistory, installHorizontalDragScroll, goOrbitBack, seedOrbitHistory } from "./src/mobile/index.js?v=315";
+import { HaloComposer, PlainComposer } from "./src/editor/Composer.js?v=301";
+import { installOrbitMobile, isOrbitMobile, useOrbitMobile, longPressHandlers, mobileMessageGestures, setOrbitMobileView, pushOrbitHistory, installHorizontalDragScroll, goOrbitBack, seedOrbitHistory } from "./src/mobile/index.js?v=316";
 import {
   hasActiveMatrixRtcSession,
   parseRtcNotification,
@@ -83,6 +83,7 @@ const ORBIT_NOTIFICATION_WINDOW = 2200;
 const orbitEmojiUploadCache = new Map();
 const orbitStickerUploadCache = new Map();
 const orbitEmojiPackPublishCache = new Map();
+const orbitEmojiMxcIndex = new Map();
 const orbitMatrixAssetCache = new Map();
 const orbitMatrixAssetPending = new Map();
 const ORBIT_MATRIX_ASSET_CACHE_LIMIT = 320;
@@ -207,6 +208,153 @@ async function markRoomRead(client, roomId, event) {
   } else {
     await client.sendReadReceipt?.(event);
   }
+}
+
+const ORBIT_READ_STORAGE_KEY = "orbit.matrix.read-up-to";
+const orbitLocalReadRooms = new Map();
+const ORBIT_LIST_REQUIRED_STATE = [
+  ["m.room.create", ""],
+  ["m.room.name", ""],
+  ["m.room.avatar", ""],
+  ["m.room.canonical_alias", ""],
+  ["m.room.encryption", ""],
+  ["m.room.topic", ""],
+  ["m.room.member", "$ME"],
+  ["m.room.member", "$LAZY"],
+  ["org.matrix.msc3401.call.member", "*"],
+  ["m.call.member", "*"],
+  ["m.rtc.member", "*"],
+  ["m.space.child", "*"],
+  ["m.space.parent", "*"],
+];
+
+function loadOrbitLocalReadRooms() {
+  if (orbitLocalReadRooms.size) return;
+  try {
+    const raw = JSON.parse(localStorage.getItem(ORBIT_READ_STORAGE_KEY) || "{}");
+    Object.entries(raw || {}).forEach(([roomId, value]) => {
+      if (roomId && value?.eventId) orbitLocalReadRooms.set(roomId, { eventId: value.eventId, ts: Number(value.ts || 0) });
+    });
+  } catch {}
+}
+
+function persistOrbitLocalReadRooms() {
+  try {
+    const data = {};
+    orbitLocalReadRooms.forEach((value, roomId) => { data[roomId] = value; });
+    localStorage.setItem(ORBIT_READ_STORAGE_KEY, JSON.stringify(data));
+  } catch {}
+}
+
+function rememberOrbitRoomRead(roomId, event) {
+  const eventId = event?.getId?.();
+  if (!roomId || !eventId) return;
+  orbitLocalReadRooms.set(roomId, { eventId, ts: Number(event?.getTs?.() || Date.now()) });
+  persistOrbitLocalReadRooms();
+}
+
+function latestReadableEvent(room) {
+  const events = room?.getLiveTimeline?.().getEvents?.() || [];
+  return [...events].reverse().find(event => event?.getId?.() && !room.hasPendingEvent?.(event.getId()));
+}
+
+function isUnreadMessageEvent(event, myUserId) {
+  if (!event || event.isRedacted?.()) return false;
+  if (event.getSender?.() === myUserId) return false;
+  const type = event.getClearType?.() || event.getType?.();
+  if (event.getType?.() === "m.room.encrypted" && type === "m.room.encrypted") return true;
+  if (type === "m.sticker") return true;
+  if (type !== "m.room.message") return false;
+  const relation = (event.getClearContent?.() || event.getContent?.() || {})["m.relates_to"];
+  if (relation?.rel_type === "m.replace") return false;
+  return true;
+}
+
+function roomUnreadCount(room, client) {
+  const myUserId = client?.getUserId?.();
+  const events = room?.getLiveTimeline?.().getEvents?.() || [];
+  const last = room.getLastLiveEvent?.() || events[events.length - 1];
+  const localRead = orbitLocalReadRooms.get(room?.roomId);
+  if (localRead) {
+    if (last?.getId?.() === localRead.eventId) return 0;
+    if (Number(last?.getTs?.() || 0) <= Number(localRead.ts || 0)) return 0;
+    if (last?.getSender?.() === myUserId) return 0;
+  }
+  if (last?.getSender?.() === myUserId) return 0;
+  if (last?.getId?.() && myUserId && room.hasUserReadEvent?.(myUserId, last.getId())) return 0;
+  const readUpTo = myUserId ? room.getEventReadUpTo?.(myUserId, true) : null;
+  let count = 0;
+  let afterRead = !readUpTo;
+  for (const event of events) {
+    const id = event.getId?.();
+    if (!afterRead) {
+      if (id === readUpTo) afterRead = true;
+      continue;
+    }
+    if (isUnreadMessageEvent(event, myUserId)) count += 1;
+  }
+  if (!afterRead) {
+    count = events.filter(event => {
+      const id = event.getId?.();
+      if (!isUnreadMessageEvent(event, myUserId)) return false;
+      return !(id && room.hasUserReadEvent?.(myUserId, id));
+    }).length;
+  }
+  return count;
+}
+
+function createOrbitMatrixStore(session) {
+  const StoreClass = MatrixSDK.IndexedDBStore;
+  if (typeof StoreClass !== "function" || !globalThis.indexedDB || !session?.userId) return null;
+  try {
+    return new StoreClass({
+      indexedDB: globalThis.indexedDB,
+      dbName: "orbit-js-sdk:" + session.userId + ":" + (session.deviceId || "device"),
+      localStorage: globalThis.localStorage,
+    });
+  } catch (error) {
+    console.warn("无法创建 Matrix 本地缓存", error);
+    return null;
+  }
+}
+
+async function startupOrbitMatrixStore(store) {
+  if (!store?.startup || store.started) return store;
+  try {
+    await Promise.race([
+      store.startup(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("IndexedDB 启动超时")), 4000)),
+    ]);
+  } catch (error) {
+    console.warn("Matrix 本地缓存启动失败，将改为网络同步", error);
+  }
+  return store;
+}
+
+function orbitStartClientOpts(extra = {}) {
+  return {
+    initialSyncLimit: 20,
+    lazyLoadMembers: true,
+    pendingEventOrdering: MatrixSDK.PendingEventOrdering?.Detached || "detached",
+    ...extra,
+  };
+}
+
+function subscribeOrbitSlidingRoom(client, roomId) {
+  const sliding = client?.__orbitSlidingSync;
+  if (!sliding || !roomId) return;
+  try {
+    const current = new Set(sliding.getRoomSubscriptions?.() || []);
+    if (current.has(roomId)) return;
+    current.add(roomId);
+    sliding.modifyRoomSubscriptions?.(current);
+  } catch {}
+}
+
+async function prepareOrbitClient(client) {
+  loadOrbitLocalReadRooms();
+  await startupOrbitMatrixStore(client?.store);
+  return client;
 }
 
 function roomAvatarMxc(room) {
@@ -343,19 +491,10 @@ function buildVoiceWaveform(samples, buckets = 64) {
   return waveform;
 }
 
-let opusWorkerUrlPromise = null;
-async function getOpusWorkerUrl() {
-  if (!opusWorkerUrlPromise) {
-    opusWorkerUrlPromise = (async () => {
-      const response = await fetch("https://cdn.jsdelivr.net/npm/opus-recorder@8.0.5/dist/encoderWorker.min.js");
-      if (!response.ok) throw new Error("无法加载语音编码器");
-      return URL.createObjectURL(new Blob([await response.text()], { type: "text/javascript" }));
-    })().catch(error => {
-      opusWorkerUrlPromise = null;
-      throw error;
-    });
-  }
-  return opusWorkerUrlPromise;
+const OPUS_ENCODER_WORKER = new URL("./vendor/opus-recorder/encoder-bootstrap.js", import.meta.url).href;
+const OPUS_DECODER_WORKER = new URL("./vendor/opus-recorder/decoderWorker.min.js", import.meta.url).href;
+function getOpusWorkerUrl() {
+  return OPUS_ENCODER_WORKER;
 }
 
 function concatFloat32(chunks) {
@@ -418,7 +557,7 @@ function encodeSttWav(samples, sampleRate, durationMs) {
 }
 
 async function encodeVoiceOpusFromSamples(samples, sampleRate) {
-  const workerUrl = await getOpusWorkerUrl();
+  const workerUrl = getOpusWorkerUrl();
   const pages = await new Promise((resolve, reject) => {
     const worker = new Worker(workerUrl);
     const chunks = [];
@@ -426,6 +565,7 @@ async function encodeVoiceOpusFromSamples(samples, sampleRate) {
       if (!page) return;
       if (page instanceof Uint8Array) chunks.push(page.slice());
       else if (page instanceof ArrayBuffer) chunks.push(new Uint8Array(page.slice(0)));
+      else if (page.buffer) chunks.push(Uint8Array.from(page));
       else chunks.push(Uint8Array.from(page));
     };
     const timer = setTimeout(() => {
@@ -439,8 +579,10 @@ async function encodeVoiceOpusFromSamples(samples, sampleRate) {
     };
     worker.onmessage = event => {
       const data = event.data || {};
+      if (data.page) copyPage(data.page);
       if (data.message === "ready") {
         const block = 4096;
+        worker.postMessage({ command: "getHeaderPages" });
         for (let offset = 0; offset < samples.length; offset += block) {
           const frame = new Float32Array(samples.subarray(offset, offset + block));
           worker.postMessage({ command: "encode", buffers: [frame] });
@@ -448,9 +590,7 @@ async function encodeVoiceOpusFromSamples(samples, sampleRate) {
         worker.postMessage({ command: "done" });
         return;
       }
-      if (data.message === "page") copyPage(data.page);
       if (data.message === "done") {
-        copyPage(data.page);
         clearTimeout(timer);
         worker.terminate();
         resolve(chunks);
@@ -469,13 +609,13 @@ async function encodeVoiceOpusFromSamples(samples, sampleRate) {
       resampleQuality: 3,
     });
   });
-  if (!pages.length) throw new Error("语音编码结果为空");
+  if (pages.length < 3) throw new Error("语音编码结果为空");
   const header = pages[0];
   if (header.length < 4 || header[0] !== 0x4f || header[1] !== 0x67 || header[2] !== 0x67 || header[3] !== 0x53) {
     throw new Error("语音编码结果无效");
   }
   const ogg = new Blob(pages, { type: "audio/ogg" });
-  if (!ogg.size) throw new Error("语音编码结果为空");
+  if (ogg.size < 400) throw new Error("语音编码结果为空");
   const file = new File([ogg], "voice.ogg", { type: "audio/ogg" });
   file.orbitVoiceDuration = Math.round((samples.length / Math.max(1, sampleRate)) * 1000);
   file.orbitVoiceWaveform = buildVoiceWaveform(samples);
@@ -515,6 +655,56 @@ async function audioBlobIsPlayable(blob) {
   }
 }
 
+
+async function decodeOggOpusWithWorker(blob) {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  if (bytes.length < 64) throw new Error("语音文件为空");
+  return await new Promise((resolve, reject) => {
+    const worker = new Worker(OPUS_DECODER_WORKER);
+    const chunks = [];
+    const timer = setTimeout(() => {
+      worker.terminate();
+      reject(new Error("语音解码超时"));
+    }, 20000);
+    const finish = samples => {
+      clearTimeout(timer);
+      try { worker.terminate(); } catch {}
+      if (!samples?.length) reject(new Error("语音解码结果为空"));
+      else resolve({ samples, sampleRate: 48000 });
+    };
+    worker.onerror = event => {
+      clearTimeout(timer);
+      try { worker.terminate(); } catch {}
+      reject(new Error(event?.message || "语音解码失败"));
+    };
+    worker.onmessage = event => {
+      const data = event.data;
+      if (data == null) {
+        finish(concatFloat32(chunks));
+        return;
+      }
+      if (Array.isArray(data) && data[0]?.length) chunks.push(data[0].slice());
+    };
+    worker.postMessage({ command: "init", decoderSampleRate: 48000, outputBufferSampleRate: 48000, bufferLength: 4096 });
+    worker.postMessage({ command: "decode", pages: bytes });
+    worker.postMessage({ command: "done" });
+  });
+}
+
+async function transcodeVoiceToWavUrl(src) {
+  const blob = src instanceof Blob ? src : await fetch(src).then(response => {
+    if (!response.ok) throw new Error("语音加载失败");
+    return response.blob();
+  });
+  let decoded = null;
+  try { decoded = await decodeAudioToMono(blob); }
+  catch {
+    decoded = await decodeOggOpusWithWorker(blob);
+  }
+  const wav = encodeWavFile(decoded.samples, decoded.sampleRate, decoded.durationMs);
+  return URL.createObjectURL(wav);
+}
+
 function attachVoiceMeta(file, durationMs, samples) {
   if (Number(durationMs) > 0) file.orbitVoiceDuration = Number(durationMs);
   if (samples?.length) file.orbitVoiceWaveform = buildVoiceWaveform(samples);
@@ -552,7 +742,7 @@ function buildVoiceMessageContent(file, uploaded, fileInfo) {
   if (duration > 0) info.duration = duration;
   const content = applyUploadedMedia({
     msgtype: "m.audio",
-    body: "Voice message",
+    body: "voice.ogg",
     filename: "voice.ogg",
     info,
   }, uploaded, fileInfo);
@@ -563,13 +753,13 @@ function buildVoiceMessageContent(file, uploaded, fileInfo) {
   const audio = {};
   if (duration > 0) audio.duration = duration;
   if (Array.isArray(file.orbitVoiceWaveform) && file.orbitVoiceWaveform.length) audio.waveform = file.orbitVoiceWaveform;
-  content["org.matrix.msc3245.voice"] = {};
-  content["org.matrix.msc1767.text"] = "Voice message";
+  content["org.matrix.msc3245.voice"] = {};
   content["org.matrix.msc1767.audio"] = audio;
   const fileDesc = { mimetype, size, name: "voice.ogg" };
   if (content.file) fileDesc.file = content.file;
   else fileDesc.url = content.url;
   content["org.matrix.msc1767.file"] = fileDesc;
+  content["org.matrix.msc1767.text"] = "voice.ogg";
   return content;
 }
 
@@ -772,6 +962,7 @@ async function uploadRemoteEmojiMxc(client, item) {
       const file = new File([blob], fileName, { type: mimeType });
       const uploaded = await client.uploadContent(file, { includeFilename: true, name: fileName, type: mimeType });
       if (!uploaded?.content_uri) throw new Error("Matrix 未返回表情媒体地址");
+      rememberUploadedEmoji(uploaded.content_uri, item);
       return uploaded.content_uri;
     })().catch(error => {
       orbitEmojiUploadCache.delete(cacheKey);
@@ -787,7 +978,10 @@ function emojiShortcode(item) {
 }
 
 async function prepareRemoteEmoji(client, item) {
-  return { item, shortcode: emojiShortcode(item), mxc: await uploadRemoteEmojiMxc(client, item) };
+  const shortcode = emojiShortcode(item);
+  const mxc = await uploadRemoteEmojiMxc(client, item);
+  rememberUploadedEmoji(mxc, item, shortcode);
+  return { item, shortcode, mxc };
 }
 
 // Publish the selected remote emoji as a Matrix image pack.  Reactions use
@@ -808,6 +1002,8 @@ async function publishRoomEmojiPack(client, room, item, mxc) {
     const existing = Array.isArray(state) ? state[0]?.getContent?.() : state?.getContent?.();
     const images = { ...(existing?.images || {}) };
     images[shortcode] = { ...(images[shortcode] || {}), url: mxc, body: `:${shortcode}:`, usage: ["emoticon"] };
+    const packKey = emojiPackShortcode(shortcode);
+    if (packKey && packKey !== shortcode) images[packKey] = { ...(images[packKey] || {}), url: mxc, body: `:${shortcode}:`, usage: ["emoticon"] };
     await client.sendStateEvent(roomId, "im.ponies.room_emotes", {
       pack: { ...(existing?.pack || {}), display_name: existing?.pack?.display_name || "Orbit 表情", usage: ["emoticon"] },
       images,
@@ -1050,6 +1246,14 @@ async function scaleEmojiImageBlob(blob, maxSize = EMOJI_DISPLAY_SIZE) {
       const decoded = await scaleAnimatedWithImageDecoder(blob, maxSize);
       if (decoded) return decoded;
     } catch {}
+    try {
+      const bitmap = await createImageBitmap(blob);
+      const fitted = fitEmojiDisplaySize(bitmap.width, bitmap.height, maxSize);
+      bitmap.close?.();
+      return { blob, w: fitted.w, h: fitted.h };
+    } catch {
+      return { blob, w: maxSize, h: maxSize };
+    }
   }
   return scaleStaticImageBlob(blob, maxSize);
 }
@@ -1076,10 +1280,153 @@ function isEmojiImageContent(content, msgtype) {
   return false;
 }
 
+function escapeMatrixHtml(value) {
+  return String(value || "").replace(/[&<>"]/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[char]));
+}
+
+function emojiPackShortcode(shortcode) {
+  const raw = String(shortcode || "").replace(/^:+|:+$/g, "").trim();
+  if (/^[A-Za-z0-9_-]+$/.test(raw)) return raw;
+  let hash = 0;
+  for (let index = 0; index < raw.length; index += 1) hash = ((hash << 5) - hash + raw.charCodeAt(index)) | 0;
+  return `e${Math.abs(hash).toString(36)}`;
+}
+
+function emojiEmoticonHtml(mxc, shortcode) {
+  const name = String(shortcode || "").replace(/^:+|:+$/g, "").trim() || "emoji";
+  return `<img data-mx-emoticon src="${escapeMatrixHtml(mxc)}" alt="${escapeMatrixHtml(name)}" title="${escapeMatrixHtml(name)}" height="32">`;
+}
+
+function rememberUploadedEmoji(mxc, item, shortcode) {
+  const uri = String(mxc || "").trim();
+  if (!uri.startsWith("mxc://")) return;
+  const code = String(shortcode || (typeof emojiShortcode === "function" ? emojiShortcode(item) : "") || "").replace(/^:+|:+$/g, "");
+  const current = orbitEmojiMxcIndex.get(uri) || {};
+  orbitEmojiMxcIndex.set(uri, { mxc: uri, shortcode: code || current.shortcode || "", item: item || current.item || null });
+}
+
+function emojiItemForMxc(mxc) {
+  const uri = String(mxc || "").trim();
+  if (!uri.startsWith("mxc://")) return null;
+  const remembered = orbitEmojiMxcIndex.get(uri);
+  if (remembered?.item) return remembered.item;
+  if (remembered?.shortcode) {
+    const fromCode = emojiItemForToken(remembered.shortcode);
+    if (fromCode) return fromCode;
+  }
+  const client = window.orbitMatrixClient;
+  for (const room of client?.getRooms?.() || []) {
+    const events = room.currentState?.getStateEvents?.("im.ponies.room_emotes") || [];
+    const list = Array.isArray(events) ? events : events ? [events] : [];
+    for (const event of list) {
+      const images = event?.getContent?.()?.images || {};
+      for (const [name, image] of Object.entries(images)) {
+        if (String(image?.url || "") === uri) return emojiItemForToken(name) || { name, shortcode: name, mxc: uri, url: uri };
+      }
+    }
+  }
+  return null;
+}
+
+function applyEmojiFormattedBody(body, resolvedEmoji, mentions = []) {
+  const unique = [];
+  const seen = new Set();
+  (resolvedEmoji || []).forEach(entry => {
+    const mxc = String(entry?.mxc || "").trim();
+    const name = String(entry.shortcode || entry.item?.name || "").replace(/^:+|:+$/g, "").trim();
+    if (!mxc.startsWith("mxc://") || !name) return;
+    const key = name.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    unique.push({ mxc, name, token: `:${name}:` });
+    rememberUploadedEmoji(mxc, entry.item, name);
+  });
+  unique.sort((left, right) => right.token.length - left.token.length);
+  let html = mentions?.length ? mentionHtml(body, mentions) : escapeMatrixHtml(body).replace(/\n/g, "<br>");
+  unique.forEach(entry => {
+    const img = emojiEmoticonHtml(entry.mxc, entry.name);
+    const escaped = escapeMatrixHtml(entry.token);
+    html = html.split(escaped).join("\0");
+    if (escaped !== entry.token) html = html.split(entry.token).join("\0");
+    html = html.split("\0").join(img);
+  });
+  return html;
+}
+
+function isBrokenEmoticonResidue(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  if (/^["']?\s*(?:title|alt|src|height|width)\s*=/i.test(text)) return true;
+  if (/height="\d+"\s*>?\s*$/i.test(text) && /\btitle=/i.test(text)) return true;
+  return false;
+}
+
+function normalizeIncomingEmojiHtml(html) {
+  const value = String(html || "");
+  if (!/<img\b/i.test(value)) return value;
+  try {
+    const doc = new DOMParser().parseFromString(value, "text/html");
+    const images = [...doc.body.querySelectorAll("img")];
+    const residue = String(doc.body.textContent || "").trim();
+    const broken = isBrokenEmoticonResidue(residue) || images.some(image => /<img/i.test(image.getAttribute("alt") || ""));
+    if (!broken) return value;
+    const rebuilt = [];
+    const used = new Set();
+    const titles = [...value.matchAll(/\btitle="([^"]+)"/g)].map(match => String(match[1] || "").replace(/^:+|:+$/g, "").trim()).filter(Boolean);
+    let titleIndex = 0;
+    const add = (mxc, name) => {
+      const uri = String(mxc || "").trim();
+      if (!uri.startsWith("mxc://") || used.has(uri)) return;
+      used.add(uri);
+      rebuilt.push(emojiEmoticonHtml(uri, name || titles[titleIndex] || "emoji"));
+      if (!name) titleIndex += 1;
+    };
+    images.forEach(image => {
+      const src = String(image.getAttribute("src") || "");
+      const mxc = src.startsWith("mxc://") ? src : (src.match(/mxc:\/\/[^\s"'<>]+/) || [])[0];
+      const name = String(image.getAttribute("title") || image.getAttribute("alt") || "").replace(/^:+|:+$/g, "").replace(/<.*$/, "").trim();
+      if (mxc) add(mxc, name);
+    });
+    [...value.matchAll(/mxc:\/\/[^\s"'<>]+/g)].forEach(match => add(match[0], ""));
+    return rebuilt.length ? rebuilt.join(" ") : value;
+  } catch {
+    return value;
+  }
+}
+
+async function hydrateOutgoingEmoji(client, text, html, resolvedEmoji = []) {
+  const incoming = [...(resolvedEmoji || [])];
+  const fromHtml = emojiRefsFromEditorHtml(html);
+  const names = fromHtml.length ? fromHtml.map(entry => entry.shortcode) : emojiTokenList(text);
+  await ensureEmojiCatalog();
+  const have = new Set(incoming.map(entry => String(entry?.shortcode || "").replace(/^:+|:+$/g, "").toLowerCase()).filter(Boolean));
+  names.forEach((name, index) => {
+    const code = String(name || "").replace(/^:+|:+$/g, "").trim();
+    if (!code || have.has(code.toLowerCase())) return;
+    const htmlRef = fromHtml[index] && String(fromHtml[index].shortcode).replace(/^:+|:+$/g, "").toLowerCase() === code.toLowerCase() ? fromHtml[index] : fromHtml.find(entry => String(entry.shortcode).replace(/^:+|:+$/g, "").toLowerCase() === code.toLowerCase());
+    const item = emojiItemForToken(code);
+    if (!item && !htmlRef?.mxc) return;
+    incoming.push({ shortcode: emojiShortcode(item) || code, mxc: htmlRef?.mxc || "", item: item || { name: code, shortcode: code } });
+    have.add(code.toLowerCase());
+  });
+  if (!incoming.length) return [];
+  const prepared = await Promise.all(incoming.map(async entry => {
+    if (String(entry?.mxc || "").startsWith("mxc://")) return entry;
+    const item = entry.item || emojiItemForToken(entry.shortcode);
+    if (!item || !client) return entry;
+    try {
+      const ready = await prepareRemoteEmoji(client, item);
+      return { ...entry, ...ready, item: ready.item || item, shortcode: ready.shortcode || entry.shortcode, mxc: ready.mxc };
+    } catch {
+      return entry;
+    }
+  }));
+  return prepared.filter(entry => String(entry?.mxc || "").startsWith("mxc://"));
+}
+
 async function createEmojiImageContent(client, room, entry) {
   const encrypted = Boolean(room?.hasEncryptionStateEvent?.());
   const shortcode = emojiShortcode(entry?.item || entry);
-  const token = `:${shortcode}:`;
   const original = await blobFromResolvedEmoji(client, entry);
   const mimeHint = original.type || entry?.item?.mimeType || "image/png";
   const animated = emojiLooksAnimated(entry?.item || entry, original) || isAnimatedImageMime(mimeHint);
@@ -1088,25 +1435,27 @@ async function createEmojiImageContent(client, room, entry) {
   let size = { w: EMOJI_DISPLAY_SIZE, h: EMOJI_DISPLAY_SIZE };
   try {
     const scaled = await scaleEmojiImageBlob(original, EMOJI_DISPLAY_SIZE);
-    uploadBlob = scaled.blob;
-    mimeType = scaled.blob.type || mimeHint;
+    const scaledAnimated = isAnimatedImageMime(scaled.blob?.type || "");
+    if (!animated || scaledAnimated || scaled.blob === original) {
+      uploadBlob = scaled.blob;
+      mimeType = scaled.blob.type || mimeHint;
+    }
     size = { w: scaled.w, h: scaled.h };
   } catch {
     try {
-      const staticScaled = await scaleStaticImageBlob(original, EMOJI_DISPLAY_SIZE);
-      uploadBlob = staticScaled.blob;
-      mimeType = staticScaled.blob.type || "image/png";
-      size = { w: staticScaled.w, h: staticScaled.h };
+      const measured = await emojiInfoSize(original, EMOJI_DISPLAY_SIZE);
+      size = { w: measured.w, h: measured.h };
     } catch {}
   }
   const fileName = emojiFileName(entry?.item || { name: shortcode }, mimeType);
   const file = new File([uploadBlob], fileName, { type: mimeType });
   const { uploaded, fileInfo } = await uploadMatrixMedia(client, file, encrypted);
   const uploadedMxc = uploaded?.content_uri || "";
+  rememberUploadedEmoji(uploadedMxc, entry?.item || entry, shortcode);
   const info = { mimetype: mimeType, size: file.size, w: size.w, h: size.h };
   return applyUploadedMedia({
     msgtype: "m.image",
-    body: token,
+    body: fileName,
     filename: fileName,
     info,
     "org.orbit.emoji": true,
@@ -1134,9 +1483,10 @@ function createEmojiTextContent(text, resolvedEmoji, mentions = []) {
   fallbackBody = fallbackBody.replace(/[ \t]{2,}/g, " ").replace(/[ \t]+\n/g, "\n").replace(/\n[ \t]+/g, "\n").trim();
   if (!fallbackBody) fallbackBody = (resolvedEmoji || []).map(entry => `:${String(entry.shortcode || "表情").replace(/^:+|:+$/g, "")}:`).join(" ");
   const content = { msgtype: "m.text", body: fallbackBody };
-  if (mentions?.length) {
+  const emojiHtml = applyEmojiFormattedBody(fallbackBody, resolved, mentions);
+  if (mentions?.length || /data-mx-emoticon/i.test(emojiHtml)) {
     content.format = "org.matrix.custom.html";
-    content.formatted_body = mentionHtml(fallbackBody, mentions);
+    content.formatted_body = emojiHtml;
   }
   const emojiItems = (resolvedEmoji || []).filter(entry => entry?.mxc?.startsWith?.("mxc://")).map(entry => ({
     shortcode: String(entry.shortcode || entry.item?.name || "表情").replace(/^:+|:+$/g, ""),
@@ -1750,7 +2100,11 @@ function MessageText({ text }) {
   const [items, setItems] = useState(() => window.orbitEmojiItems || []);
   useEffect(() => { let active = true; ensureEmojiCatalog().then(next => active && setItems(next || [])); return () => { active = false; }; }, []);
   const catalog = items || [];
-  const parts = String(text || "").split(/(:[^:\s]+:|https?:\/\/[^\s<]+|www\.[^\s<]+)/gi);
+  const raw = String(text || "");
+  if (/<img\b/i.test(raw) || isBrokenEmoticonResidue(raw)) {
+    return h(FormattedMessage, { html: normalizeIncomingEmojiHtml(raw), client: window.orbitMatrixClient });
+  }
+  const parts = raw.split(/(:[^:\s]+:|https?:\/\/[^\s<]+|www\.[^\s<]+)/gi);
   return h(React.Fragment, null, parts.map((part, index) => {
     const rawUrl = /^https?:\/\//i.test(part) ? part : /^www\./i.test(part) ? `https://${part}` : "";
     if (rawUrl) {
@@ -1766,7 +2120,11 @@ function MessageText({ text }) {
 function FormattedMessage({ html, client, onImage, emojiFiles }) {
   const [nodes, setNodes] = useState([]);
   useEffect(() => {
-    try { const doc = new DOMParser().parseFromString(String(html || ""), "text/html"); setNodes([...doc.body.childNodes]); } catch { setNodes([]); }
+    try {
+      const repaired = normalizeIncomingEmojiHtml(html);
+      const doc = new DOMParser().parseFromString(String(repaired || ""), "text/html");
+      setNodes([...doc.body.childNodes]);
+    } catch { setNodes([]); }
   }, [html]);
   const renderText = (value, key) => String(value || "").split(/(https?:\/\/[^\s<]+|www\.[^\s<]+)/gi).map((part, index) => {
     const rawUrl = /^https?:\/\//i.test(part) ? part : /^www\./i.test(part) ? `https://${part}` : "";
@@ -1776,15 +2134,18 @@ function FormattedMessage({ html, client, onImage, emojiFiles }) {
     return h(React.Fragment, { key: `${key}-${index}` }, h("a", { className: "message-link", href, target: "_blank", rel: "noreferrer noopener" }, href), trailing);
   });
   const renderNode = (node, key) => {
-    if (node.nodeType === Node.TEXT_NODE) return renderText(node.nodeValue || "", key);
+    if (node.nodeType === Node.TEXT_NODE) return isBrokenEmoticonResidue(node.nodeValue || "") ? null : renderText(node.nodeValue || "", key);
     if (node.nodeType !== Node.ELEMENT_NODE) return null;
     if (node.tagName === "BR") return h("br", { key });
     const children = [...node.childNodes].map((child, index) => renderNode(child, `${key}-${index}`));
     if (node.tagName === "A") { const href = node.getAttribute("href") || "#"; return h("a", { key, className: "message-link", href, target: "_blank", rel: "noreferrer noopener" }, children); }
     if (node.tagName === "IMG") {
-      const alt = node.getAttribute("alt") || "图片";
-      const emoticon = node.hasAttribute("data-mx-emoticon") || node.hasAttribute("data-emoji-token") || /^:[^:\s]+:$/.test(alt);
-      return h(InlineMatrixImage, { key, client, mxcUrl: node.getAttribute("src"), alt, encryptedFile: emojiFiles?.[alt] || emojiFiles?.[alt.replace(/^:+|:+$/g, "")] || null, onOpen: onImage, emoticon });
+      const alt = node.getAttribute("alt") || node.getAttribute("title") || "图片";
+      const title = node.getAttribute("title") || alt;
+      const height = Number(node.getAttribute("height") || 0);
+      const src = String(node.getAttribute("src") || "");
+      const emoticon = node.hasAttribute("data-mx-emoticon") || node.hasAttribute("data-emoji-token") || /^:[^:\s]+:$/.test(alt) || (src.startsWith("mxc://") && height > 0 && height <= 48);
+      return h(InlineMatrixImage, { key, client, mxcUrl: src || node.getAttribute("src"), alt, title, encryptedFile: emojiFiles?.[alt] || emojiFiles?.[String(alt).replace(/^:+|:+$/g, "")] || emojiFiles?.[title] || null, onOpen: onImage, emoticon });
     }
     const tags = { STRONG: "strong", B: "strong", EM: "em", I: "em", U: "u", DEL: "del", S: "s", CODE: "code", PRE: "pre", BLOCKQUOTE: "blockquote", UL: "ul", OL: "ol", LI: "li", H1: "h1", H2: "h2", H3: "h3", SPAN: "span" };
     const tag = tags[node.tagName];
@@ -1795,8 +2156,8 @@ function FormattedMessage({ html, client, onImage, emojiFiles }) {
   return h(React.Fragment, null, nodes.map((node, index) => renderNode(node, index)));
 }
 
-function InlineMatrixImage({ client, mxcUrl, alt, encryptedFile, onOpen, emoticon = false }) {
-  const resolvedEncryptedFile = encryptedFile || window.orbitEncryptedEmojiFiles?.[alt] || null;
+function InlineMatrixImage({ client, mxcUrl, alt, title, encryptedFile, onOpen, emoticon = false }) {
+  const resolvedEncryptedFile = encryptedFile || window.orbitEncryptedEmojiFiles?.[alt] || window.orbitEncryptedEmojiFiles?.[title] || null;
   const [failed, setFailed] = useState(false);
   const [catalogSrc, setCatalogSrc] = useState("");
   const asset = useMatrixAsset(client, mxcUrl, undefined, undefined, undefined, resolvedEncryptedFile);
@@ -1807,22 +2168,21 @@ function InlineMatrixImage({ client, mxcUrl, alt, encryptedFile, onOpen, emotico
       if (!active || !item) return;
       setCatalogSrc(emojiDisplaySrc(item));
     };
-    const current = emojiItemForToken(alt);
+    const current = emojiItemForToken(alt) || emojiItemForToken(title) || emojiItemForMxc(mxcUrl);
     if (current) applyItem(current);
-    else ensureEmojiCatalog().then(items => {
-      const name = String(alt || "").replace(/^:+|:+$/g, "").trim().toLowerCase();
-      applyItem((items || []).find(entry => String(entry.name || "").trim().toLowerCase() === name || String(entry.shortcode || "").replace(/^:+|:+$/g, "").trim().toLowerCase() === name) || null);
+    else ensureEmojiCatalog().then(() => {
+      applyItem(emojiItemForToken(alt) || emojiItemForToken(title) || emojiItemForMxc(mxcUrl));
     });
     return () => { active = false; };
-  }, [emoticon, alt]);
+  }, [emoticon, alt, title, mxcUrl]);
   const src = (!failed && asset.src) || catalogSrc;
   if (!src) return h("span", { className: "inline-media-placeholder" }, "⌛");
   return h("img", {
     className: emoticon ? "inline-message-emoji" : "inline-message-image",
     src,
-    alt,
-    title: alt,
-    onClick: emoticon ? undefined : () => onOpen?.(src, alt),
+    alt: alt || title || "表情",
+    title: title || alt || "表情",
+    onClick: emoticon ? undefined : () => onOpen?.(src, alt || title),
     onError: () => { if (!failed) setFailed(true); },
   });
 }
@@ -1950,23 +2310,33 @@ function EmojiPicker({ onSelect, onInsert, onSendEmoji, variant = "popover", ope
 }
 
 function emojiItemForToken(token) {
-  const name = String(token || "").trim().replace(/^:+|:+$/g, "").trim().toLowerCase();
+  const raw = String(token || "").trim();
+  if (/^mxc:\/\//i.test(raw)) return emojiItemForMxc(raw);
+  const name = raw.replace(/^:+|:+$/g, "").trim().toLowerCase();
+  if (!name) return null;
   return (window.orbitEmojiItems || []).find(item => String(item.name || "").trim().toLowerCase() === name || String(item.shortcode || "").replace(/^:+|:+$/g, "").trim().toLowerCase() === name) || null;
 }
 
-function ReactionLabel({ keyValue }) {
-  const [item, setItem] = useState(() => emojiItemForToken(keyValue));
-  useEffect(() => { let active = true; const current = emojiItemForToken(keyValue); if (current) { setItem(current); return () => { active = false; }; } ensureEmojiCatalog().then(items => { if (!active) return; const name = String(keyValue || "").trim().replace(/^:+|:+$/g, "").trim(); const normalized = name.toLowerCase(); setItem((items || []).find(entry => String(entry.name || "").trim().toLowerCase() === normalized || String(entry.shortcode || "").replace(/^:+|:+$/g, "").trim().toLowerCase() === normalized) || null); }); return () => { active = false; }; }, [keyValue]);
-  const mxcKey = /^mxc:\/\//i.test(String(keyValue || "")) ? String(keyValue) : null;
+function ReactionLabel({ keyValue, shortcode, mxcUrl }) {
+  const mxcKey = /^mxc:\/\//i.test(String(keyValue || "")) ? String(keyValue) : (/^mxc:\/\//i.test(String(mxcUrl || "")) ? String(mxcUrl) : null);
+  const [item, setItem] = useState(() => emojiItemForToken(shortcode) || emojiItemForToken(keyValue) || emojiItemForMxc(mxcKey));
+  useEffect(() => {
+    let active = true;
+    const apply = current => { if (active) setItem(current); };
+    const current = emojiItemForToken(shortcode) || emojiItemForToken(keyValue) || emojiItemForMxc(mxcKey);
+    if (current) { apply(current); return () => { active = false; }; }
+    ensureEmojiCatalog().then(() => apply(emojiItemForToken(shortcode) || emojiItemForToken(keyValue) || emojiItemForMxc(mxcKey)));
+    return () => { active = false; };
+  }, [keyValue, shortcode, mxcKey]);
   const matrixClient = window.orbitMatrixClient;
-  // Do not request a resized thumbnail here: Matrix thumbnail endpoints
-  // commonly flatten animated GIFs to their first frame. Load the original
-  // media and let the reaction CSS constrain its display size instead.
   const media = useMatrixAsset(matrixClient, mxcKey, null, null, null);
-  if (mxcKey) return media.src ? h("img", { className: "reaction-image", src: media.src, alt: "自定义表情", title: "自定义表情" }) : h("span", { className: "reaction-fallback" }, "表情");
-  return item ? h("img", { className: "reaction-image", src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, title: item.name }) : keyValue;
+  const catalogSrc = item ? emojiDisplaySrc(item) : "";
+  const src = media.src || catalogSrc;
+  if (src) return h("img", { className: "reaction-image", src, alt: item?.name || shortcode || "自定义表情", title: item?.name || shortcode || "自定义表情" });
+  if (mxcKey) return h("span", { className: "reaction-fallback" }, "表情");
+  return keyValue;
 }
-function reactionLabel(key) { return h(ReactionLabel, { keyValue: key }); }
+function reactionLabel(key, meta) { return h(ReactionLabel, { keyValue: key, shortcode: meta?.shortcode, mxcUrl: meta?.url }); }
 
 function ReactionPopover({ users = [], children }) {
   const uniqueUsers = users.filter((entry, index, all) => entry && all.findIndex(item => item?.userId === entry.userId) === index);
@@ -2346,9 +2716,56 @@ function matrixErrorText(error) {
     .join(" ");
 }
 
+function persistMatrixSession(session) {
+  if (!session?.homeserver || !session?.userId || !session?.accessToken || !session?.deviceId) return;
+  const stored = readMatrixSession();
+  const sameDevice = stored?.userId === session.userId && stored?.deviceId === session.deviceId;
+  const next = sameDevice ? { ...stored, ...session } : { ...session };
+  if (!session.refreshToken || session.refreshTokenInvalid) delete next.refreshToken;
+  delete next.refreshTokenInvalid;
+  saveMatrixSession(next);
+}
+
+function latestMatrixRefreshToken(client, session, sdkToken = "") {
+  if (session?.refreshTokenInvalid || client?.__orbitRefreshTokenInvalid) return "";
+  const stored = readMatrixSession();
+  const sameDevice = stored && session && stored.userId === session.userId && stored.deviceId === session.deviceId;
+  return session?.refreshToken || (sameDevice && stored.refreshToken) || sdkToken || client?.http?.opts?.refreshToken || "";
+}
+
+function dropMatrixRefreshToken(client, session = client?.__orbitSession) {
+  if (session) {
+    session.refreshTokenInvalid = true;
+    delete session.refreshToken;
+  }
+  if (client) {
+    client.__orbitRefreshTokenInvalid = true;
+    if (client.http?.opts) delete client.http.opts.refreshToken;
+    client.__orbitSession = { ...(client.__orbitSession || {}), ...(session || {}) };
+    client.__orbitSession.refreshTokenInvalid = true;
+    delete client.__orbitSession.refreshToken;
+  }
+  if (session?.homeserver && session?.userId && session?.accessToken && session?.deviceId) persistMatrixSession(session);
+  else {
+    const stored = readMatrixSession();
+    if (stored?.accessToken) {
+      delete stored.refreshToken;
+      saveMatrixSession(stored);
+    }
+  }
+}
+
+function historyLoadErrorMessage(error) {
+  const text = matrixErrorText(error);
+  if (isFatalAuthError(error) || isRecoverableAuthError(error) || /invalid refresh|unknown token|token is not active|\[401\]|HTTP\s*401/i.test(text)) {
+    return "历史消息暂时无法加载，请稍后重试";
+  }
+  return "历史消息加载失败：" + (error?.message || "请稍后重试");
+}
+
 function isFatalAuthError(error) {
   const text = matrixErrorText(error);
-  return /invalid refresh token|refresh token.*(invalid|unknown|expired)|TokenRefreshError/i.test(text) && /invalid refresh token|refresh token/i.test(text);
+  return /invalid refresh token|refresh token.*(invalid|unknown|expired)|unknown refresh token/i.test(text);
 }
 
 function isRecoverableAuthError(error) {
@@ -2364,23 +2781,39 @@ function isRecoverableAuthError(error) {
 function applyMatrixSessionToClient(client, session) {
   if (!client || !session?.accessToken) return;
   client.setAccessToken?.(session.accessToken);
-  if (session.refreshToken) {
-    client.setRefreshToken?.(session.refreshToken);
-    if (client.http?.opts) client.http.opts.refreshToken = session.refreshToken;
-  }
   if (client.http?.opts) client.http.opts.accessToken = session.accessToken;
+  if (session.refreshToken && !session.refreshTokenInvalid) {
+    if (client.http?.opts) client.http.opts.refreshToken = session.refreshToken;
+  } else if (client.http?.opts) {
+    delete client.http.opts.refreshToken;
+  }
   client.__orbitSession = { ...(client.__orbitSession || {}), ...session };
+  if (!session.refreshToken || session.refreshTokenInvalid) {
+    delete client.__orbitSession.refreshToken;
+    client.__orbitRefreshTokenInvalid = true;
+  } else {
+    client.__orbitRefreshTokenInvalid = false;
+  }
 }
 
 async function recoverMatrixAccessToken(client) {
   const session = client?.__orbitSession;
-  const refreshToken = client?.getRefreshToken?.() || session?.refreshToken;
+  if (session?.refreshTokenInvalid || client?.__orbitRefreshTokenInvalid) return false;
+  const refreshToken = latestMatrixRefreshToken(client, session);
   if (!refreshToken || !client?.__orbitRefresh) return false;
   if (session) session.refreshToken = refreshToken;
-  const result = await client.__orbitRefresh(refreshToken);
-  if (!result?.accessToken) return false;
-  applyMatrixSessionToClient(client, session || { accessToken: result.accessToken, refreshToken: result.refreshToken });
-  return true;
+  try {
+    const result = await client.__orbitRefresh(refreshToken);
+    if (!result?.accessToken) return false;
+    applyMatrixSessionToClient(client, session || { accessToken: result.accessToken, refreshToken: result.refreshToken });
+    return true;
+  } catch (error) {
+    if (isFatalAuthError(error)) {
+      dropMatrixRefreshToken(client, session);
+      return false;
+    }
+    throw error;
+  }
 }
 
 
@@ -2396,6 +2829,7 @@ function matrixSessionFromLogin(homeserver, result) {
 }
 
 async function refreshMatrixSession(baseUrl, session) {
+  if (session?.refreshTokenInvalid) throw new Error("Invalid refresh token");
   if (!session?.refreshToken) throw new Error("当前会话没有 refresh token，无法续期");
   const response = await fetchWithTimeout(`${baseUrl}/_matrix/client/v3/refresh`, {
     method: "POST",
@@ -2404,10 +2838,15 @@ async function refreshMatrixSession(baseUrl, session) {
   }, 15000);
   const refreshed = await response.json().catch(() => null);
   if (!response.ok || !refreshed?.access_token) {
-    throw new Error(refreshed?.error || `Matrix 令牌刷新失败（HTTP ${response.status}）`);
+    const error = new Error(refreshed?.error || `Matrix 令牌刷新失败（HTTP ${response.status}）`);
+    error.errcode = refreshed?.errcode;
+    error.httpStatus = response.status;
+    error.data = refreshed;
+    throw error;
   }
   session.accessToken = refreshed.access_token;
-  session.refreshToken = refreshed.refresh_token || session.refreshToken;
+  if (refreshed.refresh_token) session.refreshToken = refreshed.refresh_token;
+  session.refreshTokenInvalid = false;
   if (refreshed.expires_in_ms) session.accessTokenExpiresAt = Date.now() + refreshed.expires_in_ms;
   return session;
 }
@@ -2422,7 +2861,10 @@ function createAuthenticatedMatrixClient(baseUrl, session) {
     deviceId: session.deviceId,
     cryptoCallbacks: orbitCryptoCallbacks,
     fallbackICEServerAllowed: true,
+    lazyLoadMembers: true,
   };
+  const store = createOrbitMatrixStore(session);
+  if (store) options.store = store;
   if (session.refreshToken) {
     options.refreshToken = session.refreshToken;
     options.tokenRefreshFunction = async currentRefreshToken => {
@@ -2430,19 +2872,24 @@ function createAuthenticatedMatrixClient(baseUrl, session) {
       // refresh token may rotate on every successful request, so concurrent
       // refresh calls would invalidate each other. Serialize them and persist
       // the newest token before releasing the lock.
+      if (session.refreshTokenInvalid) throw new Error("Invalid refresh token");
       if (!refreshPromise) {
         refreshPromise = (async () => {
-          const previousRefreshToken = session.refreshToken;
-          session.refreshToken = currentRefreshToken || previousRefreshToken;
+          const latest = latestMatrixRefreshToken(client, session, currentRefreshToken);
+          if (!latest) throw new Error("Invalid refresh token");
+          session.refreshToken = latest;
           await refreshMatrixSession(baseUrl, session);
-          const stored = readMatrixSession();
-          if (stored?.userId === session.userId && stored?.deviceId === session.deviceId) saveMatrixSession({ ...stored, ...session });
+          persistMatrixSession(session);
+          applyMatrixSessionToClient(client, session);
           return {
             accessToken: session.accessToken,
             refreshToken: session.refreshToken,
             ...(session.accessTokenExpiresAt ? { expiry: new Date(session.accessTokenExpiresAt) } : {}),
           };
-        })().finally(() => { refreshPromise = null; });
+        })().catch(error => {
+          if (isFatalAuthError(error)) dropMatrixRefreshToken(client, session);
+          throw error;
+        }).finally(() => { refreshPromise = null; });
       }
       return refreshPromise;
     };
@@ -2450,8 +2897,11 @@ function createAuthenticatedMatrixClient(baseUrl, session) {
   client = MatrixSDK.createClient(options);
   // Keep the session available to targeted history/media retries without
   // exposing credentials in the DOM.
-  client.__orbitSession = session;
+  applyMatrixSessionToClient(client, session);
   client.__orbitBaseUrl = baseUrl;
+  client.on?.("Session.logged_out", () => {
+    dropMatrixRefreshToken(client, session);
+  });
   if (options.tokenRefreshFunction) {
     const refresh = options.tokenRefreshFunction;
     client.__orbitRefresh = async token => {
@@ -2467,11 +2917,21 @@ function createAuthenticatedMatrixClient(baseUrl, session) {
 
 async function ensureMatrixAccessToken(client) {
   const session = client?.__orbitSession;
+  if (session?.refreshTokenInvalid || client?.__orbitRefreshTokenInvalid) return true;
   const expiresAt = Number(session?.accessTokenExpiresAt || 0);
   if (!session?.refreshToken) return true;
   if (expiresAt && expiresAt - Date.now() > 60_000) return true;
   if (!expiresAt) return true;
-  return recoverMatrixAccessToken(client);
+  try {
+    await recoverMatrixAccessToken(client);
+    return true;
+  } catch (error) {
+    if (isFatalAuthError(error)) {
+      dropMatrixRefreshToken(client, session);
+      return true;
+    }
+    throw error;
+  }
 }
 
 async function getMatrixLoginFlows(baseUrl) {
@@ -2487,7 +2947,8 @@ async function loginWithMatrixToken(homeserver, token) {
   const result = await promiseWithTimeout(loginClient.login("m.login.token", { token, refresh_token: true }));
   const session = matrixSessionFromLogin(resolved.homeserver, result);
   const client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, session);
-  await initCryptoSafely(client);
+  await prepareOrbitClient(client);
+  warmOrbitCrypto(client);
   return { resolved, result, session, client };
 }
 
@@ -2529,22 +2990,65 @@ async function resolveHomeserver(input, { detect = true } = {}) {
 }
 
 // Use MSC3575 when the homeserver advertises it; otherwise retain /sync.
-async function startOrbitSync(client, { clientBaseUrl, slidingSync = false } = {}) {
+async function restartOrbitSyncWithoutSliding(client) {
+  if (!client || client.__orbitFallbackSync) return false;
+  client.__orbitFallbackSync = true;
+  try { client.__orbitSlidingSync?.stop?.(); } catch {}
+  client.__orbitSlidingSync = null;
+  try { client.stopClient(); } catch {}
+  startOrbitSync(client, { clientBaseUrl: client.__orbitBaseUrl, slidingSync: false });
+  return true;
+}
+
+async function loadRoomHistoryWithoutRefresh(client, matrixRoom, limit = 40) {
+  if (!client || !matrixRoom?.roomId) throw new Error("当前房间无法加载历史消息");
+  const timeline = matrixRoom.getLiveTimeline?.();
+  const backwards = MatrixSDK.EventTimeline?.BACKWARDS || "b";
+  const from = timeline?.getPaginationToken?.(backwards);
+  if (from === null) return { reachedStart: true, added: 0 };
+  const accessToken = client.getAccessToken?.() || client.http?.opts?.accessToken || client.__orbitSession?.accessToken;
+  const baseUrl = String(client.getHomeserverUrl?.() || client.__orbitBaseUrl || "").replace(/\/$/, "");
+  if (!accessToken || !baseUrl) throw new Error("当前会话无法加载历史消息");
+  const params = new URLSearchParams({ dir: "b", limit: String(limit) });
+  if (from) params.set("from", from);
+  const response = await fetch(`${baseUrl}/_matrix/client/v3/rooms/${encodeURIComponent(matrixRoom.roomId)}/messages?${params}`, {
+    headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const error = new Error(body?.error || `历史消息加载失败（HTTP ${response.status}）`);
+    error.errcode = body?.errcode;
+    error.httpStatus = response.status;
+    error.data = body;
+    throw error;
+  }
+  const mapper = typeof client.getEventMapper === "function" ? client.getEventMapper() : event => new MatrixSDK.MatrixEvent(event);
+  const events = (body.chunk || []).map(event => mapper(event));
+  const timelineSet = matrixRoom.getUnfilteredTimelineSet?.();
+  if (timelineSet?.addEventsToTimeline && timeline) {
+    if (timelineSet.addEventsToTimeline.length >= 5) timelineSet.addEventsToTimeline(events, true, false, timeline, body.end ?? null);
+    else timelineSet.addEventsToTimeline(events, true, timeline, body.end ?? null);
+  }
+  if (body.end == null) timeline?.setPaginationToken?.(null, backwards);
+  return { reachedStart: body.end == null, added: events.length };
+}
+
+function startOrbitSync(client, { clientBaseUrl, slidingSync = false } = {}) {
   const startRtc = () => { try { client.matrixRTC?.start?.(); } catch {} };
   const fallback = () => {
-    const result = client.startClient({ initialSyncLimit: 30 });
+    const result = client.startClient(orbitStartClientOpts());
     startRtc();
     return result;
   };
   if (!slidingSync || typeof SlidingSync !== "function") return fallback();
   try {
     const lists = new Map([
-      ["all", { ranges: [[0, 500]], sort: ["by_recency"], filters: { is_invite: false }, required_state: [["m.room.create", ""], ["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["org.matrix.msc3401.call.member", "*"], ["m.call.member", "*"], ["m.rtc.member", "*"], ["m.room.topic", ""], ["m.space.child", "*"], ["m.space.parent", "*"]], timeline_limit: 30 }],
-      ["invites", { ranges: [[0, 20]], sort: ["by_recency"], filters: { is_invite: true }, required_state: [["m.room.create", ""], ["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["org.matrix.msc3401.call.member", "*"], ["m.call.member", "*"], ["m.rtc.member", "*"], ["m.room.topic", ""], ["m.space.child", "*"], ["m.space.parent", "*"]], timeline_limit: 30 }]
+      ["all", { ranges: [[0, 120]], sort: ["by_recency"], filters: { is_invite: false }, required_state: ORBIT_LIST_REQUIRED_STATE, timeline_limit: 8 }],
+      ["invites", { ranges: [[0, 20]], sort: ["by_recency"], filters: { is_invite: true }, required_state: ORBIT_LIST_REQUIRED_STATE, timeline_limit: 8 }]
     ]);
-    const roomSubscriptionInfo = { required_state: [["m.room.create", ""], ["m.room.name", ""], ["m.room.avatar", ""], ["m.room.encryption", ""], ["m.room.member", "*"], ["org.matrix.msc3401.call.member", "*"], ["m.call.member", "*"], ["m.rtc.member", "*"], ["m.room.topic", ""], ["m.space.child", "*"], ["m.space.parent", "*"]], timeline_limit: 30 };
+    const roomSubscriptionInfo = { required_state: ORBIT_LIST_REQUIRED_STATE.concat([["m.room.member", "*"]]), timeline_limit: 24 };
     const slidingClient = new SlidingSync(clientBaseUrl, lists, roomSubscriptionInfo, client, 30000);
-    client.startClient({ initialSyncLimit: 30, slidingSync: slidingClient });
+    client.startClient(orbitStartClientOpts({ slidingSync: slidingClient }));
     client.__orbitSlidingSync = slidingClient;
     startRtc();
   } catch (error) {
@@ -2573,6 +3077,13 @@ async function initCryptoSafely(client) {
     console.warn("E2EE 初始化未完成，将先连接并显示加密占位消息", error);
     return false;
   }
+}
+
+async function warmOrbitCrypto(client) {
+  const ok = await initCryptoSafely(client);
+  if (!ok) return false;
+  try { await client.getCrypto?.()?.loadSessionBackupPrivateKeyFromSecretStorage?.(); } catch {}
+  return true;
 }
 
 const orbitCryptoCallbacks = {
@@ -2604,7 +3115,7 @@ function roomToView(room, client) {
   // (or it is present in m.direct). Small group rooms must remain groups.
   const directUserId = directRoom ? otherMember?.userId : (room.isDirect?.() ? otherMember?.userId : null);
   const directMember = directUserId && room.getMember?.(directUserId);
-  const unread = Number(room.getUnreadNotificationCount?.("total") || 0);
+  const unread = roomUnreadCount(room, client);
   return {
     id: room.roomId,
     name,
@@ -2784,7 +3295,7 @@ function eventToMessage(event, room, userId) {
   const emojiNames = [...String(cleanBody || "").matchAll(/:([^:\s]+):/g)].map(match => match[1]);
   const emojiFiles = content["org.orbit.emoji_files"] || (content.file && emojiNames.length ? Object.fromEntries(emojiNames.map(name => [name, content.file])) : null);
   if (emojiFiles && typeof emojiFiles === "object") window.orbitEncryptedEmojiFiles = { ...(window.orbitEncryptedEmojiFiles || {}), ...emojiFiles };
-  const wireFormatted = content.format === "org.matrix.custom.html" && content.formatted_body ? sanitizeFormattedBody(reply ? stripReplyHtml(content.formatted_body) : content.formatted_body) : "";
+  const wireFormatted = content.format === "org.matrix.custom.html" && content.formatted_body ? normalizeIncomingEmojiHtml(sanitizeFormattedBody(reply ? stripReplyHtml(content.formatted_body) : content.formatted_body)) : "";
   // Matrix has no native Markdown field. For plain messages that contain
   // common Markdown markers, render a safe local preview while keeping body
   // as the interoperable source of truth for clients that ignore HTML.
@@ -2860,7 +3371,7 @@ async function roomMessages(room, userId, client) {
   const redacted = new Set(); const reactions = new Map(); const edits = new Map(); const replacements = new Map(); const updates = new Map(); const byId = new Map();
   events.forEach(event => {
     if (event.getType?.() === "m.room.redaction") { const id = event.getRedacts?.() || event.getContent?.()?.redacts; if (id) redacted.add(id); return; }
-    if (event.getType?.() === "m.reaction") { const content = event.getContent?.() || {}; const relation = content["m.relates_to"]; if (relation?.event_id) { const list = reactions.get(relation.event_id) || []; list.push({ id: event.getId?.(), key: relation.key || "👍", sender: event.getSender?.() }); reactions.set(relation.event_id, list); } return; }
+    if (event.getType?.() === "m.reaction") { const content = event.getContent?.() || {}; const relation = content["m.relates_to"]; if (relation?.event_id) { const list = reactions.get(relation.event_id) || []; list.push({ id: event.getId?.(), key: relation.key || "👍", sender: event.getSender?.(), shortcode: content.shortcode || content["com.beeper.reaction.shortcode"] || "", url: content.url || "" }); reactions.set(relation.event_id, list); } return; }
     const clearType = event.getClearType?.() || event.getType?.();
     if (clearType !== "m.room.message" && clearType !== "m.sticker" && event.getType?.() !== "m.room.encrypted") return;
     const eventContent = event.getClearContent?.() || event.getContent?.() || {};
@@ -2884,11 +3395,12 @@ async function roomMessages(room, userId, client) {
       message.editorText = editorTextFromFormattedBody(message.formattedBody);
       message.emojiRefs = emojiRefsFromFormattedBody(message.formattedBody);
     }
-    const reactionCounts = {}; const reactionUsers = {};
+    const reactionCounts = {}; const reactionUsers = {}; const reactionMeta = {};
     (reactions.get(id) || []).forEach(reaction => {
       if (!reaction.id || redacted.has(reaction.id)) return;
       const key = String(reaction.key || "👍");
       reactionCounts[key] = (reactionCounts[key] || 0) + 1;
+      if (!reactionMeta[key]) reactionMeta[key] = { shortcode: String(reaction.shortcode || "").replace(/^:+|:+$/g, ""), url: reaction.url || (/^mxc:\/\//i.test(key) ? key : "") };
       const sender = String(reaction.sender || "");
       const member = sender ? room.getMember?.(sender) : null;
       const name = member?.name || member?.rawDisplayName || sender || "未知用户";
@@ -2897,6 +3409,7 @@ async function roomMessages(room, userId, client) {
     });
     message.reactions = reactionCounts;
     message.reactionUsers = reactionUsers;
+    message.reactionMeta = reactionMeta;
     const reply = message.replyTo ? byId.get(message.replyTo) : null;
     if (reply) { message.replyPreview = reply.text; message.replyAuthor = reply.author; message.replyAvatarMxc = reply.avatarMxc; message.replyIsMe = reply.handle === userId; }
     const thread = message.threadRoot ? byId.get(message.threadRoot) : null;
@@ -2984,7 +3497,8 @@ function LoginDialog({ onConnected, onClose }) {
       const result = await promiseWithTimeout(loginClient.login("m.login.password", { identifier: { type: "m.id.user", user: username.trim() }, password, refresh_token: true }));
       const session = matrixSessionFromLogin(resolved.homeserver, result);
       const client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, session);
-      await initCryptoSafely(client);
+      await prepareOrbitClient(client);
+      warmOrbitCrypto(client);
       saveMatrixSession(session);
       window.orbitMatrixClient = client;
       const syncResolved = detectedResolved || resolved;
@@ -3236,7 +3750,7 @@ function SearchDialog({ client, room, onClose, onJumpTo }) {
   return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card search-card" }, h("div", { className: "modal-head" }, h("div", null, h("div", { className: "modal-title" }, "搜索房间消息"), h("div", { className: "modal-copy" }, room.name)), h("button", { className: "icon-button", onClick: onClose }, "×")), h("form", { className: "search-form", onSubmit: search }, h("input", { value: query, onChange: e => setQuery(e.target.value), placeholder: "输入关键词", autoFocus: true }), h("button", { className: "primary-btn", disabled: loading }, loading ? "搜索中…" : "搜索")), h("div", { className: "search-results" }, !results.length && query && !loading && h("div", { className: "dialog-empty" }, "没有找到匹配的消息"), results.map((item, i) => h("button", { type: "button", className: "search-result", key: item.result?.event_id || item.rank || i, onClick: () => { onClose(); onJumpTo?.(item.result?.event_id); } }, h("div", { className: "search-result-author" }, item.result?.senderName || item.result?.sender || "未知用户", h("span", { className: "message-time" }, item.result?.origin_server_ts ? new Date(item.result.origin_server_ts).toLocaleString("zh-CN") : "")), h("div", { className: "search-result-body" }, item.result?.content?.body || ""))))));
 }
 
-function Sidebar({ rooms, allRooms: roomUniverse = rooms, invites = [], spaces, selectedId, connected, presence, viewMode, activeSpaceId, onViewMode, onSpaceSelect, onSelect, onCreate, onCreateSpace, onManageSpace, onLeaveSpace = window.orbitLeaveSpace, onAcceptInvite, onDeclineInvite, onAccount, onLogout }) {
+function Sidebar({ rooms, allRooms: roomUniverse = rooms, invites = [], spaces, selectedId, connected, presence, viewMode, activeSpaceId, countSelectedUnread = false, onViewMode, onSpaceSelect, onSelect, onCreate, onCreateSpace, onManageSpace, onLeaveSpace = window.orbitLeaveSpace, onAcceptInvite, onDeclineInvite, onAccount, onLogout }) {
   const [query, setQuery] = useState("");
   const [directSort, setDirectSort] = useState("active");
   const [directPresenceByUser, setDirectPresenceByUser] = useState({});
@@ -3270,8 +3784,8 @@ function Sidebar({ rooms, allRooms: roomUniverse = rooms, invites = [], spaces, 
   const directPresence = userId => directPresenceByUser[userId] || matrixPresence(connected.client, userId);
   // Badge totals must come from this committed render's props.
   const allRooms = roomUniverse;
-  const totalUnread = allRooms.filter(room => room.id !== selectedId && room.isDirect).reduce((sum, room) => sum + (Number(room.unread) || 0), 0);
-  const groupUnread = allRooms.filter(room => room.id !== selectedId && room.isGroup).reduce((sum, room) => sum + (Number(room.unread) || 0), 0);
+  const totalUnread = allRooms.filter(room => (countSelectedUnread || room.id !== selectedId) && room.isDirect).reduce((sum, room) => sum + (Number(room.unread) || 0), 0);
+  const groupUnread = allRooms.filter(room => (countSelectedUnread || room.id !== selectedId) && room.isGroup).reduce((sum, room) => sum + (Number(room.unread) || 0), 0);
   const unreadBadge = count => count > 0 ? h("span", { className: "nav-unread-badge", title: `${count} 条未读消息` }, count > 99 ? "99+" : count) : null;
   const sortedRooms = viewMode !== "messages" ? filtered : [...filtered].sort((a, b) => {
     if (directSort === "online") {
@@ -3290,7 +3804,7 @@ function Sidebar({ rooms, allRooms: roomUniverse = rooms, invites = [], spaces, 
       h("div", { className: "invite-actions" }, h("button", { type: "button", className: "invite-accept", onClick: () => onAcceptInvite?.(invite) }, "接受"), h("button", { type: "button", className: "invite-decline", onClick: () => onDeclineInvite?.(invite) }, "忽略"))
     ))
   ) : null;
-  return h("aside", { className: "sidebar" }, h("div", { className: "brand-row desktop-only" }, h("div", { className: "brand" }, h("div", { className: "brand-mark" }, "O"), h("div", null, "Orbit", h("div", { className: "workspace-pill" }, "Matrix 工作台"))), h("button", { className: "icon-button", title: viewMode === "spaces" && activeSpaceId ? "在当前空间创建房间" : "创建房间", onClick: onCreate }, "+")), h("div", { className: "sidebar-user-row" }, h("button", { className: "user-card", onClick: onAccount, title: "打开我的设置" }, h(MatrixAvatar, { client: connected.client, mxcUrl: memberAvatarMxc(currentUser), size: 32, className: "user-avatar", style: { background: colorFor(connected.userId) }, fallback: initials(connected.userId), alt: connected.userId }), h("div", { className: "user-meta" }, h("div", { className: "user-name" }, connected.client?.getUser?.(connected.userId)?.displayName || connected.userId), h("div", { className: "user-id" }, "我的设置")), h("span", { className: `online-dot ${presence === "offline" ? "offline-dot" : ""}`, title: presence || "online" })), h("button", { type: "button", className: "icon-button mobile-only mobile-create-room", title: "创建房间", "aria-label": "创建房间", onClick: onCreate }, h(Icon, { name: "plus", size: 22 }))), h("div", { className: "sidebar-nav" }, h("button", { className: `nav-item ${viewMode === "messages" ? "active" : ""}`, onClick: () => onViewMode("messages") }, "私聊", unreadBadge(totalUnread)), h("button", { className: `nav-item ${viewMode === "groups" ? "active" : ""}`, onClick: () => onViewMode("groups") }, "群聊", unreadBadge(groupUnread), invites.length > 0 && h("span", { className: "nav-unread-dot", title: `${invites.length} 个房间邀请` })), h("button", { className: `nav-item ${viewMode === "spaces" ? "active" : ""}`, onClick: () => onViewMode("spaces") }, "空间")), inviteNotice, viewMode === "spaces" && h("div", { className: "space-list" }, h("div", { className: "section-label" }, h("span", null, "我的空间"), h("span", { className: "space-actions" }, h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onCreateSpace?.(); }, title: "创建空间" }, "+"), activeSpaceId && h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onCreate?.(); }, title: "在当前空间创建房间" }, "新房间"), activeSpaceId && h("button", { className: "mini-link danger-mini-link", onClick: event => { event.stopPropagation(); onLeaveSpace?.(); }, title: "退出当前空间" }, "退出"), h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onManageSpace?.(); }, title: "管理空间房间" }, "⋯"))), spaces.length ? spaces.map(space => h("div", { className: `space-row ${space.id === activeSpaceId ? "active" : ""}`, key: space.id, onClick: () => onSpaceSelect(space.id) }, h("div", { className: "space-icon", style: { background: space.color } }, space.initials), h("span", null, space.name))) : h("div", { className: "empty-sidebar" }, "服务器没有返回 Space 房间")), h("div", { className: "room-tools" }, h(Input, { prefix: "⌕", placeholder: viewMode === "spaces" ? "搜索空间内房间" : viewMode === "groups" ? "搜索群聊" : "搜索私聊", value: query, onChange: setQuery, showClear: true })), h("div", { className: "section-label" }, h("span", null, viewMode === "spaces" ? "空间内房间" : viewMode === "groups" ? "群聊" : "私聊"), h("span", { className: "desktop-only" }, filtered.length), viewMode === "messages" && h("span", { className: "sort-switch", role: "group", "aria-label": "私聊排序" }, h("button", { type: "button", className: directSort === "active" ? "active" : "", onClick: () => setDirectSort("active") }, "活跃优先"), h("button", { type: "button", className: directSort === "online" ? "active" : "", onClick: () => setDirectSort("online") }, "在线优先"))), h("div", { className: "room-list" }, sortedRooms.length ? sortedRooms.map(room => { const directPresence = room.directUserId ? connected.client?.getUser?.(room.directUserId)?.presence : null; const showUnread = room.id !== selectedId && room.unread > 0; return h("div", { key: room.id, className: `room-row ${room.id === selectedId ? "active" : ""}`, onClick: () => onSelect(room.id) }, h(MatrixAvatar, { client: connected.client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 38, style: { background: room.color }, fallback: room.initials, alt: room.name }), h("div", { className: "room-copy" }, h("div", { className: "room-name-line" }, h("span", { className: "room-name" }, room.name), directPresence && h("span", { className: `room-presence-dot ${directPresence === "online" ? "online" : ""}`, title: directPresence === "online" ? "在线" : "离线" })), h("div", { className: "room-preview" }, room.preview)), h("div", { className: "room-trailing" }, h("span", { className: "room-time" }, room.time), showUnread ? h("span", { className: `room-unread-badge ${room.unread === 1 ? "dot" : ""}`, title: `${room.unread} 条未读消息` }, room.unread > 1 ? room.unread : null) : null)); }) : h("div", { className: "empty-sidebar" }, viewMode === "spaces" ? "请选择一个空间，或该空间还没有子房间" : "暂无房间")), h("div", { className: "sidebar-footer desktop-only" }, h("div", { className: "connection-state" }, h("span", { className: `online-dot ${presence === "offline" ? "offline-dot" : ""}` }), presence === "offline" ? "离线" : "Matrix 已连接"), h("button", { className: "icon-button", title: "退出登录", onClick: onLogout }, "↪")));
+  return h("aside", { className: "sidebar" }, h("div", { className: "brand-row desktop-only" }, h("div", { className: "brand" }, h("div", { className: "brand-mark" }, "O"), h("div", null, "Orbit", h("div", { className: "workspace-pill" }, "Matrix 工作台"))), h("button", { className: "icon-button", title: viewMode === "spaces" && activeSpaceId ? "在当前空间创建房间" : "创建房间", onClick: onCreate }, "+")), h("div", { className: "sidebar-user-row" }, h("button", { className: "user-card", onClick: onAccount, title: "打开我的设置" }, h(MatrixAvatar, { client: connected.client, mxcUrl: memberAvatarMxc(currentUser), size: 32, className: "user-avatar", style: { background: colorFor(connected.userId) }, fallback: initials(connected.userId), alt: connected.userId }), h("div", { className: "user-meta" }, h("div", { className: "user-name" }, connected.client?.getUser?.(connected.userId)?.displayName || connected.userId), h("div", { className: "user-id" }, "我的设置")), h("span", { className: `online-dot ${presence === "offline" ? "offline-dot" : ""}`, title: presence || "online" })), h("button", { type: "button", className: "icon-button mobile-only mobile-create-room", title: "创建房间", "aria-label": "创建房间", onClick: onCreate }, h(Icon, { name: "plus", size: 22 }))), h("div", { className: "sidebar-nav" }, h("button", { className: `nav-item ${viewMode === "messages" ? "active" : ""}`, onClick: () => onViewMode("messages") }, "私聊", unreadBadge(totalUnread)), h("button", { className: `nav-item ${viewMode === "groups" ? "active" : ""}`, onClick: () => onViewMode("groups") }, "群聊", unreadBadge(groupUnread), invites.length > 0 && h("span", { className: "nav-unread-dot", title: `${invites.length} 个房间邀请` })), h("button", { className: `nav-item ${viewMode === "spaces" ? "active" : ""}`, onClick: () => onViewMode("spaces") }, "空间")), inviteNotice, viewMode === "spaces" && h("div", { className: "space-list" }, h("div", { className: "section-label" }, h("span", null, "我的空间"), h("span", { className: "space-actions" }, h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onCreateSpace?.(); }, title: "创建空间" }, "+"), activeSpaceId && h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onCreate?.(); }, title: "在当前空间创建房间" }, "新房间"), activeSpaceId && h("button", { className: "mini-link danger-mini-link", onClick: event => { event.stopPropagation(); onLeaveSpace?.(); }, title: "退出当前空间" }, "退出"), h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onManageSpace?.(); }, title: "管理空间房间" }, "⋯"))), spaces.length ? spaces.map(space => h("div", { className: `space-row ${space.id === activeSpaceId ? "active" : ""}`, key: space.id, onClick: () => onSpaceSelect(space.id) }, h("div", { className: "space-icon", style: { background: space.color } }, space.initials), h("span", null, space.name))) : h("div", { className: "empty-sidebar" }, "服务器没有返回 Space 房间")), h("div", { className: "room-tools" }, h(Input, { prefix: "⌕", placeholder: viewMode === "spaces" ? "搜索空间内房间" : viewMode === "groups" ? "搜索群聊" : "搜索私聊", value: query, onChange: setQuery, showClear: true })), h("div", { className: "section-label" }, h("span", null, viewMode === "spaces" ? "空间内房间" : viewMode === "groups" ? "群聊" : "私聊"), h("span", { className: "desktop-only" }, filtered.length), viewMode === "messages" && h("span", { className: "sort-switch", role: "group", "aria-label": "私聊排序" }, h("button", { type: "button", className: directSort === "active" ? "active" : "", onClick: () => setDirectSort("active") }, "活跃优先"), h("button", { type: "button", className: directSort === "online" ? "active" : "", onClick: () => setDirectSort("online") }, "在线优先"))), h("div", { className: "room-list" }, sortedRooms.length ? sortedRooms.map(room => { const directPresence = room.directUserId ? connected.client?.getUser?.(room.directUserId)?.presence : null; const showUnread = room.unread > 0 && (countSelectedUnread || room.id !== selectedId); return h("div", { key: room.id, className: `room-row ${room.id === selectedId ? "active" : ""}`, onClick: () => onSelect(room.id) }, h(MatrixAvatar, { client: connected.client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 38, style: { background: room.color }, fallback: room.initials, alt: room.name }), h("div", { className: "room-copy" }, h("div", { className: "room-name-line" }, h("span", { className: "room-name" }, room.name), directPresence && h("span", { className: `room-presence-dot ${directPresence === "online" ? "online" : ""}`, title: directPresence === "online" ? "在线" : "离线" })), h("div", { className: "room-preview" }, room.preview)), h("div", { className: "room-trailing" }, h("span", { className: "room-time" }, room.time), showUnread ? h("span", { className: `room-unread-badge ${room.unread === 1 ? "dot" : ""}`, title: `${room.unread} 条未读消息` }, room.unread > 1 ? room.unread : null) : null)); }) : h("div", { className: "empty-sidebar" }, viewMode === "spaces" ? "请选择一个空间，或该空间还没有子房间" : "暂无房间")), h("div", { className: "sidebar-footer desktop-only" }, h("div", { className: "connection-state" }, h("span", { className: `online-dot ${presence === "offline" ? "offline-dot" : ""}` }), presence === "offline" ? "离线" : "Matrix 已连接"), h("button", { className: "icon-button", title: "退出登录", onClick: onLogout }, "↪")));
 }
 
 function SpaceDialog({ client, onClose, onCreated }) {
@@ -3451,10 +3965,11 @@ function emojiRefsFromEditorHtml(html) {
   if (!html || typeof DOMParser === "undefined") return [];
   try {
     const doc = new DOMParser().parseFromString(String(html), "text/html");
-    return [...doc.querySelectorAll("[data-emoji-token], [data-emoji-chip], [data-token]")].filter(node => !node.parentElement?.closest?.("[data-emoji-token], [data-emoji-chip], [data-token]")).map(node => {
-      const token = String(node.getAttribute("data-emoji-token") || node.getAttribute("data-token") || "");
+    return [...doc.querySelectorAll("[data-emoji-token], [data-emoji-chip], [data-token], img[data-mx-emoticon]")].filter(node => !node.parentElement?.closest?.("[data-emoji-token], [data-emoji-chip], [data-token]")).map(node => {
+      const token = String(node.getAttribute("data-emoji-token") || node.getAttribute("data-token") || node.getAttribute("alt") || node.getAttribute("title") || "");
       const shortcode = token.replace(/^:+|:+$/g, "").trim();
-      const mxc = String(node.getAttribute("data-mxc") || "");
+      const rawMxc = String(node.getAttribute("data-mxc") || node.getAttribute("src") || "");
+      const mxc = rawMxc.startsWith("mxc://") ? rawMxc : "";
       return shortcode && !/^k歌$/i.test(shortcode) ? { shortcode, mxc } : null;
     }).filter(Boolean);
   } catch { return []; }
@@ -3479,7 +3994,9 @@ function resolveComposerEmojiEntries(text, html, preparedMap, roomPrefix) {
       ? fromHtml[index]
       : fromHtml.find(entry => String(entry.shortcode).toLowerCase() === code.toLowerCase());
     if (preparedEntry) return { ...preparedEntry, shortcode: preparedEntry.shortcode || code, mxc: preparedEntry.mxc || htmlRef?.mxc || "" };
-    if (htmlRef?.mxc) return { shortcode: code, mxc: htmlRef.mxc, item: { name: code, shortcode: code } };
+    if (htmlRef?.mxc) return { shortcode: code, mxc: htmlRef.mxc, item: emojiItemForToken(code) || { name: code, shortcode: code } };
+    const catalogItem = emojiItemForToken(code);
+    if (catalogItem) return { shortcode: emojiShortcode(catalogItem) || code, mxc: htmlRef?.mxc || "", item: catalogItem };
     return null;
   }).filter(Boolean);
 }
@@ -3736,22 +4253,59 @@ function formatFileSize(value) {
 function AudioMessagePlayer({ src, className = "", label = "音频文件", durationMs = 0 }) {
   const ref = useRef(null);
   const knownDuration = Number(durationMs) > 0 ? Number(durationMs) / 1000 : 0;
+  const [playableSrc, setPlayableSrc] = useState(src || "");
   const [duration, setDuration] = useState(knownDuration);
   const [currentTime, setCurrentTime] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [rate, setRate] = useState(1);
   const [error, setError] = useState(false);
+  const transcodeRef = useRef({ src: "", url: "", pending: null });
   const waveform = [10, 18, 26, 14, 22, 32, 20, 13, 28, 36, 18, 24, 31, 16, 12, 23, 34, 20, 15, 27, 37, 22, 14, 25, 31, 18, 12, 21, 29, 16, 24, 34, 19, 13, 27, 35, 23, 17, 28, 20];
 
-  useEffect(() => { setDuration(knownDuration); setCurrentTime(0); setPlaying(false); setError(false); }, [src, knownDuration]);
+  const fallbackToWav = async currentSrc => {
+    if (!currentSrc || transcodeRef.current.src === currentSrc && transcodeRef.current.url) return transcodeRef.current.url;
+    if (transcodeRef.current.pending) return transcodeRef.current.pending;
+    const pending = transcodeVoiceToWavUrl(currentSrc).then(url => {
+      if (transcodeRef.current.url && transcodeRef.current.url !== url) URL.revokeObjectURL(transcodeRef.current.url);
+      transcodeRef.current = { src: currentSrc, url, pending: null };
+      return url;
+    }).catch(error => {
+      transcodeRef.current.pending = null;
+      throw error;
+    });
+    transcodeRef.current.pending = pending;
+    return pending;
+  };
+
+  useEffect(() => {
+    setPlayableSrc(src || "");
+    setDuration(knownDuration);
+    setCurrentTime(0);
+    setPlaying(false);
+    setError(false);
+  }, [src, knownDuration]);
+  useEffect(() => () => {
+    if (transcodeRef.current.url) URL.revokeObjectURL(transcodeRef.current.url);
+    transcodeRef.current = { src: "", url: "", pending: null };
+  }, []);
   useEffect(() => {
     const audio = ref.current;
     if (!audio) return undefined;
+    if (!playableSrc) return undefined;
     const loaded = () => { setDuration(Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : knownDuration); setError(false); };
     const time = () => setCurrentTime(audio.currentTime || 0);
     const play = () => setPlaying(true);
     const pause = () => setPlaying(false);
-    const failed = () => { setPlaying(false); setError(true); };
+    const failed = async () => {
+      setPlaying(false);
+      if (!src || playableSrc !== src) { setError(true); return; }
+      try {
+        const wavUrl = await fallbackToWav(src);
+        if (audio.getAttribute("src") === wavUrl) { setError(true); return; }
+        setPlayableSrc(wavUrl);
+        setError(false);
+      } catch { setError(true); }
+    };
     audio.addEventListener("loadedmetadata", loaded);
     audio.addEventListener("timeupdate", time);
     audio.addEventListener("play", play);
@@ -3768,7 +4322,7 @@ function AudioMessagePlayer({ src, className = "", label = "音频文件", durat
       audio.removeEventListener("ended", pause);
       audio.removeEventListener("error", failed);
     };
-  }, [src, knownDuration]);
+  }, [playableSrc, src, knownDuration]);
 
   const togglePlayback = async () => {
     const audio = ref.current;
@@ -3776,7 +4330,18 @@ function AudioMessagePlayer({ src, className = "", label = "音频文件", durat
     try {
       if (audio.paused) await audio.play();
       else audio.pause();
-    } catch { setError(true); setPlaying(false); }
+    } catch {
+      try {
+        const wavUrl = await fallbackToWav(src || playableSrc);
+        if (wavUrl && playableSrc !== wavUrl) {
+          setPlayableSrc(wavUrl);
+          setError(false);
+          return;
+        }
+      } catch {}
+      setError(true);
+      setPlaying(false);
+    }
   };
   const seek = event => {
     const next = Number(event.target.value) || 0;
@@ -3800,7 +4365,7 @@ function AudioMessagePlayer({ src, className = "", label = "音频文件", durat
   const progress = duration ? Math.min(100, Math.max(0, currentTime / duration * 100)) : 0;
   const playedBars = Math.round(progress / 100 * waveform.length);
   return h("div", { className: `media-player media-player-audio ${className} ${playing ? "is-playing" : ""} ${error ? "has-error" : ""}`, role: "group", "aria-label": label },
-    h("audio", { ref, className: "media-native audio-native", src, preload: "metadata" }),
+    h("audio", { ref, className: "media-native audio-native", src: playableSrc || undefined, preload: "metadata" }),
     h("div", { className: "audio-player-main" },
       h("button", { type: "button", className: "audio-play-button", onClick: togglePlayback, disabled: error, "aria-label": playing ? "暂停音频" : "播放音频" }, h(Icon, { name: playing ? "pause" : "play", size: 17 })),
       h("div", { className: "audio-player-body" },
@@ -4374,7 +4939,7 @@ function Message({ item, client, onReply, onReact, onThread, onEdit, onRedact, o
            relation,
            payload,
            item.decryptFailed && h("div", { className: "decrypt-hint" }, "请在“我的设置 → 设备与安全”中恢复密钥"),
-            reactions.length > 0 && h("div", { className: "reaction-row" }, reactions.map(([key, count]) => h(ReactionPopover, { key, users: item.reactionUsers?.[key] || [] }, h("button", { type: "button", className: "reaction", onClick: event => { event.stopPropagation(); onReact(item, key); } }, reactionLabel(key), h("span", { className: "reaction-count" }, count))))),
+            reactions.length > 0 && h("div", { className: "reaction-row" }, reactions.map(([key, count]) => h(ReactionPopover, { key, users: item.reactionUsers?.[key] || [] }, h("button", { type: "button", className: "reaction", onClick: event => { event.stopPropagation(); onReact(item, key); } }, reactionLabel(key, item.reactionMeta?.[key]), h("span", { className: "reaction-count" }, count))))),
            h("div", { className: "message-actions" },
              h(ReactionPicker, { client, onSelect: key => onReact(item, key) }),
              h("button", { onClick: event => { event.stopPropagation(); onReply(item); } }, "回复"),
@@ -5304,8 +5869,20 @@ function App() {
       if (showRoom) { setShowRoom(false); return; }
       if (showSpace) { setShowSpace(false); return; }
       if (showSpaceRooms) { setShowSpaceRooms(false); return; }
-      if (mobileViewRef.current === "details") { setMobileView("chat"); return; }
-      if (mobileViewRef.current === "chat") setMobileView("rooms");
+      if (mobileViewRef.current === "details") { mobileViewRef.current = "chat"; setMobileView("chat"); return; }
+      if (mobileViewRef.current === "chat") {
+        const roomId = selectedIdRef.current;
+        const client = window.orbitMatrixClient;
+        const room = roomId ? client?.getRoom?.(roomId) : null;
+        const target = latestReadableEvent(room);
+        if (roomId && target) {
+          rememberOrbitRoomRead(roomId, target);
+          setRooms(current => current.map(entry => entry.id === roomId ? { ...entry, unread: 0, hasUnread: false } : entry));
+          markRoomRead(client, roomId, target).catch(() => {});
+        }
+        mobileViewRef.current = "rooms";
+        setMobileView("rooms");
+      }
     };
     const onPopState = event => {
       if (event.state?.overlay) return;
@@ -5316,8 +5893,20 @@ function App() {
         return;
       }
       if (event.state.root) {
+        if (mobileViewRef.current === "chat") {
+          const roomId = selectedIdRef.current;
+          const client = window.orbitMatrixClient;
+          const room = roomId ? client?.getRoom?.(roomId) : null;
+          const target = latestReadableEvent(room);
+          if (roomId && target) {
+            rememberOrbitRoomRead(roomId, target);
+            setRooms(current => current.map(entry => entry.id === roomId ? { ...entry, unread: 0, hasUnread: false } : entry));
+            markRoomRead(client, roomId, target).catch(() => {});
+          }
+        }
+        mobileViewRef.current = "rooms";
         setMobileView("rooms");
-        try { history.pushState({ orbit: true, view: "rooms", root: true }, ""); } catch {}
+        try { history.pushState({ orbit: true, view: "rooms", root: true, held: true }, ""); } catch {}
         return;
       }
       const view = event.state?.view;
@@ -5331,8 +5920,16 @@ function App() {
   }, [mobile, showAccount, showLogin, showSearch, showInvite, showForward, showRoom, showSpace, showSpaceRooms]);
   const openMobileRoom = id => {
     setSelectedId(id);
+    subscribeOrbitSlidingRoom(connected?.client, id);
+    const matrixRoom = connected?.client?.getRoom?.(id);
+    if (matrixRoom && connected?.client) {
+      roomMessages(matrixRoom, connected.userId, connected.client).then(loaded => {
+        setMessages(current => ({ ...current, [id]: loaded }));
+      }).catch(() => {});
+    }
     if (!mobile) return;
     if (mobileViewRef.current !== "chat") pushOrbitHistory("chat");
+    mobileViewRef.current = "chat";
     setMobileView("chat");
   };
   const openMobileDetails = () => {
@@ -5450,25 +6047,27 @@ function App() {
     };
   }, [connected?.client]);
   const rememberRoomRead = (roomId, event) => {
-    const eventId = event?.getId?.();
-    if (!roomId || !eventId) return;
-    locallyReadRoomsRef.current.set(roomId, { eventId, ts: Number(event?.getTs?.() || Date.now()) });
+    rememberOrbitRoomRead(roomId, event);
+    const stored = orbitLocalReadRooms.get(roomId);
+    if (stored) locallyReadRoomsRef.current.set(roomId, stored);
   };
   useEffect(() => {
     const client = connected?.client;
     const room = selectedId ? client?.getRoom?.(selectedId) : null;
     if (!client || !room || document.hidden) return;
-    const scrollNode = document.querySelector(".message-scroll");
-    if (!scrollNode || scrollNode.scrollHeight - scrollNode.scrollTop - scrollNode.clientHeight > 140) return;
-    const events = room.getLiveTimeline?.().getEvents?.() || [];
-    const readUpTo = room.getEventReadUpTo?.(client.getUserId?.(), true); const readIndex = readUpTo ? events.findIndex(event => event.getId?.() === readUpTo) : -1; const target = readIndex >= 0 ? [...events.slice(readIndex + 1)].reverse().find(event => event?.getId?.() && !room.hasPendingEvent?.(event.getId())) : [...events].reverse().find(event => event?.getId?.() && !room.hasPendingEvent?.(event.getId()));
+    if (mobile && mobileViewRef.current !== "chat" && mobileViewRef.current !== "details") return;
+    if (!mobile) {
+      const scrollNode = document.querySelector(".message-scroll");
+      if (!scrollNode || scrollNode.scrollHeight - scrollNode.scrollTop - scrollNode.clientHeight > 140) return;
+    }
+    const target = latestReadableEvent(room);
     if (!target) return;
-    rememberRoomRead(selectedId, target);
+    const previous = orbitLocalReadRooms.get(selectedId);
     setRooms(current => current.map(entry => entry.id === selectedId ? { ...entry, unread: 0, hasUnread: false } : entry));
-    const previous = locallyReadRoomsRef.current.get(selectedId);
     if (previous?.eventId === target.getId?.()) return;
-    markRoomRead(client, selectedId, target).then(() => { rememberRoomRead(selectedId, target); queueRefresh(client); }).catch(() => {});
-  }, [connected?.client, selectedId, messages[selectedId]?.length]);
+    rememberRoomRead(selectedId, target);
+    markRoomRead(client, selectedId, target).then(() => queueRefresh(client)).catch(() => {});
+  }, [connected?.client, selectedId, messages[selectedId]?.length, mobileView]);
   useEffect(() => { const client = connected?.client; const crypto = client?.getCrypto?.(); if (!client) return; const eventName = MatrixSDK.CryptoEvent?.VerificationRequestReceived || "crypto.verificationRequestReceived"; const onRequest = request => { if (request && !request.initiatedByMe) Toast.info(`收到设备验证请求：${request.otherDeviceId || "其他设备"}，请打开“我的设置 → 设备与安全”`); }; client.on?.(eventName, onRequest); crypto?.on?.(eventName, onRequest); return () => { client.off?.(eventName, onRequest); crypto?.off?.(eventName, onRequest); }; }, [connected?.client]);
   useEffect(() => { ensureEmojiCatalog().then(() => setEmojiCatalogReady(value => value + 1)); }, []);
   const onForward = (item, append = false) => {
@@ -5527,26 +6126,21 @@ function App() {
     });
     const pending = allRooms.filter(room => room.getMyMembership?.() === "invite" && !pendingJoinIds.has(room.roomId)).map(room => roomToView(room, client));
     setInvites(pending);
-    const joinedViews = allRooms.filter(room => room.getMyMembership?.() === "join" || pendingJoinIds.has(room.roomId)).map(room => {
-      const view = roomToView(room, client);
-      const localRead = locallyReadRoomsRef.current.get(room.roomId);
-      if (!localRead) return view;
-      const last = room.getLastLiveEvent?.() || room.getLiveTimeline?.().getEvents?.().slice(-1)[0];
-      const lastId = last?.getId?.();
-      const lastTs = Number(last?.getTs?.() || 0);
-      // Do not let a lagging SDK unread cache resurrect a badge. A genuinely
-      // newer remote event removes this override in the timeline listener.
-      if (lastId === localRead.eventId || lastTs <= localRead.ts) {
-        view.unread = 0;
-        view.hasUnread = false;
-      }
-      return view;
-    });
+    const joinedViews = allRooms.filter(room => room.getMyMembership?.() === "join" || pendingJoinIds.has(room.roomId)).map(room => roomToView(room, client));
     const joinedIds = new Set(joinedViews.map(room => room.id));
     const fallbackViews = [...optimisticJoined.values()].filter(room => !joinedIds.has(room.id));
     const next = [...joinedViews, ...fallbackViews].sort((a, b) => { if (a.pinned !== b.pinned) return a.pinned ? -1 : 1; return (b.matrixRoom.getLastLiveEvent?.()?.getTs?.() || b.lastTs || 0) - (a.matrixRoom.getLastLiveEvent?.()?.getTs?.() || a.lastTs || 0); });
-    setRooms(next); setSelectedId(id => id || next[0]?.id || null);
-    const nextMessages = {}; await Promise.all(next.map(async room => { nextMessages[room.id] = await roomMessages(room.matrixRoom, client.getUserId(), client); })); setMessages(current => ({ ...current, ...nextMessages }));
+    setRooms(next);
+    if (!isOrbitMobile()) setSelectedId(id => id || next[0]?.id || null);
+    const selected = selectedIdRef.current;
+    const viewingChat = !isOrbitMobile() || mobileViewRef.current === "chat" || mobileViewRef.current === "details";
+    if (selected && viewingChat) {
+      const room = next.find(item => item.id === selected);
+      if (room?.matrixRoom) {
+        const loaded = await roomMessages(room.matrixRoom, client.getUserId(), client);
+        setMessages(current => ({ ...current, [selected]: loaded }));
+      }
+    }
     // Presence returned by Matrix is often `offline` when a client has not
     // explicitly published presence.  The connection indicator should reflect
     // the sync session, not that optional presence hint.
@@ -5582,7 +6176,7 @@ function App() {
     Toast.error(`接受邀请失败：${error?.message || "请稍后重试"}`);
   } };
   const declineInvite = async invite => { try { await connected.client.leave(invite.id); Toast.success("已忽略房间邀请"); await refresh(connected.client); } catch (error) { Toast.error(`忽略邀请失败：${error?.message || "请稍后重试"}`); } };
-  const queueRefresh = client => { if (refreshTimer.current) return; refreshTimer.current = setTimeout(() => { refreshTimer.current = null; refresh(client).catch(error => console.warn("刷新房间失败", error)); }, 250); };
+  const queueRefresh = client => { if (refreshTimer.current) return; refreshTimer.current = setTimeout(() => { refreshTimer.current = null; refresh(client).catch(error => console.warn("刷新房间失败", error)); }, roomsRef.current.length ? 280 : 50); };
   const restoreKeys = async ({ type, key, passphrase, version }) => { const crypto = connected?.client?.getCrypto?.(); if (!crypto || !version) return; setCryptoState(s => ({ ...s, restoring: true, restoreProgress: 0, restoreStage: "prepare", error: null })); try {
     if (type === "key") {
       // Element's recovery key is the Secret Storage key. It must first
@@ -5606,8 +6200,8 @@ function App() {
     }
     if (type === "secret") { if (typeof crypto.loadSessionBackupPrivateKeyFromSecretStorage === "function") { try { await crypto.loadSessionBackupPrivateKeyFromSecretStorage(); } catch (error) { const stored = await crypto.isKeyBackupKeyStored?.(version); if (!stored) throw error; } } }
     const progressCallback = p => setCryptoState(s => ({ ...s, restoreStage: p?.stage || s.restoreStage, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })); const result = type === "passphrase" ? await crypto.restoreKeyBackupWithPassphrase(passphrase, { progressCallback }) : await crypto.restoreKeyBackup({ progressCallback }); try { await crypto.bootstrapCrossSigning?.({ authUploadDeviceSigningKeys: async () => ({}) }); } catch {} const retried = await retryLoadedRoomDecryption(connected.client); await refresh(connected.client); setCryptoState(s => ({ ...s, restoring: false, restoreProgress: 100, restoreStage: "done", keyRestored: true })); Toast.success(`密钥恢复完成，导入 ${result?.imported ?? 0} 个会话，已重试解密 ${retried} 条已加载消息。`); } catch (error) { const raw = error?.message || "密钥恢复失败"; const mismatch = /does not match|mismatch|match.*decryption key/i.test(raw); const message = mismatch ? `恢复密钥与服务器备份版本 ${version} 不匹配。请确认这是该账号当前 Secret Storage 的恢复密钥；如果备份曾重置，请从 Element“设置 → 安全与隐私”获取最新密钥。` : raw; setCryptoState(s => ({ ...s, restoring: false, restoreStage: "error", error: message })); Toast.error(message); } };
-  const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); setSyncing(true); setTimeout(() => setSyncing(false), 15000); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setPresence("offline"); setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const authExpired = isRecoverableAuthError(errorObject) || isFatalAuthError(errorObject); const message = authExpired ? ((client.getRefreshToken?.() || client.__orbitSession?.refreshToken) ? "Matrix 访问令牌过期，正在尝试刷新" : "Matrix 同步暂时失败，将自动重试") : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired) recoverMatrixAccessToken(client).catch(() => {}); }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room, toStartOfTimeline) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const selectedRoom = room?.roomId === selectedIdRef.current; const scrollNode = selectedRoom ? document.querySelector(".message-scroll") : null; const nearBottom = Boolean(scrollNode && scrollNode.scrollHeight - scrollNode.scrollTop - scrollNode.clientHeight <= 140); if (selectedRoom && !document.hidden && nearBottom) { Promise.resolve(markRoomRead(client, room?.roomId, event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && !toStartOfTimeline && eventId && eventShouldNotify(client, event) && (room?.roomId !== selectedIdRef.current || document.hidden || !document.hasFocus?.() || !nearBottom); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); if (!hasDecryptedNotificationContent(event)) { const timer = setTimeout(() => { orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body: "收到加密消息", compact: true }); }, 1400); orbitPendingEncryptedNotifications.set(eventId, { room, eventId, title, timer }); } else { markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body }); } } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", () => { queueRefresh(client); }); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user?.presence === "offline" ? "online" : (user?.presence || "online")); queueRefresh(client); }); client.on("Event.decrypted", event => { queueRefresh(client); const eventId = event?.getId?.(); const pending = eventId && orbitPendingEncryptedNotifications.get(eventId); if (!pending) return; clearTimeout(pending.timer); orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId) || !eventShouldNotify(client, event)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room: pending.room, roomId: pending.room?.roomId, eventId, title: pending.title, body: notificationBody(event) }); }); queueRefresh(client); setShowLogin(false); };
-  React.useEffect(() => { const session = readMatrixSession(); if (!session) return; (async () => { const start = async current => { loadPersistedRecoveryKey(current.userId); const resolved = await resolveHomeserver(current.homeserver); const client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, current); await initCryptoSafely(client); try { await client.getCrypto?.()?.loadSessionBackupPrivateKeyFromSecretStorage?.(); } catch {} window.orbitMatrixClient = client; connectedHandler({ client, userId: current.userId, homeserver: resolved.homeserver }); startOrbitSync(client, resolved); }; try { await start(session); } catch (error) { if (session.refreshToken) { try { const resolved = await resolveHomeserver(session.homeserver); await refreshMatrixSession(resolved.clientBaseUrl, session); saveMatrixSession(session); await start(session); return; } catch (refreshError) { if (!isFatalAuthError(refreshError)) { Toast.error(`无法恢复登录：${refreshError?.message || error?.message || "请检查网络"}`); return; } } } else if (!isFatalAuthError(error)) { Toast.error(`无法恢复登录：${error?.message || "请检查网络"}`); return; } if (isFatalAuthError(error)) { localStorage.removeItem(MATRIX_SESSION_STORAGE_KEY); setShowLogin(true); } } })(); }, []);
+  const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); const hasCachedRooms = (client.getRooms?.() || []).some(room => ["join", "invite"].includes(room.getMyMembership?.())); setSyncing(!hasCachedRooms); if (!hasCachedRooms) setTimeout(() => setSyncing(false), 5000); if (hasCachedRooms) refresh(client).catch(() => {}); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING", "CATCHUP"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setPresence("offline"); setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const refreshDead = Boolean(client.__orbitRefreshTokenInvalid || client.__orbitSession?.refreshTokenInvalid || !client.__orbitSession?.refreshToken); const authExpired = isRecoverableAuthError(errorObject) || isFatalAuthError(errorObject); const message = authExpired ? (refreshDead ? "Matrix 同步暂时失败，将自动重试" : "Matrix 访问令牌过期，正在尝试刷新") : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired && client.__orbitSlidingSync) { restartOrbitSyncWithoutSliding(client); return; } if (authExpired && !refreshDead) recoverMatrixAccessToken(client).catch(() => {}); }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room, toStartOfTimeline) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const selectedRoom = room?.roomId === selectedIdRef.current; const scrollNode = selectedRoom ? document.querySelector(".message-scroll") : null; const nearBottom = Boolean(scrollNode && scrollNode.scrollHeight - scrollNode.scrollTop - scrollNode.clientHeight <= 140); if (selectedRoom && !document.hidden && nearBottom) { Promise.resolve(markRoomRead(client, room?.roomId, event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && !toStartOfTimeline && eventId && eventShouldNotify(client, event) && (room?.roomId !== selectedIdRef.current || document.hidden || !document.hasFocus?.() || !nearBottom); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); if (!hasDecryptedNotificationContent(event)) { const timer = setTimeout(() => { orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body: "收到加密消息", compact: true }); }, 1400); orbitPendingEncryptedNotifications.set(eventId, { room, eventId, title, timer }); } else { markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body }); } } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", (event, state) => { const type = event?.getType?.(); if (type === "m.room.member" && state?.roomId !== selectedIdRef.current) return; queueRefresh(client); }); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user?.presence === "offline" ? "online" : (user?.presence || "online")); }); client.on("Event.decrypted", event => { queueRefresh(client); const eventId = event?.getId?.(); const pending = eventId && orbitPendingEncryptedNotifications.get(eventId); if (!pending) return; clearTimeout(pending.timer); orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId) || !eventShouldNotify(client, event)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room: pending.room, roomId: pending.room?.roomId, eventId, title: pending.title, body: notificationBody(event) }); }); queueRefresh(client); setShowLogin(false); };
+  React.useEffect(() => { const session = readMatrixSession(); if (!session) return; (async () => { const start = async current => { loadPersistedRecoveryKey(current.userId); const resolved = await resolveHomeserver(current.homeserver); const client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, current); await prepareOrbitClient(client); window.orbitMatrixClient = client; connectedHandler({ client, userId: current.userId, homeserver: resolved.homeserver }); const cryptoTask = warmOrbitCrypto(client); await Promise.race([cryptoTask, new Promise(resolve => setTimeout(resolve, 700))]); startOrbitSync(client, resolved); }; try { await start(session); } catch (error) { if (session.refreshToken) { try { const resolved = await resolveHomeserver(session.homeserver); await refreshMatrixSession(resolved.clientBaseUrl, session); persistMatrixSession(session); await start(session); return; } catch (refreshError) { if (isFatalAuthError(refreshError)) { dropMatrixRefreshToken(null, session); try { await start(session); return; } catch {} return; } Toast.error(`无法恢复登录：${refreshError?.message || error?.message || "请检查网络"}`); return; } } else if (!isFatalAuthError(error) && !isRecoverableAuthError(error)) { Toast.error(`无法恢复登录：${error?.message || "请检查网络"}`); return; } } })(); }, []);
   React.useEffect(() => {
     const url = new URL(window.location.href);
     const loginToken = url.searchParams.get("loginToken");
@@ -5648,15 +6242,15 @@ function App() {
     const onAuthSyncError = (state, _previous, data) => {
       if (state !== "ERROR") return;
       const error = data?.error || data;
-      if (isRecoverableAuthError(error) && (client.getRefreshToken?.() || client.__orbitSession?.refreshToken)) {
-        recoverMatrixAccessToken(client).catch(() => {});
+      if (isFatalAuthError(error)) {
+        dropMatrixRefreshToken(client, client.__orbitSession);
+        if (restartOrbitSyncWithoutSliding(client)) return;
         return;
       }
-      if (!isFatalAuthError(error)) return;
-      client.stopClient?.(); window.orbitMatrixClient = null;
-      localStorage.removeItem(MATRIX_SESSION_STORAGE_KEY);
-      setConnected(null); setRooms([]); setInvites([]); setMessages({}); setSelectedId(null); setShowLogin(true);
-      Toast.error("登录刷新已失效，请重新登录。");
+      if (isRecoverableAuthError(error)) {
+        if (client.__orbitSlidingSync && restartOrbitSyncWithoutSliding(client)) return;
+        if (latestMatrixRefreshToken(client, client.__orbitSession)) recoverMatrixAccessToken(client).catch(() => {});
+      }
     };
     client.on("sync", onAuthSyncError);
     return () => client.off?.("sync", onAuthSyncError);
@@ -5691,12 +6285,13 @@ function App() {
   const spaces = useMemo(() => rooms.filter(item => item.isSpace), [rooms]);
   const visibleRooms = useMemo(() => { if (viewMode === "spaces") { const space = spaces.find(item => item.id === activeSpaceId); if (!space) return []; const childIds = new Set(spaceChildIds(space.matrixRoom)); return rooms.filter(item => !item.isSpace && (childIds.has(item.id) || roomParentSpaceIds(item.matrixRoom).includes(space.id))); } if (viewMode === "groups") return rooms.filter(item => item.isGroup); return rooms.filter(item => !item.isSpace && item.isDirect); }, [rooms, spaces, viewMode, activeSpaceId]);
   const room = useMemo(() => rooms.find(item => item.id === selectedId) || visibleRooms.find(item => item.id === selectedId) || null, [rooms, visibleRooms, selectedId]);
-  const loadMore = async () => { if (!connected || !room) return false; const run = async () => { await ensureMatrixAccessToken(connected.client); const matrixRoom = room.matrixRoom; const before = (messages[room.id] || []).filter(item => item.type !== "empty").length; const beforeToken = matrixRoom?.oldState?.paginationToken; await connected.client.scrollback(matrixRoom, 40); const loaded = await roomMessages(matrixRoom, connected.userId, connected.client); const next = loaded.filter(item => item.type !== "empty"); setMessages(current => ({ ...current, [room.id]: loaded })); const afterToken = matrixRoom?.oldState?.paginationToken; const reachedStart = afterToken === null; return (!next.length && before === 0) || next.length > before || (!reachedStart && afterToken !== beforeToken); }; try { return await run(); } catch (error) { if (isRecoverableAuthError(error)) { try { if (await recoverMatrixAccessToken(connected.client)) return await run(); } catch {} } Toast.error(`历史消息加载失败：${error?.message || "请稍后重试"}`); return; } };
+  const loadMore = async () => { if (!connected || !room) return false; const client = connected.client; const run = async () => { await ensureMatrixAccessToken(client); const matrixRoom = room.matrixRoom; const before = (messages[room.id] || []).filter(item => item.type !== "empty").length; const beforeToken = matrixRoom?.getLiveTimeline?.()?.getPaginationToken?.(MatrixSDK.EventTimeline?.BACKWARDS || "b") ?? matrixRoom?.oldState?.paginationToken; try { await loadRoomHistoryWithoutRefresh(client, matrixRoom, 40); } catch (directError) { if (isFatalAuthError(directError)) dropMatrixRefreshToken(client, client.__orbitSession); if (!(isRecoverableAuthError(directError) || isFatalAuthError(directError))) throw directError; await client.scrollback(matrixRoom, 40); } const loaded = await roomMessages(matrixRoom, connected.userId, client); const next = loaded.filter(item => item.type !== "empty"); setMessages(current => ({ ...current, [room.id]: loaded })); const afterToken = matrixRoom?.getLiveTimeline?.()?.getPaginationToken?.(MatrixSDK.EventTimeline?.BACKWARDS || "b") ?? matrixRoom?.oldState?.paginationToken; const reachedStart = afterToken === null; return (!next.length && before === 0) || next.length > before || (!reachedStart && afterToken !== beforeToken); }; try { return await run(); } catch (error) { if (isFatalAuthError(error)) dropMatrixRefreshToken(client, client.__orbitSession); if (isRecoverableAuthError(error) || isFatalAuthError(error)) { try { return await run(); } catch (retryError) { Toast.error(historyLoadErrorMessage(retryError)); return false; } } Toast.error(historyLoadErrorMessage(error)); return false; } };
   const send = async (text, _html, mentions = [], resolvedEmoji = []) => {
     if (!connected || !room) return;
     try {
       if (editing) {
         const validMentions = (mentions || []).filter(entry => entry?.userId && String(text).includes(`@${String(entry.name || "").replace(/^@/, "")}`));
+        resolvedEmoji = await hydrateOutgoingEmoji(connected.client, text, _html, resolvedEmoji);
         const editedContent = resolvedEmoji.length ? createEmojiTextContent(text, resolvedEmoji, validMentions) : { msgtype: "m.text", body: text };
         if (!resolvedEmoji.length && _html && editorHtmlHasUserFormatting(_html)) {
           editedContent.format = "org.matrix.custom.html";
@@ -5716,6 +6311,7 @@ function App() {
         setEditing(null);
       } else {
         const validMentions = (mentions || []).filter(entry => entry?.userId && String(text).includes(`@${String(entry.name || "").replace(/^@/, "")}`));
+        resolvedEmoji = await hydrateOutgoingEmoji(connected.client, text, _html, resolvedEmoji);
         if (resolvedEmoji.length) {
           await Promise.all(resolvedEmoji.map(entry => publishRoomEmojiPack(connected.client, room.matrixRoom, entry.item, entry.mxc)));
         }
@@ -5724,10 +6320,12 @@ function App() {
           : replyTo
             ? { "m.in_reply_to": { event_id: replyTo.id } }
             : null;
-        if (resolvedEmoji.length && isEmojiOnlyMessage(text, resolvedEmoji) && resolvedEmoji.length === 1) {
-          const content = await createEmojiImageContent(connected.client, room.matrixRoom, resolvedEmoji[0]);
-          if (relatesTo) content["m.relates_to"] = relatesTo;
-          await connected.client.sendMessage(room.id, content);
+        if (resolvedEmoji.length && isEmojiOnlyMessage(text, resolvedEmoji)) {
+          for (const entry of resolvedEmoji) {
+            const content = await createEmojiImageContent(connected.client, room.matrixRoom, entry);
+            if (relatesTo) content["m.relates_to"] = relatesTo;
+            await connected.client.sendMessage(room.id, content);
+          }
           setReplyTo(null); setThreadRoot(null);
         } else {
           let content = resolvedEmoji.length
@@ -5860,7 +6458,8 @@ function App() {
   const markRead = id => {
     setRooms(current => current.map(entry => entry.id === id ? { ...entry, unread: 0, hasUnread: false } : entry));
     const targetRoom = connected?.client.getRoom(id);
-    const target = targetRoom?.getLiveTimeline?.().getEvents?.().slice(-1)[0];
+    const target = latestReadableEvent(targetRoom);
+    subscribeOrbitSlidingRoom(connected?.client, id);
     if (target) {
       rememberRoomRead(id, target);
       Promise.resolve(markRoomRead(connected.client, id, target)).then(() => queueRefresh(connected.client)).catch(() => {});
@@ -6046,7 +6645,7 @@ function App() {
     setSelecting(true);
   };
   const onReact = react;
-  return h("div", { className: "app-shell", "data-orbit-view": mobile ? mobileView : undefined }, h(Sidebar, { rooms: visibleRooms, allRooms: rooms, invites, spaces, selectedId, connected, presence, viewMode, activeSpaceId, onViewMode: mode => { setViewMode(mode); if (mobile) { setMobileView("rooms"); return; } const first = mode === "spaces" ? null : rooms.find(item => mode === "groups" ? item.isGroup : item.isDirect); if (first) setSelectedId(first.id); }, onSpaceSelect: id => { setActiveSpaceId(id); const child = spaceChildIds(spaces.find(item => item.id === id)?.matrixRoom)[0]; setSelectedId(child || null); if (mobile) setMobileView("rooms"); }, onSelect: id => { markRead(id); openMobileRoom(id); }, onAcceptInvite: acceptInvite, onDeclineInvite: declineInvite, onCreate: () => { if (mobile) pushOrbitHistory(mobileView, true); setShowRoom(true); }, onCreateSpace: () => { if (mobile) pushOrbitHistory(mobileView, true); setShowSpace(true); }, onManageSpace: () => { if (activeSpaceId) { if (mobile) pushOrbitHistory(mobileView, true); setShowSpaceRooms(true); } }, onAccount: () => { if (mobile) pushOrbitHistory(mobileView, true); setShowAccount(true); }, onLogout: logout }), syncing && h("div", { className: "sync-indicator" }, "正在同步 Matrix…"), h(Chat, { room, messages: selectedId ? (messages[selectedId] || []) : [], client: connected.client, detailsCollapsed, onLoadMore: loadMore, onSearch: () => { if (mobile) pushOrbitHistory(mobileView, true); setShowSearch(true); }, onSend: send, onTyping: typing, onReply: item => { setReplyTo(item); setThreadRoot(null); setEditing(null); }, onReact, onThread: item => { const loaded = messages[selectedId] || []; let root = item; const seen = new Set(); while (root && (root.threadRoot || root.replyTo) && !seen.has(root.id)) { seen.add(root.id); const parentId = root.threadRoot || root.replyTo; root = loaded.find(entry => entry.id === parentId) || root; if (root.id === item.id) break; } setThreadRoot(root); setReplyTo(null); setEditing(null); }, onEdit: item => { setEditing(item); setReplyTo(null); setThreadRoot(null); }, onRedact: redact, onJumpTo: jumpTo, onForward, onEmojiSelect: sendEmoji, onEmojiSend: sendCustomEmoji, replyTo, threadRoot, editing, onCancelReply: () => setReplyTo(null), onCancelThread: () => setThreadRoot(null), onCancelEdit: () => setEditing(null), onUpload: upload, selecting, forwardItems, onSelectForward: toggleForwardItem, onStartSelecting: setSelectingState, pinnedEventIds: room?.pinnedEventIds || [], onTogglePinMessage: togglePinMessage, onStartCall: startCall, activeCall: callSession, onOpenDetails: openMobileDetails, onBack: () => goOrbitBack() }), h(Details, { room, client: connected.client, onInvite: () => { if (mobile) pushOrbitHistory(mobileView, true); setShowInvite(true); }, onLeave: leaveRoom, collapsed: mobile ? mobileView !== "details" : detailsCollapsed, onToggle: () => { if (mobile) goOrbitBack(); else setDetailsCollapsed(value => !value); }, onRoomUpdated: () => refresh(connected.client) }), forwardItems.length > 0 && h("div", { className: "forward-bar" }, h("span", null, `已选择 ${forwardItems.length} 条消息`), h(UiButton, { size: "small", variant: "primary", onClick: () => setShowForward(true) }, mobile ? "转发" : "打开转发"), h(UiButton, { size: "small", className: "ghost-btn", onClick: () => setSelectingState(false) }, "清除")), selecting && forwardItems.length === 0 && h("div", { className: "forward-bar forward-bar-empty" }, h("span", null, "已进入多选模式，点击消息进行选择"), h(UiButton, { size: "small", className: "ghost-btn", onClick: () => setSelectingState(false) }, "取消多选")), showForward && h(ForwardDialog, { client: connected.client, rooms, items: forwardItems, onClose: () => { setShowForward(false); setSelectingState(false); } }), showRoom && h(RoomDialog, { client: connected.client, space: viewMode === "spaces" ? spaces.find(item => item.id === activeSpaceId) : null, onClose: () => setShowRoom(false), onCreated: roomId => { openMobileRoom(roomId); refresh(connected.client); } }), showSpace && h(SpaceDialog, { client: connected.client, onClose: () => setShowSpace(false), onCreated: roomId => { setActiveSpaceId(roomId); refresh(connected.client); } }), showSpaceRooms && activeSpaceId && h(SpaceRoomsDialog, { client: connected.client, space: spaces.find(item => item.id === activeSpaceId), rooms, onClose: () => setShowSpaceRooms(false), onChanged: () => refresh(connected.client) }), showInvite && room && h(InviteDialog, { client: connected.client, room, onClose: () => setShowInvite(false) }), showSearch && room && h(SearchDialog, { client: connected.client, room, onClose: () => setShowSearch(false) }), showAccount && h(AccountDialog, { client: connected.client, cryptoState, onRestore: restoreKeys, onLogout: logout, onClose: () => setShowAccount(false) }), callSession && h(CallOverlay, { session: callSession, client: connected.client, onHangup: hangupCall, onAnswer: answerCall, onToggleMute: toggleCallMute, onToggleVideo: toggleCallVideo }));
+  return h("div", { className: "app-shell", "data-orbit-view": mobile ? mobileView : undefined }, h(Sidebar, { rooms: visibleRooms, allRooms: rooms, invites, spaces, selectedId, connected, presence, viewMode, activeSpaceId, onViewMode: mode => { setViewMode(mode); if (mobile) { setMobileView("rooms"); return; } const first = mode === "spaces" ? null : rooms.find(item => mode === "groups" ? item.isGroup : item.isDirect); if (first) setSelectedId(first.id); }, onSpaceSelect: id => { setActiveSpaceId(id); const child = spaceChildIds(spaces.find(item => item.id === id)?.matrixRoom)[0]; setSelectedId(child || null); if (mobile) setMobileView("rooms"); }, countSelectedUnread: Boolean(mobile && mobileView === "rooms"), onSelect: id => { markRead(id); openMobileRoom(id); }, onAcceptInvite: acceptInvite, onDeclineInvite: declineInvite, onCreate: () => { if (mobile) pushOrbitHistory(mobileView, true); setShowRoom(true); }, onCreateSpace: () => { if (mobile) pushOrbitHistory(mobileView, true); setShowSpace(true); }, onManageSpace: () => { if (activeSpaceId) { if (mobile) pushOrbitHistory(mobileView, true); setShowSpaceRooms(true); } }, onAccount: () => { if (mobile) pushOrbitHistory(mobileView, true); setShowAccount(true); }, onLogout: logout }), syncing && h("div", { className: "sync-indicator" }, "正在同步 Matrix…"), h(Chat, { room, messages: selectedId ? (messages[selectedId] || []) : [], client: connected.client, detailsCollapsed, onLoadMore: loadMore, onSearch: () => { if (mobile) pushOrbitHistory(mobileView, true); setShowSearch(true); }, onSend: send, onTyping: typing, onReply: item => { setReplyTo(item); setThreadRoot(null); setEditing(null); }, onReact, onThread: item => { const loaded = messages[selectedId] || []; let root = item; const seen = new Set(); while (root && (root.threadRoot || root.replyTo) && !seen.has(root.id)) { seen.add(root.id); const parentId = root.threadRoot || root.replyTo; root = loaded.find(entry => entry.id === parentId) || root; if (root.id === item.id) break; } setThreadRoot(root); setReplyTo(null); setEditing(null); }, onEdit: item => { setEditing(item); setReplyTo(null); setThreadRoot(null); }, onRedact: redact, onJumpTo: jumpTo, onForward, onEmojiSelect: sendEmoji, onEmojiSend: sendCustomEmoji, replyTo, threadRoot, editing, onCancelReply: () => setReplyTo(null), onCancelThread: () => setThreadRoot(null), onCancelEdit: () => setEditing(null), onUpload: upload, selecting, forwardItems, onSelectForward: toggleForwardItem, onStartSelecting: setSelectingState, pinnedEventIds: room?.pinnedEventIds || [], onTogglePinMessage: togglePinMessage, onStartCall: startCall, activeCall: callSession, onOpenDetails: openMobileDetails, onBack: () => goOrbitBack() }), h(Details, { room, client: connected.client, onInvite: () => { if (mobile) pushOrbitHistory(mobileView, true); setShowInvite(true); }, onLeave: leaveRoom, collapsed: mobile ? mobileView !== "details" : detailsCollapsed, onToggle: () => { if (mobile) goOrbitBack(); else setDetailsCollapsed(value => !value); }, onRoomUpdated: () => refresh(connected.client) }), forwardItems.length > 0 && h("div", { className: "forward-bar" }, h("span", null, `已选择 ${forwardItems.length} 条消息`), h(UiButton, { size: "small", variant: "primary", onClick: () => setShowForward(true) }, mobile ? "转发" : "打开转发"), h(UiButton, { size: "small", className: "ghost-btn", onClick: () => setSelectingState(false) }, "清除")), selecting && forwardItems.length === 0 && h("div", { className: "forward-bar forward-bar-empty" }, h("span", null, "已进入多选模式，点击消息进行选择"), h(UiButton, { size: "small", className: "ghost-btn", onClick: () => setSelectingState(false) }, "取消多选")), showForward && h(ForwardDialog, { client: connected.client, rooms, items: forwardItems, onClose: () => { setShowForward(false); setSelectingState(false); } }), showRoom && h(RoomDialog, { client: connected.client, space: viewMode === "spaces" ? spaces.find(item => item.id === activeSpaceId) : null, onClose: () => setShowRoom(false), onCreated: roomId => { openMobileRoom(roomId); refresh(connected.client); } }), showSpace && h(SpaceDialog, { client: connected.client, onClose: () => setShowSpace(false), onCreated: roomId => { setActiveSpaceId(roomId); refresh(connected.client); } }), showSpaceRooms && activeSpaceId && h(SpaceRoomsDialog, { client: connected.client, space: spaces.find(item => item.id === activeSpaceId), rooms, onClose: () => setShowSpaceRooms(false), onChanged: () => refresh(connected.client) }), showInvite && room && h(InviteDialog, { client: connected.client, room, onClose: () => setShowInvite(false) }), showSearch && room && h(SearchDialog, { client: connected.client, room, onClose: () => setShowSearch(false) }), showAccount && h(AccountDialog, { client: connected.client, cryptoState, onRestore: restoreKeys, onLogout: logout, onClose: () => setShowAccount(false) }), callSession && h(CallOverlay, { session: callSession, client: connected.client, onHangup: hangupCall, onAnswer: answerCall, onToggleMute: toggleCallMute, onToggleVideo: toggleCallVideo }));
 }
 
 function AccountDialog({ client, onClose, cryptoState, onRestore, onLogout }) {
