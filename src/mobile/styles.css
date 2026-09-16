@@ -58,7 +58,7 @@ html[data-orbit-mobile="1"][data-orbit-view="landing"] .sidebar,
 html[data-orbit-mobile="1"][data-orbit-view="landing"] .landing-sidebar { display: none !important; }
 
 html[data-orbit-mobile="1"][data-orbit-view="rooms"] .main-panel,
-html[data-orbit-mobile="1"][data-orbit-view="rooms"] .details-panel { display: none !important; }
+html[data-orbit-mobile="1"][data-orbit-view="rooms"] .details-panel { display: none !important; transform: none !important; pointer-events: none !important; }
 
 html[data-orbit-mobile="1"][data-orbit-view="chat"] .details-panel { display: none !important; }
 html[data-orbit-mobile="1"][data-orbit-view="chat"] .sidebar {
@@ -122,6 +122,13 @@ html[data-orbit-mobile="1"].is-orbit-swiping-back-commit .details-panel {
 }
 html[data-orbit-mobile="1"].is-orbit-swiping-back-commit .sidebar {
   pointer-events: auto;
+}
+
+html[data-orbit-mobile="1"] .orbit-build-version {
+  margin: 4px 16px 14px;
+  color: #98a2b3;
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 html[data-orbit-mobile="1"] .sidebar {
@@ -883,7 +890,42 @@ html[data-orbit-mobile="1"] .call-action { min-width: 64px; }
 
 html[data-orbit-mobile="1"] .sync-indicator { top: calc(10px + var(--orbit-safe-top)); }
 
-html[data-orbit-mobile="1"] .media-lightbox-stage { width: 100vw; height: 100dvh; }
+html[data-orbit-mobile="1"].is-orbit-lightbox,
+html[data-orbit-mobile="1"].is-orbit-lightbox body {
+  touch-action: none;
+  overflow: hidden;
+}
+html[data-orbit-mobile="1"].is-orbit-swiping-back,
+html[data-orbit-mobile="1"].is-orbit-swiping-back body {
+  touch-action: none;
+}
+html[data-orbit-mobile="1"] .media-lightbox {
+  padding: calc(10px + var(--orbit-safe-top)) 12px calc(12px + var(--orbit-safe-bottom));
+  gap: 8px;
+  overflow: hidden;
+  touch-action: none;
+  overscroll-behavior: none;
+}
+html[data-orbit-mobile="1"] .media-lightbox-toolbar {
+  position: relative;
+  z-index: 30;
+  width: 100%;
+  flex: 0 0 auto;
+}
+html[data-orbit-mobile="1"] .media-lightbox-stage {
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  flex: 1 1 auto;
+  touch-action: none;
+}
+html[data-orbit-mobile="1"] .media-lightbox-image {
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  touch-action: none;
+}
 
 html[data-orbit-mobile="1"] .read-people-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 

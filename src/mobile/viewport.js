@@ -67,13 +67,13 @@ export function pushOrbitHistory(view, overlay = false) {
 }
 
 export function goOrbitBack() {
+  window.dispatchEvent(new CustomEvent("orbit:mobile-back"));
   try {
     if (history.state?.orbit && history.state.root === false) {
       history.back();
       return true;
     }
   } catch {}
-  window.dispatchEvent(new CustomEvent("orbit:mobile-back"));
   return false;
 }
 
@@ -118,7 +118,7 @@ export function installSwipeBack() {
     if (!isOrbitMobile()) return false;
     const view = document.documentElement.dataset.orbitView;
     if (view !== "chat" && view !== "details") return false;
-    if (document.querySelector(".orbit-voice-overlay, .orbit-sheet-backdrop, .modal-backdrop, .call-overlay")) return false;
+    if (document.querySelector(".orbit-voice-overlay, .orbit-sheet-backdrop, .modal-backdrop, .call-overlay, .media-lightbox")) return false;
     return true;
   };
 
@@ -180,7 +180,9 @@ export function installSwipeBack() {
         locked = true;
         document.documentElement.classList.add("is-orbit-swiping-back");
         document.documentElement.classList.remove("is-orbit-swiping-back-snap", "is-orbit-swiping-back-commit");
-        try { event.target?.setPointerCapture?.(event.pointerId); } catch {}
+        if (event.pointerType !== "touch") {
+          try { event.target?.setPointerCapture?.(event.pointerId); } catch {}
+        }
       } else return;
     }
     event.preventDefault();
@@ -188,7 +190,7 @@ export function installSwipeBack() {
     document.documentElement.style.setProperty("--orbit-back-x", `${x}px`);
   };
 
-  const finish = commit => {
+  const finish = (commit, event) => {
     tracking = false;
     locked = false;
     axis = null;
@@ -201,18 +203,10 @@ export function installSwipeBack() {
       window.setTimeout(resetBackSwipe, 140);
       return;
     }
-    armClickGuard(90);
-    root.classList.remove("is-orbit-swiping-back");
-    root.classList.add("is-orbit-swiping-back-commit");
-    root.style.setProperty("--orbit-back-x", `${window.innerWidth}px`);
-    commitTimer = window.setTimeout(() => {
-      commitTimer = 0;
-      goOrbitBack();
-      window.requestAnimationFrame(() => {
-        resetBackSwipe();
-        armClickGuard(60);
-      });
-    }, 90);
+    armClickGuard(50);
+    try { event?.target?.releasePointerCapture?.(event?.pointerId); } catch {}
+    goOrbitBack();
+    resetBackSwipe();
   };
 
   const onEnd = event => {
@@ -228,7 +222,12 @@ export function installSwipeBack() {
     if (p) lastX = p.clientX;
     const x = Math.max(0, lastX - startX);
     const threshold = Math.min(96, window.innerWidth * 0.2);
-    finish(x > threshold || (x > 40 && velocity > 0.28));
+    const commit = x > threshold || (x > 40 && velocity > 0.28);
+    if (commit) {
+      try { event?.preventDefault?.(); } catch {}
+      try { event?.stopPropagation?.(); } catch {}
+    }
+    finish(commit, event);
   };
 
   document.addEventListener("click", swallowClick, true);

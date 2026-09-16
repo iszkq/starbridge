@@ -8,7 +8,7 @@ import { decodeRecoveryKey } from "https://esm.sh/matrix-js-sdk@42.3.0/lib/crypt
 import { SlidingSync } from "https://esm.sh/matrix-js-sdk@42.3.0/lib/sliding-sync.js?bundle&external=@matrix-org/matrix-sdk-crypto-wasm";
 import Icon from "./src/ui/Icon.js?v=289";
 import { HaloComposer, PlainComposer } from "./src/editor/Composer.js?v=301";
-import { installOrbitMobile, isOrbitMobile, useOrbitMobile, longPressHandlers, mobileMessageGestures, setOrbitMobileView, pushOrbitHistory, installHorizontalDragScroll, goOrbitBack, seedOrbitHistory } from "./src/mobile/index.js?v=316";
+import { installOrbitMobile, isOrbitMobile, useOrbitMobile, longPressHandlers, mobileMessageGestures, setOrbitMobileView, pushOrbitHistory, installHorizontalDragScroll, goOrbitBack, seedOrbitHistory } from "./src/mobile/index.js?v=318";
 import {
   hasActiveMatrixRtcSession,
   parseRtcNotification,
@@ -34,6 +34,8 @@ window.fetch = (input, init) => {
 };
 
 installOrbitMobile();
+const ORBIT_APP_VERSION = "332";
+window.orbitAppVersion = ORBIT_APP_VERSION;
 const { Input: AntInput, Avatar: AntAvatar, Button: AntButton, Popover: AntPopover, Checkbox: AntCheckbox, message: antMessage } = Antd;
 const TextArea = AntInput.TextArea;
 const Input = props => h(AntInput, { ...props, allowClear: props.showClear, onChange: event => props.onChange?.(event?.target?.value ?? event) });
@@ -2216,19 +2218,49 @@ function ProgressiveImage({ thumbSrc, src, alt, className = "", onClick, onReque
 }
 
 function MediaLightbox({ viewer, onClose }) {
-  const [rotation, setRotation] = useState(0); const [scale, setScale] = useState(1); const [offset, setOffset] = useState({ x: 0, y: 0 }); const [dragging, setDragging] = useState(false); const dragRef = useRef(null);
+  const [rotation, setRotation] = useState(0);
+  const [scale, setScale] = useState(1);
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const overlayRef = useRef(null);
+  const stageRef = useRef(null);
+  const imageRef = useRef(null);
+  const zoomLabelRef = useRef(null);
+  const pointersRef = useRef(new Map());
+  const gestureRef = useRef(null);
+  const scaleRef = useRef(1);
+  const offsetRef = useRef({ x: 0, y: 0 });
+  const rotationRef = useRef(0);
   const close = event => { event?.preventDefault?.(); event?.stopPropagation?.(); onClose?.(); };
   const navigate = delta => {
     const gallery = viewer?.gallery || [];
     if (gallery.length < 2) return;
     const nextIndex = (Number(viewer.index) + delta + gallery.length) % gallery.length;
-    const next = gallery[nextIndex];
-    if (next) viewer.onNavigate?.(next, nextIndex);
+    const nextItem = gallery[nextIndex];
+    if (nextItem) viewer.onNavigate?.(nextItem, nextIndex);
   };
-  useEffect(() => { setRotation(0); setScale(1); setOffset({ x: 0, y: 0 }); }, [viewer?.src]);
+  const clampScale = value => Math.min(4, Math.max(0.5, Number(Number(value).toFixed(3))));
+  const setDraggingClass = on => { stageRef.current?.classList.toggle("is-dragging", Boolean(on)); };
+  const paint = (nextScale = scaleRef.current, nextOffset = offsetRef.current, nextRotation = rotationRef.current) => {
+    scaleRef.current = nextScale;
+    offsetRef.current = nextOffset;
+    rotationRef.current = nextRotation;
+    if (imageRef.current) imageRef.current.style.transform = "translate(" + nextOffset.x + "px, " + nextOffset.y + "px) rotate(" + nextRotation + "deg) scale(" + nextScale + ")";
+    if (zoomLabelRef.current) zoomLabelRef.current.textContent = Math.round(nextScale * 100) + "%";
+  };
+  const commit = () => {
+    const nextScale = scaleRef.current < 1.03 ? 1 : scaleRef.current;
+    const nextOffset = nextScale <= 1 ? { x: 0, y: 0 } : offsetRef.current;
+    paint(nextScale, nextOffset);
+    setScale(nextScale);
+    setOffset(nextOffset);
+    setRotation(rotationRef.current);
+    setDraggingClass(false);
+  };
+  useEffect(() => { setRotation(0); setScale(1); setOffset({ x: 0, y: 0 }); scaleRef.current = 1; offsetRef.current = { x: 0, y: 0 }; rotationRef.current = 0; paint(1, { x: 0, y: 0 }, 0); }, [viewer?.src]);
   useEffect(() => { if (scale <= 1) setOffset({ x: 0, y: 0 }); }, [scale]);
+  useEffect(() => { scaleRef.current = scale; offsetRef.current = offset; rotationRef.current = rotation; paint(scale, offset, rotation); }, [scale, offset, rotation]);
   useEffect(() => {
-    if (!viewer) return;
+    if (!viewer) return undefined;
     const onKey = event => {
       if (event.key === "Escape") close(event);
       if (event.key === "ArrowLeft") navigate(-1);
@@ -2237,15 +2269,117 @@ function MediaLightbox({ viewer, onClose }) {
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [viewer, onClose]);
+  useEffect(() => {
+    const overlay = overlayRef.current;
+    const stage = stageRef.current;
+    if (!overlay || !stage) return undefined;
+    const root = document.documentElement;
+    root.classList.add("is-orbit-lightbox");
+    const viewport = document.querySelector("meta[name=\"viewport\"]");
+    const prevViewport = viewport?.getAttribute("content") || "";
+    if (viewport && !/maximum-scale/.test(prevViewport)) viewport.setAttribute("content", prevViewport + ", maximum-scale=1, user-scalable=no");
+    const preventBrowserZoom = event => {
+      if (event.touches?.length > 1 || scaleRef.current > 1) event.preventDefault();
+    };
+    const preventGesture = event => event.preventDefault();
+    const pointerList = () => [...pointersRef.current.values()];
+    const onPointerDown = event => {
+      if (event.pointerType === "mouse" && event.button !== 0) return;
+      if (event.target?.closest?.(".media-lightbox-toolbar, .media-lightbox-edge, .ant-btn")) return;
+      pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      const points = pointerList();
+      if (points.length >= 2) {
+        const [a, b] = points;
+        gestureRef.current = { type: "pinch", distance: Math.hypot(a.x - b.x, a.y - b.y) || 1, mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, scale: scaleRef.current, offset: { ...offsetRef.current } };
+        setDraggingClass(true);
+        return;
+      }
+      gestureRef.current = { type: "pan", x: event.clientX, y: event.clientY, offset: { ...offsetRef.current }, moved: false };
+    };
+    const onPointerMove = event => {
+      if (!pointersRef.current.has(event.pointerId)) return;
+      pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      const points = pointerList();
+      let gesture = gestureRef.current;
+      if (points.length >= 2) {
+        const [a, b] = points;
+        const distance = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+        const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+        if (!gesture || gesture.type !== "pinch") {
+          gesture = { type: "pinch", distance, mid, scale: scaleRef.current, offset: { ...offsetRef.current } };
+          gestureRef.current = gesture;
+          setDraggingClass(true);
+        }
+        const nextScale = clampScale(gesture.scale * (distance / gesture.distance));
+        const box = stage.getBoundingClientRect();
+        const originX = box.left + box.width / 2;
+        const originY = box.top + box.height / 2;
+        const startMid = { x: gesture.mid.x - originX, y: gesture.mid.y - originY };
+        const imageX = (startMid.x - gesture.offset.x) / (gesture.scale || 1);
+        const imageY = (startMid.y - gesture.offset.y) / (gesture.scale || 1);
+        const nowMid = { x: mid.x - originX, y: mid.y - originY };
+        paint(nextScale, { x: nowMid.x - imageX * nextScale, y: nowMid.y - imageY * nextScale });
+        event.preventDefault();
+        return;
+      }
+      if (!gesture || gesture.type !== "pan") return;
+      const dx = event.clientX - gesture.x;
+      const dy = event.clientY - gesture.y;
+      if (Math.hypot(dx, dy) > 6) gesture.moved = true;
+      if (scaleRef.current > 1) {
+        paint(scaleRef.current, { x: gesture.offset.x + dx, y: gesture.offset.y + dy });
+        event.preventDefault();
+      }
+    };
+    const onPointerUp = event => {
+      if (!pointersRef.current.has(event.pointerId)) return;
+      pointersRef.current.delete(event.pointerId);
+      const points = pointerList();
+      const gesture = gestureRef.current;
+      if (points.length >= 2) return;
+      if (points.length === 1) {
+        const p = points[0];
+        gestureRef.current = { type: "pan", x: p.x, y: p.y, offset: { ...offsetRef.current }, moved: true };
+        return;
+      }
+      if (gesture?.type === "pan" && !gesture.moved && scaleRef.current <= 1 && (event.target === stage || event.target === overlay)) close(event);
+      if (gesture?.type === "pinch" || (gesture?.type === "pan" && (gesture.moved || scaleRef.current > 1))) commit();
+      else setDraggingClass(false);
+      gestureRef.current = null;
+    };
+    overlay.addEventListener("touchstart", preventBrowserZoom, { passive: false });
+    overlay.addEventListener("touchmove", preventBrowserZoom, { passive: false });
+    overlay.addEventListener("gesturestart", preventGesture, { passive: false });
+    overlay.addEventListener("gesturechange", preventGesture, { passive: false });
+    overlay.addEventListener("gestureend", preventGesture, { passive: false });
+    stage.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("pointermove", onPointerMove, { passive: false });
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+    return () => {
+      root.classList.remove("is-orbit-lightbox");
+      if (viewport) viewport.setAttribute("content", prevViewport);
+      overlay.removeEventListener("touchstart", preventBrowserZoom);
+      overlay.removeEventListener("touchmove", preventBrowserZoom);
+      overlay.removeEventListener("gesturestart", preventGesture);
+      overlay.removeEventListener("gesturechange", preventGesture);
+      overlay.removeEventListener("gestureend", preventGesture);
+      stage.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+      pointersRef.current.clear();
+    };
+  }, [viewer]);
   if (!viewer) return null;
-  const adjustScale = delta => setScale(value => Math.min(4, Math.max(0.35, Number((value + delta).toFixed(2)))));
-  const beginDrag = event => { if (scale <= 1) return; event.preventDefault(); dragRef.current = { x: event.clientX, y: event.clientY, offset }; setDragging(true); };
-  const moveDrag = event => { if (!dragRef.current) return; const start = dragRef.current; setOffset({ x: start.offset.x + event.clientX - start.x, y: start.offset.y + event.clientY - start.y }); };
-  const endDrag = () => { dragRef.current = null; setDragging(false); };
-  return createPortal(h("div", { className: "media-lightbox", role: "dialog", "aria-modal": "true", onMouseDown: event => event.target === event.currentTarget && close(event) },
-    h("div", { className: "media-lightbox-toolbar", onMouseDown: event => event.stopPropagation(), onClick: event => event.stopPropagation() }, h("span", null, viewer.gallery?.length > 1 ? `${Number(viewer.index) + 1}/${viewer.gallery.length} · ` : "", viewer.alt || "图片预览"), h("div", { className: "media-lightbox-actions" }, h(UiButton, { size: "small", htmlType: "button", title: "缩小", onClick: () => adjustScale(-0.2) }, "−"), h("span", { className: "media-zoom-value" }, `${Math.round(scale * 100)}%`), h(UiButton, { size: "small", htmlType: "button", title: "放大", onClick: () => adjustScale(0.2) }, "+"), h(UiButton, { size: "small", htmlType: "button", title: "重置缩放", onClick: () => setScale(1) }, "1:1"), h(UiButton, { size: "small", htmlType: "button", onClick: () => setRotation(value => value - 90) }, "↶"), h(UiButton, { size: "small", htmlType: "button", onClick: () => setRotation(value => value + 90) }, "↷"), h(UiButton, { size: "small", htmlType: "button", className: "media-lightbox-close", onClick: close }, "关闭"))),
+  const adjustScale = delta => setScale(value => clampScale(value + delta));
+  const beginDrag = event => { if (scale <= 1) return; event.preventDefault(); gestureRef.current = { type: "pan", x: event.clientX, y: event.clientY, offset: { ...offset }, moved: false }; setDraggingClass(true); };
+  const moveDrag = event => { if (!gestureRef.current || gestureRef.current.type !== "pan" || pointersRef.current.size) return; paint(scaleRef.current, { x: gestureRef.current.offset.x + event.clientX - gestureRef.current.x, y: gestureRef.current.offset.y + event.clientY - gestureRef.current.y }); };
+  const endDrag = () => { if (pointersRef.current.size) return; if (gestureRef.current?.type === "pan") commit(); else setDraggingClass(false); };
+  return createPortal(h("div", { ref: overlayRef, className: "media-lightbox", role: "dialog", "aria-modal": "true", onMouseDown: event => event.target === event.currentTarget && close(event) },
+    h("div", { className: "media-lightbox-toolbar", onMouseDown: event => event.stopPropagation(), onClick: event => event.stopPropagation() }, h("span", null, viewer.gallery?.length > 1 ? (Number(viewer.index) + 1) + "/" + viewer.gallery.length + " · " : "", viewer.alt || "图片预览"), h("div", { className: "media-lightbox-actions" }, h(UiButton, { size: "small", htmlType: "button", title: "缩小", onClick: () => adjustScale(-0.2) }, "−"), h("span", { ref: zoomLabelRef, className: "media-zoom-value" }, Math.round(scale * 100) + "%"), h(UiButton, { size: "small", htmlType: "button", title: "放大", onClick: () => adjustScale(0.2) }, "+"), h(UiButton, { size: "small", htmlType: "button", title: "重置缩放", onClick: () => { setScale(1); setOffset({ x: 0, y: 0 }); } }, "1:1"), h(UiButton, { size: "small", htmlType: "button", onClick: () => setRotation(value => value - 90) }, "↶"), h(UiButton, { size: "small", htmlType: "button", onClick: () => setRotation(value => value + 90) }, "↷"), h(UiButton, { size: "small", htmlType: "button", className: "media-lightbox-close", onClick: close }, "关闭"))),
     viewer.gallery?.length > 1 && h(React.Fragment, null, h("div", { className: "media-lightbox-edge media-lightbox-edge-prev" }, h("button", { type: "button", onClick: () => navigate(-1), "aria-label": "上一张", title: "上一张" }, "‹")), h("div", { className: "media-lightbox-edge media-lightbox-edge-next" }, h("button", { type: "button", onClick: () => navigate(1), "aria-label": "下一张", title: "下一张" }, "›"))),
-    h("div", { className: `media-lightbox-stage ${dragging ? "is-dragging" : ""}`, onWheel: event => { event.preventDefault(); adjustScale(event.deltaY > 0 ? -0.1 : 0.1); }, onMouseDown: event => event.target === event.currentTarget ? close(event) : beginDrag(event), onMouseMove: moveDrag, onMouseUp: endDrag, onMouseLeave: endDrag }, h("img", { className: "media-lightbox-image", src: viewer.src, alt: viewer.alt || "图片预览", draggable: false, style: { transform: `translate(${offset.x}px, ${offset.y}px) rotate(${rotation}deg) scale(${scale})` } }))), document.body);
+    h("div", { ref: stageRef, className: "media-lightbox-stage", onWheel: event => { event.preventDefault(); adjustScale(event.deltaY > 0 ? -0.1 : 0.1); }, onMouseDown: event => event.target === event.currentTarget ? close(event) : beginDrag(event), onMouseMove: moveDrag, onMouseUp: endDrag, onMouseLeave: endDrag }, h("img", { ref: imageRef, className: "media-lightbox-image", src: viewer.src, alt: viewer.alt || "图片预览", draggable: false }))), document.body);
 }
 
 function EmojiPicker({ onSelect, onInsert, onSendEmoji, variant = "popover", open, onOpenChange, onRequestKeyboard, panelHostRef }) {
@@ -3804,7 +3938,7 @@ function Sidebar({ rooms, allRooms: roomUniverse = rooms, invites = [], spaces, 
       h("div", { className: "invite-actions" }, h("button", { type: "button", className: "invite-accept", onClick: () => onAcceptInvite?.(invite) }, "接受"), h("button", { type: "button", className: "invite-decline", onClick: () => onDeclineInvite?.(invite) }, "忽略"))
     ))
   ) : null;
-  return h("aside", { className: "sidebar" }, h("div", { className: "brand-row desktop-only" }, h("div", { className: "brand" }, h("div", { className: "brand-mark" }, "O"), h("div", null, "Orbit", h("div", { className: "workspace-pill" }, "Matrix 工作台"))), h("button", { className: "icon-button", title: viewMode === "spaces" && activeSpaceId ? "在当前空间创建房间" : "创建房间", onClick: onCreate }, "+")), h("div", { className: "sidebar-user-row" }, h("button", { className: "user-card", onClick: onAccount, title: "打开我的设置" }, h(MatrixAvatar, { client: connected.client, mxcUrl: memberAvatarMxc(currentUser), size: 32, className: "user-avatar", style: { background: colorFor(connected.userId) }, fallback: initials(connected.userId), alt: connected.userId }), h("div", { className: "user-meta" }, h("div", { className: "user-name" }, connected.client?.getUser?.(connected.userId)?.displayName || connected.userId), h("div", { className: "user-id" }, "我的设置")), h("span", { className: `online-dot ${presence === "offline" ? "offline-dot" : ""}`, title: presence || "online" })), h("button", { type: "button", className: "icon-button mobile-only mobile-create-room", title: "创建房间", "aria-label": "创建房间", onClick: onCreate }, h(Icon, { name: "plus", size: 22 }))), h("div", { className: "sidebar-nav" }, h("button", { className: `nav-item ${viewMode === "messages" ? "active" : ""}`, onClick: () => onViewMode("messages") }, "私聊", unreadBadge(totalUnread)), h("button", { className: `nav-item ${viewMode === "groups" ? "active" : ""}`, onClick: () => onViewMode("groups") }, "群聊", unreadBadge(groupUnread), invites.length > 0 && h("span", { className: "nav-unread-dot", title: `${invites.length} 个房间邀请` })), h("button", { className: `nav-item ${viewMode === "spaces" ? "active" : ""}`, onClick: () => onViewMode("spaces") }, "空间")), inviteNotice, viewMode === "spaces" && h("div", { className: "space-list" }, h("div", { className: "section-label" }, h("span", null, "我的空间"), h("span", { className: "space-actions" }, h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onCreateSpace?.(); }, title: "创建空间" }, "+"), activeSpaceId && h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onCreate?.(); }, title: "在当前空间创建房间" }, "新房间"), activeSpaceId && h("button", { className: "mini-link danger-mini-link", onClick: event => { event.stopPropagation(); onLeaveSpace?.(); }, title: "退出当前空间" }, "退出"), h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onManageSpace?.(); }, title: "管理空间房间" }, "⋯"))), spaces.length ? spaces.map(space => h("div", { className: `space-row ${space.id === activeSpaceId ? "active" : ""}`, key: space.id, onClick: () => onSpaceSelect(space.id) }, h("div", { className: "space-icon", style: { background: space.color } }, space.initials), h("span", null, space.name))) : h("div", { className: "empty-sidebar" }, "服务器没有返回 Space 房间")), h("div", { className: "room-tools" }, h(Input, { prefix: "⌕", placeholder: viewMode === "spaces" ? "搜索空间内房间" : viewMode === "groups" ? "搜索群聊" : "搜索私聊", value: query, onChange: setQuery, showClear: true })), h("div", { className: "section-label" }, h("span", null, viewMode === "spaces" ? "空间内房间" : viewMode === "groups" ? "群聊" : "私聊"), h("span", { className: "desktop-only" }, filtered.length), viewMode === "messages" && h("span", { className: "sort-switch", role: "group", "aria-label": "私聊排序" }, h("button", { type: "button", className: directSort === "active" ? "active" : "", onClick: () => setDirectSort("active") }, "活跃优先"), h("button", { type: "button", className: directSort === "online" ? "active" : "", onClick: () => setDirectSort("online") }, "在线优先"))), h("div", { className: "room-list" }, sortedRooms.length ? sortedRooms.map(room => { const directPresence = room.directUserId ? connected.client?.getUser?.(room.directUserId)?.presence : null; const showUnread = room.unread > 0 && (countSelectedUnread || room.id !== selectedId); return h("div", { key: room.id, className: `room-row ${room.id === selectedId ? "active" : ""}`, onClick: () => onSelect(room.id) }, h(MatrixAvatar, { client: connected.client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 38, style: { background: room.color }, fallback: room.initials, alt: room.name }), h("div", { className: "room-copy" }, h("div", { className: "room-name-line" }, h("span", { className: "room-name" }, room.name), directPresence && h("span", { className: `room-presence-dot ${directPresence === "online" ? "online" : ""}`, title: directPresence === "online" ? "在线" : "离线" })), h("div", { className: "room-preview" }, room.preview)), h("div", { className: "room-trailing" }, h("span", { className: "room-time" }, room.time), showUnread ? h("span", { className: `room-unread-badge ${room.unread === 1 ? "dot" : ""}`, title: `${room.unread} 条未读消息` }, room.unread > 1 ? room.unread : null) : null)); }) : h("div", { className: "empty-sidebar" }, viewMode === "spaces" ? "请选择一个空间，或该空间还没有子房间" : "暂无房间")), h("div", { className: "sidebar-footer desktop-only" }, h("div", { className: "connection-state" }, h("span", { className: `online-dot ${presence === "offline" ? "offline-dot" : ""}` }), presence === "offline" ? "离线" : "Matrix 已连接"), h("button", { className: "icon-button", title: "退出登录", onClick: onLogout }, "↪")));
+  return h("aside", { className: "sidebar" }, h("div", { className: "brand-row desktop-only" }, h("div", { className: "brand" }, h("div", { className: "brand-mark" }, "O"), h("div", null, "Orbit", h("div", { className: "workspace-pill" }, "Matrix 工作台"))), h("button", { className: "icon-button", title: viewMode === "spaces" && activeSpaceId ? "在当前空间创建房间" : "创建房间", onClick: onCreate }, "+")), h("div", { className: "sidebar-user-row" }, h("button", { className: "user-card", onClick: onAccount, title: "打开我的设置" }, h(MatrixAvatar, { client: connected.client, mxcUrl: memberAvatarMxc(currentUser), size: 32, className: "user-avatar", style: { background: colorFor(connected.userId) }, fallback: initials(connected.userId), alt: connected.userId }), h("div", { className: "user-meta" }, h("div", { className: "user-name" }, connected.client?.getUser?.(connected.userId)?.displayName || connected.userId), h("div", { className: "user-id" }, "我的设置")), h("span", { className: `online-dot ${presence === "offline" ? "offline-dot" : ""}`, title: presence || "online" })), h("button", { type: "button", className: "icon-button mobile-only mobile-create-room", title: "创建房间", "aria-label": "创建房间", onClick: onCreate }, h(Icon, { name: "plus", size: 22 }))), h("div", { className: "sidebar-nav" }, h("button", { className: `nav-item ${viewMode === "messages" ? "active" : ""}`, onClick: () => onViewMode("messages") }, "私聊", unreadBadge(totalUnread)), h("button", { className: `nav-item ${viewMode === "groups" ? "active" : ""}`, onClick: () => onViewMode("groups") }, "群聊", unreadBadge(groupUnread), invites.length > 0 && h("span", { className: "nav-unread-dot", title: `${invites.length} 个房间邀请` })), h("button", { className: `nav-item ${viewMode === "spaces" ? "active" : ""}`, onClick: () => onViewMode("spaces") }, "空间")), inviteNotice, viewMode === "spaces" && h("div", { className: "space-list" }, h("div", { className: "section-label" }, h("span", null, "我的空间"), h("span", { className: "space-actions" }, h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onCreateSpace?.(); }, title: "创建空间" }, "+"), activeSpaceId && h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onCreate?.(); }, title: "在当前空间创建房间" }, "新房间"), activeSpaceId && h("button", { className: "mini-link danger-mini-link", onClick: event => { event.stopPropagation(); onLeaveSpace?.(); }, title: "退出当前空间" }, "退出"), h("button", { className: "mini-link", onClick: event => { event.stopPropagation(); onManageSpace?.(); }, title: "管理空间房间" }, "⋯"))), spaces.length ? spaces.map(space => h("div", { className: `space-row ${space.id === activeSpaceId ? "active" : ""}`, key: space.id, onClick: () => onSpaceSelect(space.id) }, h("div", { className: "space-icon", style: { background: space.color } }, space.initials), h("span", null, space.name))) : h("div", { className: "empty-sidebar" }, "服务器没有返回 Space 房间")), h("div", { className: "room-tools" }, h(Input, { prefix: "⌕", placeholder: viewMode === "spaces" ? "搜索空间内房间" : viewMode === "groups" ? "搜索群聊" : "搜索私聊", value: query, onChange: setQuery, showClear: true })), h("div", { className: "section-label" }, h("span", null, viewMode === "spaces" ? "空间内房间" : viewMode === "groups" ? "群聊" : "私聊"), h("span", { className: "desktop-only" }, filtered.length), viewMode === "messages" && h("span", { className: "sort-switch", role: "group", "aria-label": "私聊排序" }, h("button", { type: "button", className: directSort === "active" ? "active" : "", onClick: () => setDirectSort("active") }, "活跃优先"), h("button", { type: "button", className: directSort === "online" ? "active" : "", onClick: () => setDirectSort("online") }, "在线优先"))), h("div", { className: "room-list" }, sortedRooms.length ? sortedRooms.map(room => { const directPresence = room.directUserId ? connected.client?.getUser?.(room.directUserId)?.presence : null; const showUnread = room.unread > 0 && (countSelectedUnread || room.id !== selectedId); return h("div", { key: room.id, className: `room-row ${room.id === selectedId ? "active" : ""}`, onClick: () => onSelect(room.id) }, h(MatrixAvatar, { client: connected.client, mxcUrl: room.avatarMxc, httpUrl: room.avatarUrl, size: 38, style: { background: room.color }, fallback: room.initials, alt: room.name }), h("div", { className: "room-copy" }, h("div", { className: "room-name-line" }, h("span", { className: "room-name" }, room.name), directPresence && h("span", { className: `room-presence-dot ${directPresence === "online" ? "online" : ""}`, title: directPresence === "online" ? "在线" : "离线" })), h("div", { className: "room-preview" }, room.preview)), h("div", { className: "room-trailing" }, h("span", { className: "room-time" }, room.time), showUnread ? h("span", { className: `room-unread-badge ${room.unread === 1 ? "dot" : ""}`, title: `${room.unread} 条未读消息` }, room.unread > 1 ? room.unread : null) : null)); }) : h("div", { className: "empty-sidebar" }, viewMode === "spaces" ? "请选择一个空间，或该空间还没有子房间" : "暂无房间")), h("div", { className: "mobile-only orbit-build-version" }, "版本 " + ORBIT_APP_VERSION), h("div", { className: "sidebar-footer desktop-only" }, h("div", { className: "connection-state" }, h("span", { className: `online-dot ${presence === "offline" ? "offline-dot" : ""}` }), presence === "offline" ? "离线" : "Matrix 已连接"), h("button", { className: "icon-button", title: "退出登录", onClick: onLogout }, "↪")));
 }
 
 function SpaceDialog({ client, onClose, onCreated }) {
@@ -5869,7 +6003,7 @@ function App() {
       if (showRoom) { setShowRoom(false); return; }
       if (showSpace) { setShowSpace(false); return; }
       if (showSpaceRooms) { setShowSpaceRooms(false); return; }
-      if (mobileViewRef.current === "details") { mobileViewRef.current = "chat"; setMobileView("chat"); return; }
+      if (mobileViewRef.current === "details") { mobileViewRef.current = "chat"; setOrbitMobileView("chat"); setMobileView("chat"); return; }
       if (mobileViewRef.current === "chat") {
         const roomId = selectedIdRef.current;
         const client = window.orbitMatrixClient;
@@ -5881,6 +6015,7 @@ function App() {
           markRoomRead(client, roomId, target).catch(() => {});
         }
         mobileViewRef.current = "rooms";
+        setOrbitMobileView("rooms");
         setMobileView("rooms");
       }
     };
@@ -5893,7 +6028,8 @@ function App() {
         return;
       }
       if (event.state.root) {
-        if (mobileViewRef.current === "chat") {
+        const alreadyRooms = mobileViewRef.current === "rooms";
+        if (!alreadyRooms && mobileViewRef.current === "chat") {
           const roomId = selectedIdRef.current;
           const client = window.orbitMatrixClient;
           const room = roomId ? client?.getRoom?.(roomId) : null;
@@ -5904,9 +6040,15 @@ function App() {
             markRoomRead(client, roomId, target).catch(() => {});
           }
         }
-        mobileViewRef.current = "rooms";
-        setMobileView("rooms");
-        try { history.pushState({ orbit: true, view: "rooms", root: true, held: true }, ""); } catch {}
+        if (!alreadyRooms) {
+          mobileViewRef.current = "rooms";
+          setMobileView("rooms");
+        }
+        if (!event.state.held) {
+          window.setTimeout(() => {
+            try { history.pushState({ orbit: true, view: "rooms", root: true, held: true }, ""); } catch {}
+          }, 0);
+        }
         return;
       }
       const view = event.state?.view;
@@ -6658,7 +6800,7 @@ function AccountDialog({ client, onClose, cryptoState, onRestore, onLogout }) {
   const enableNotifications = async () => { if (typeof Notification === "undefined") return Toast.error("当前浏览器不支持桌面通知"); const result = await Notification.requestPermission(); setNotificationPermission(result); Toast[result === "granted" ? "success" : "warning"](result === "granted" ? "桌面通知已开启" : "桌面通知未授权"); };
   if (active === "security") return h(LegacyAccountDialog, { client, onClose, onBack: () => { setActive("general"); setMobilePane(false); }, cryptoState, onRestore });
   const nav = [{ id: "general", label: "常规", hint: "界面与消息" }, { id: "account", label: "账号", hint: "资料与身份" }, { id: "notifications", label: "通知", hint: "提醒方式" }, { id: "security", label: "设备与安全", hint: "加密与设备" }, { id: "emoji", label: "表情与分类", hint: "云端目录" }, { id: "ai", label: "AI 助手", hint: "可选能力" }, { id: "developer", label: "开发工具", hint: "连接信息" }, { id: "about", label: "关于", hint: "版本信息" }];
-  const panel = active === "general" ? h("div", { className: "settings-panel-content" }, h("h3", null, "常规"), h("p", null, "保持清晰、克制的企业工作台体验。"), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "外观主题"), h("span", null, "浅色 · 企业蓝")), h("span", { className: "settings-value-chip" }, "当前")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "消息排版"), h("span", null, "紧凑布局，长文本保留原始换行")), h("span", { className: "settings-value-chip" }, "紧凑")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "发送方式"), h("span", null, mobile ? "点发送按钮发送，键盘换行" : "Enter 发送 · Shift + Enter 换行")), h("span", { className: "settings-value-chip" }, mobile ? "按钮发送" : "默认"))) : active === "account" ? h("div", { className: "settings-panel-content" }, h("h3", null, "账号"), h("p", null, "你的资料会通过 Matrix 账户接口同步到其他客户端。"), h("label", { className: "settings-field-label" }, "显示昵称", h(Input, { value: displayName, onChange: setDisplayName, placeholder: "输入显示昵称" })), h(UiButton, { variant: "primary", onClick: saveName }, "保存昵称"), h("div", { className: "settings-account-id" }, h("span", null, "Matrix ID"), h("code", null, client.getUserId?.() || "未知")), onLogout && h("button", { type: "button", className: "orbit-logout-btn", onClick: onLogout }, "退出登录")) : active === "notifications" ? h("div", { className: "settings-panel-content" }, h("h3", null, "通知"), h("p", null, "只在后台或当前房间之外提醒新消息。"), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "消息通知"), h("span", null, notificationPermission === "granted" ? "浏览器通知已授权" : "需要授权后接收提醒")), h(UiButton, { size: "small", onClick: enableNotifications }, notificationPermission === "granted" ? "已开启" : "开启")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "未读红点"), h("span", null, "房间列表会显示未读数量")), h("span", { className: "settings-value-chip" }, "已启用"))) : active === "emoji" ? h("div", { className: "settings-panel-content" }, h("h3", null, "表情与分类"), h("p", null, "从云端目录加载分类，发送时使用标准 Matrix 图片事件，GIF 保留动画。"), h("div", { className: "settings-account-id" }, h("span", null, "目录地址"), h("code", null, "image.527012.xyz/index.json")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "已加载分类"), h("span", null, "QQ、钉钉、月薪喵、B 站等")), h("span", { className: "settings-value-chip" }, "云端"))) : active === "ai" ? h("div", { className: "settings-panel-content" }, h("h3", null, "AI 助手"), h("p", null, "当前未配置 AI 服务。配置后可在不影响 Matrix 数据的前提下启用辅助能力。"), h("div", { className: "settings-empty-state" }, "未配置")) : active === "developer" ? h("div", { className: "settings-panel-content" }, h("h3", null, "开发工具"), h("div", { className: "settings-account-id" }, h("span", null, "Homeserver"), h("code", null, client.getHomeserverUrl?.() || "未知")), h("div", { className: "settings-account-id" }, h("span", null, "设备 ID"), h("code", null, client.getDeviceId?.() || "未知")), h("div", { className: "settings-account-id" }, h("span", null, "Matrix SDK"), h("code", null, "matrix-js-sdk 42.3.0"))) : h("div", { className: "settings-panel-content" }, h("h3", null, "关于"), h("p", null, "Orbit 是基于 Matrix 的企业级聊天工作台。"), h("div", { className: "settings-about-version" }, "Orbit Web · Matrix Client-Server API · E2EE Rust Crypto"));
+  const panel = active === "general" ? h("div", { className: "settings-panel-content" }, h("h3", null, "常规"), h("p", null, "保持清晰、克制的企业工作台体验。"), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "外观主题"), h("span", null, "浅色 · 企业蓝")), h("span", { className: "settings-value-chip" }, "当前")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "消息排版"), h("span", null, "紧凑布局，长文本保留原始换行")), h("span", { className: "settings-value-chip" }, "紧凑")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "发送方式"), h("span", null, mobile ? "点发送按钮发送，键盘换行" : "Enter 发送 · Shift + Enter 换行")), h("span", { className: "settings-value-chip" }, mobile ? "按钮发送" : "默认"))) : active === "account" ? h("div", { className: "settings-panel-content" }, h("h3", null, "账号"), h("p", null, "你的资料会通过 Matrix 账户接口同步到其他客户端。"), h("label", { className: "settings-field-label" }, "显示昵称", h(Input, { value: displayName, onChange: setDisplayName, placeholder: "输入显示昵称" })), h(UiButton, { variant: "primary", onClick: saveName }, "保存昵称"), h("div", { className: "settings-account-id" }, h("span", null, "Matrix ID"), h("code", null, client.getUserId?.() || "未知")), onLogout && h("button", { type: "button", className: "orbit-logout-btn", onClick: onLogout }, "退出登录")) : active === "notifications" ? h("div", { className: "settings-panel-content" }, h("h3", null, "通知"), h("p", null, "只在后台或当前房间之外提醒新消息。"), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "消息通知"), h("span", null, notificationPermission === "granted" ? "浏览器通知已授权" : "需要授权后接收提醒")), h(UiButton, { size: "small", onClick: enableNotifications }, notificationPermission === "granted" ? "已开启" : "开启")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "未读红点"), h("span", null, "房间列表会显示未读数量")), h("span", { className: "settings-value-chip" }, "已启用"))) : active === "emoji" ? h("div", { className: "settings-panel-content" }, h("h3", null, "表情与分类"), h("p", null, "从云端目录加载分类，发送时使用标准 Matrix 图片事件，GIF 保留动画。"), h("div", { className: "settings-account-id" }, h("span", null, "目录地址"), h("code", null, "image.527012.xyz/index.json")), h("div", { className: "settings-option-row" }, h("div", null, h("strong", null, "已加载分类"), h("span", null, "QQ、钉钉、月薪喵、B 站等")), h("span", { className: "settings-value-chip" }, "云端"))) : active === "ai" ? h("div", { className: "settings-panel-content" }, h("h3", null, "AI 助手"), h("p", null, "当前未配置 AI 服务。配置后可在不影响 Matrix 数据的前提下启用辅助能力。"), h("div", { className: "settings-empty-state" }, "未配置")) : active === "developer" ? h("div", { className: "settings-panel-content" }, h("h3", null, "开发工具"), h("div", { className: "settings-account-id" }, h("span", null, "Homeserver"), h("code", null, client.getHomeserverUrl?.() || "未知")), h("div", { className: "settings-account-id" }, h("span", null, "设备 ID"), h("code", null, client.getDeviceId?.() || "未知")), h("div", { className: "settings-account-id" }, h("span", null, "Matrix SDK"), h("code", null, "matrix-js-sdk 42.3.0"))) : h("div", { className: "settings-panel-content" }, h("h3", null, "关于"), h("p", null, "Orbit 是基于 Matrix 的企业级聊天工作台。"), h("div", { className: "settings-account-id" }, h("span", null, "客户端版本"), h("code", null, ORBIT_APP_VERSION)), h("div", { className: "settings-about-version" }, "Orbit Web · Matrix Client-Server API · E2EE Rust Crypto"));
   return h("div", { className: "modal-backdrop", onMouseDown: e => e.target === e.currentTarget && onClose() }, h("div", { className: "modal-card settings-card" }, h("div", { className: "modal-head settings-card-head" }, h("div", null, h("div", { className: "modal-title" }, mobile && mobilePane ? (nav.find(item => item.id === active)?.label || "设置") : "我的设置"), h("div", { className: "modal-copy" }, mobile && mobilePane ? (nav.find(item => item.id === active)?.hint || "") : "按分类管理账户、通知和设备安全。")), h("div", { className: "modal-head-actions" }, mobile && mobilePane && h(UiButton, { className: "icon-button", type: "text", onClick: () => setMobilePane(false), "aria-label": "返回设置分类" }, h(Icon, { name: "chevronLeft", size: 20 })), h(UiButton, { className: "icon-button", type: "text", onClick: onClose, "aria-label": "关闭" }, "×"))), h("div", { className: `settings-layout ${mobile ? (mobilePane ? "is-pane" : "is-nav") : ""}` }, h("nav", { className: "settings-sidebar", "aria-label": "设置分类" }, nav.map(item => h("button", { type: "button", key: item.id, className: `settings-nav-item ${active === item.id ? "active" : ""}`, onClick: () => { setActive(item.id); if (mobile) setMobilePane(true); } }, h("span", null, item.label), h("small", null, item.hint)))), h("section", { className: "settings-panel" }, panel))));
 }
 
