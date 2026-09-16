@@ -34,7 +34,7 @@ window.fetch = (input, init) => {
 };
 
 installOrbitMobile();
-const ORBIT_APP_VERSION = "335";
+const ORBIT_APP_VERSION = "336";
 window.orbitAppVersion = ORBIT_APP_VERSION;
 const { Input: AntInput, Avatar: AntAvatar, Button: AntButton, Popover: AntPopover, Checkbox: AntCheckbox, message: antMessage } = Antd;
 const TextArea = AntInput.TextArea;
@@ -2392,7 +2392,18 @@ function EmojiPicker({ onSelect, onInsert, onSendEmoji, variant = "popover", ope
   const catsRef = useRef(null);
   const skipSendRef = useRef(false);
   const previewTimerRef = useRef(0);
+  const previewStartRef = useRef(null);
   const [pressPreview, setPressPreview] = useState(null);
+  useEffect(() => {
+    if (!pressPreview) return undefined;
+    const block = event => event.preventDefault();
+    document.addEventListener("contextmenu", block, true);
+    document.addEventListener("dragstart", block, true);
+    return () => {
+      document.removeEventListener("contextmenu", block, true);
+      document.removeEventListener("dragstart", block, true);
+    };
+  }, [pressPreview]);
   useEffect(() => { if (variant === "panel") return undefined; const move = event => { const target = event.target?.closest?.(".emoji-item-wrap"); if (!target) return; const rect = target.getBoundingClientRect(); const width = 164; const height = 180; const gap = 10; const x = window.innerWidth - rect.right >= width + gap ? rect.right + gap : Math.max(8, rect.left - width - gap); const y = rect.top >= height + gap ? rect.top - height - gap : Math.min(window.innerHeight - height - 8, rect.bottom + gap); document.documentElement.style.setProperty("--orbit-picker-preview-x", `${x}px`); document.documentElement.style.setProperty("--orbit-picker-preview-y", `${y}px`); }; document.addEventListener("mousemove", move); return () => document.removeEventListener("mousemove", move); }, []);
   useEffect(() => { let active = true; setLoading(true); ensureEmojiCatalog().then(nextItems => { if (active) { setItems(nextItems); const nextPacks = window.orbitEmojiPacks || []; setPacks(nextPacks); if (variant === "panel" && nextPacks[0]?.id) setPack(current => current === "all" ? nextPacks[0].id : current); } }).finally(() => active && setLoading(false)); return () => { active = false; }; }, [variant]);
   const bindCats = node => {
@@ -2421,15 +2432,26 @@ function EmojiPicker({ onSelect, onInsert, onSendEmoji, variant = "popover", ope
     const panelGrid = loading
       ? h("div", { className: "emoji-loading" }, "正在加载表情…")
       : h("div", { className: "orbit-emoji-grid" }, (shown.length ? shown : []).map(item => h("button", { type: "button", className: "orbit-emoji-cell", key: item.id, title: item.name,
-        onPointerDown: () => {
+        onPointerDown: event => {
           skipSendRef.current = false;
           clearTimeout(previewTimerRef.current);
-          previewTimerRef.current = window.setTimeout(() => { skipSendRef.current = true; setPressPreview(item); }, 420);
+          previewStartRef.current = { x: event.clientX, y: event.clientY, id: event.pointerId };
+          previewTimerRef.current = window.setTimeout(() => { skipSendRef.current = true; setPressPreview(item); try { navigator.vibrate?.(10); } catch {} }, 380);
         },
-        onPointerUp: () => { clearTimeout(previewTimerRef.current); setPressPreview(null); },
-        onPointerCancel: () => { clearTimeout(previewTimerRef.current); skipSendRef.current = true; setPressPreview(null); },
+        onPointerMove: event => {
+          const start = previewStartRef.current;
+          if (!start || start.id !== event.pointerId) return;
+          if (Math.hypot(event.clientX - start.x, event.clientY - start.y) > 10) {
+            clearTimeout(previewTimerRef.current);
+            previewStartRef.current = null;
+            setPressPreview(null);
+          }
+        },
+        onPointerUp: () => { clearTimeout(previewTimerRef.current); previewStartRef.current = null; setPressPreview(null); },
+        onPointerCancel: () => { clearTimeout(previewTimerRef.current); previewStartRef.current = null; skipSendRef.current = true; setPressPreview(null); },
+        onContextMenu: event => event.preventDefault(),
         onClick: () => { if (skipSendRef.current || Date.now() < (window.__orbitEmojiArmUntil || 0)) return; if (mode === "sticker") onSelect?.(item); else onInsert?.(item); }
-      }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy" }))));
+      }, h("img", { src: assetRequestUrl(item.thumbUrl || item.url), alt: item.name, loading: "lazy", draggable: false, onDragStart: event => event.preventDefault() }))));
     const trigger = h("button", { type: "button", className: `tool-button composer-emoji-button ${panelOpen ? "is-open" : ""}`, title: panelOpen ? "键盘" : "表情", "aria-label": panelOpen ? "键盘" : "表情", onMouseDown: event => event.preventDefault(), onClick: () => { const next = !panelOpen; if (next) window.__orbitEmojiArmUntil = Date.now() + 320; onOpenChange?.(next); onRequestKeyboard?.(!next); } }, h(Icon, { name: panelOpen ? "keyboard" : "smile", size: 22 }));
     const panelNode = panelOpen ? h("div", { className: "orbit-emoji-panel", onMouseDown: event => { if (event.target?.closest?.(".orbit-emoji-cats, .orbit-emoji-grid, .emoji-mode-tabs")) return; event.preventDefault(); } },
       h("div", { className: "emoji-mode-tabs orbit-emoji-mode-tabs", role: "tablist" },
@@ -2443,7 +2465,7 @@ function EmojiPicker({ onSelect, onInsert, onSendEmoji, variant = "popover", ope
       )
     ) : null;
     const host = panelHostRef?.current;
-    return h(React.Fragment, null, trigger, panelNode && host ? createPortal(panelNode, host) : null, pressPreview ? createPortal(h("div", { className: "orbit-emoji-press-preview", role: "dialog" }, h("img", { src: assetRequestUrl(pressPreview.url || pressPreview.thumbUrl), alt: pressPreview.name }), h("strong", null, pressPreview.name)), document.body) : null);
+    return h(React.Fragment, null, trigger, panelNode && host ? createPortal(panelNode, host) : null, pressPreview ? createPortal(h("div", { className: "orbit-emoji-press-preview", role: "dialog" }, h("img", { src: assetRequestUrl(pressPreview.url || pressPreview.thumbUrl), alt: pressPreview.name, draggable: false }), h("strong", null, pressPreview.name)), document.body) : null);
   }
   return h(AntPopover, { trigger: "click", placement: "top", arrow: false, autoAdjustOverflow: true, getPopupContainer: node => node.closest?.(".composer-wrap") || document.body, content }, h("button", { type: "button", className: "tool-button composer-emoji-button", title: "表情包", "aria-label": "表情包" }, h(Icon, { name: "smile", size: 17 })));
 }

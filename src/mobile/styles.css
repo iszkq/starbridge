@@ -1790,6 +1790,14 @@ html[data-orbit-mobile="1"] .orbit-emoji-grid {
   -webkit-overflow-scrolling: touch;
 }
 
+html[data-orbit-mobile="1"] .orbit-emoji-panel,
+html[data-orbit-mobile="1"] .orbit-emoji-cell,
+html[data-orbit-mobile="1"] .orbit-emoji-cat,
+html[data-orbit-mobile="1"] .orbit-emoji-press-preview {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
 html[data-orbit-mobile="1"] .orbit-emoji-cell {
   aspect-ratio: 1;
   border: 0;
@@ -1798,6 +1806,8 @@ html[data-orbit-mobile="1"] .orbit-emoji-cell {
   background: transparent;
   display: grid;
   place-items: center;
+  touch-action: manipulation;
+  -webkit-user-drag: none;
 }
 
 html[data-orbit-mobile="1"] .orbit-emoji-cell:active {
@@ -1808,6 +1818,15 @@ html[data-orbit-mobile="1"] .orbit-emoji-cell img {
   width: 100%;
   height: 100%;
   object-fit: contain;
+}
+html[data-orbit-mobile="1"] .orbit-emoji-cell img,
+html[data-orbit-mobile="1"] .orbit-emoji-cat img,
+html[data-orbit-mobile="1"] .orbit-emoji-press-preview img {
+  pointer-events: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-user-drag: none;
 }
 
 html[data-orbit-mobile="1"] .ant-popover:has(.emoji-popover) {
@@ -1895,7 +1914,7 @@ html[data-orbit-mobile="1"] .orbit-emoji-press-preview {
   position: fixed;
   left: 50%;
   top: 18%;
-  z-index: 90;
+  z-index: 5000;
   width: min(220px, 64vw);
   padding: 16px 16px 12px;
   border-radius: 18px;
