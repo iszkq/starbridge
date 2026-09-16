@@ -34,7 +34,7 @@ window.fetch = (input, init) => {
 };
 
 installOrbitMobile();
-const ORBIT_APP_VERSION = "338";
+const ORBIT_APP_VERSION = "340";
 window.orbitAppVersion = ORBIT_APP_VERSION;
 const { Input: AntInput, Avatar: AntAvatar, Button: AntButton, Popover: AntPopover, Checkbox: AntCheckbox, message: antMessage } = Antd;
 const TextArea = AntInput.TextArea;
@@ -525,6 +525,7 @@ async function prepareOrbitClient(client) {
   requestOrbitPersistentStorage();
   await startupOrbitMatrixStore(client?.store);
   installOrbitStorePersistence(client);
+  installOrbitClientKeepAlive(client);
   return client;
 }
 
@@ -2994,6 +2995,8 @@ function promiseWithTimeout(promise, timeoutMs = 15000) {
 }
 
 const MATRIX_SESSION_STORAGE_KEY = "orbit.matrix.session";
+const ORBIT_ACCESS_TOKEN_DEFAULT_TTL_MS = 5 * 60 * 1000;
+const ORBIT_ACCESS_TOKEN_REFRESH_WINDOW_MS = 90_000;
 
 function readMatrixSession() {
   try {
@@ -3148,15 +3151,43 @@ async function recoverMatrixAccessToken(client) {
 }
 
 
+function matrixExpiresInMs(payload) {
+  const ms = Number(payload?.expires_in_ms || 0);
+  if (Number.isFinite(ms) && ms > 0) return ms;
+  const seconds = Number(payload?.expires_in || 0);
+  if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+  return 0;
+}
+
+function applyOrbitAccessTokenExpiry(session, payload) {
+  if (!session) return session;
+  const expiresMs = matrixExpiresInMs(payload);
+  if (expiresMs) session.accessTokenExpiresAt = Date.now() + expiresMs;
+  else if (session.refreshToken) session.accessTokenExpiresAt = Date.now() + ORBIT_ACCESS_TOKEN_DEFAULT_TTL_MS;
+  return session;
+}
+
+function orbitAccessTokenNeedsRefresh(session) {
+  if (!session?.refreshToken || session.refreshTokenInvalid) return false;
+  const expiresAt = Number(session.accessTokenExpiresAt || 0);
+  return !expiresAt || expiresAt - Date.now() <= ORBIT_ACCESS_TOKEN_REFRESH_WINDOW_MS;
+}
+
+async function ensureFreshStoredMatrixSession(baseUrl, session) {
+  if (!orbitAccessTokenNeedsRefresh(session)) return session;
+  await refreshMatrixSession(baseUrl, session);
+  persistMatrixSession(session);
+  return session;
+}
+
 function matrixSessionFromLogin(homeserver, result) {
-  return {
+  return applyOrbitAccessTokenExpiry({
     homeserver,
     userId: result.user_id,
     accessToken: result.access_token,
     deviceId: result.device_id,
     ...(result.refresh_token ? { refreshToken: result.refresh_token } : {}),
-    ...(result.expires_in_ms ? { accessTokenExpiresAt: Date.now() + result.expires_in_ms } : {}),
-  };
+  }, result);
 }
 
 async function refreshMatrixSession(baseUrl, session) {
@@ -3178,7 +3209,7 @@ async function refreshMatrixSession(baseUrl, session) {
   session.accessToken = refreshed.access_token;
   if (refreshed.refresh_token) session.refreshToken = refreshed.refresh_token;
   session.refreshTokenInvalid = false;
-  if (refreshed.expires_in_ms) session.accessTokenExpiresAt = Date.now() + refreshed.expires_in_ms;
+  applyOrbitAccessTokenExpiry(session, refreshed);
   return session;
 }
 
@@ -3215,7 +3246,7 @@ function createAuthenticatedMatrixClient(baseUrl, session) {
           return {
             accessToken: session.accessToken,
             refreshToken: session.refreshToken,
-            ...(session.accessTokenExpiresAt ? { expiry: new Date(session.accessTokenExpiresAt) } : {}),
+            expiry: new Date(session.accessTokenExpiresAt || (Date.now() + ORBIT_ACCESS_TOKEN_DEFAULT_TTL_MS)),
           };
         })().catch(error => {
           if (isFatalAuthError(error)) dropMatrixRefreshToken(client, session);
@@ -3231,7 +3262,10 @@ function createAuthenticatedMatrixClient(baseUrl, session) {
   applyMatrixSessionToClient(client, session);
   client.__orbitBaseUrl = baseUrl;
   client.on?.("Session.logged_out", () => {
-    dropMatrixRefreshToken(client, session);
+    recoverMatrixAccessToken(client).then(ok => {
+      if (ok) client.__orbitTokenRefreshedAt = Date.now();
+      else dropMatrixRefreshToken(client, session);
+    }).catch(() => dropMatrixRefreshToken(client, session));
   });
   if (options.tokenRefreshFunction) {
     const refresh = options.tokenRefreshFunction;
@@ -3246,15 +3280,30 @@ function createAuthenticatedMatrixClient(baseUrl, session) {
   return client;
 }
 
+async function refreshOrbitAccessTokenIfNeeded(client, { force = false } = {}) {
+  const session = client?.__orbitSession;
+  if (!client || session?.refreshTokenInvalid || client.__orbitRefreshTokenInvalid) return false;
+  if (!latestMatrixRefreshToken(client, session)) return false;
+  const expiresAt = Number(session?.accessTokenExpiresAt || 0);
+  const lastRefresh = Number(client.__orbitTokenRefreshedAt || 0);
+  if (!force) {
+    if (expiresAt && expiresAt - Date.now() > ORBIT_ACCESS_TOKEN_REFRESH_WINDOW_MS) return true;
+    if (!expiresAt && lastRefresh && Date.now() - lastRefresh < 4 * 60_000) return true;
+  }
+  const ok = await recoverMatrixAccessToken(client);
+  if (ok) {
+    client.__orbitTokenRefreshedAt = Date.now();
+    try { client.__orbitSlidingSync?.resend?.(); } catch {}
+  }
+  return ok;
+}
+
 async function ensureMatrixAccessToken(client) {
   const session = client?.__orbitSession;
   if (session?.refreshTokenInvalid || client?.__orbitRefreshTokenInvalid) return true;
-  const expiresAt = Number(session?.accessTokenExpiresAt || 0);
   if (!session?.refreshToken) return true;
-  if (expiresAt && expiresAt - Date.now() > 60_000) return true;
-  if (!expiresAt) return true;
   try {
-    await recoverMatrixAccessToken(client);
+    await refreshOrbitAccessTokenIfNeeded(client);
     return true;
   } catch (error) {
     if (isFatalAuthError(error)) {
@@ -3263,6 +3312,57 @@ async function ensureMatrixAccessToken(client) {
     }
     throw error;
   }
+}
+
+async function withOrbitAuthRetry(client, action) {
+  await ensureMatrixAccessToken(client);
+  try {
+    return await action();
+  } catch (error) {
+    if (!isRecoverableAuthError(error)) throw error;
+    const refreshed = await recoverMatrixAccessToken(client).catch(() => false);
+    if (!refreshed) throw error;
+    client.__orbitTokenRefreshedAt = Date.now();
+    return await action();
+  }
+}
+
+async function resumeOrbitClient(client, { forceRefresh = false } = {}) {
+  if (!client) return false;
+  if (client.__orbitResumePromise) return client.__orbitResumePromise;
+  client.__orbitResumePromise = (async () => {
+    try {
+      await refreshOrbitAccessTokenIfNeeded(client, { force: forceRefresh });
+      if (client.isRunning?.() === false) {
+        const wantSliding = !client.__orbitFallbackSync;
+        try { client.__orbitSlidingSync?.stop?.(); } catch {}
+        startOrbitSync(client, { clientBaseUrl: client.__orbitBaseUrl, slidingSync: wantSliding });
+        return true;
+      }
+      try { client.__orbitSlidingSync?.resend?.(); } catch {}
+      return true;
+    } catch (error) {
+      console.warn("恢复 Matrix 连接失败", error);
+      return false;
+    }
+  })().finally(() => { client.__orbitResumePromise = null; });
+  return client.__orbitResumePromise;
+}
+
+function installOrbitClientKeepAlive(client) {
+  if (!client || client.__orbitKeepAliveInstalled) return;
+  client.__orbitKeepAliveInstalled = true;
+  const resume = () => resumeOrbitClient(client);
+  const onVisible = () => { if (document.visibilityState === "visible") resume(); };
+  document.addEventListener("visibilitychange", onVisible);
+  window.addEventListener("pageshow", resume);
+  window.addEventListener("online", resume);
+  window.addEventListener("focus", resume);
+  client.__orbitTokenTimer = setInterval(() => {
+    if (document.hidden) return;
+    if (client.isRunning?.() === false) resumeOrbitClient(client).catch(() => {});
+    else refreshOrbitAccessTokenIfNeeded(client).catch(() => {});
+  }, 60_000);
 }
 
 async function getMatrixLoginFlows(baseUrl) {
@@ -6546,8 +6646,8 @@ function App() {
     }
     if (type === "secret") { if (typeof crypto.loadSessionBackupPrivateKeyFromSecretStorage === "function") { try { await crypto.loadSessionBackupPrivateKeyFromSecretStorage(); } catch (error) { const stored = await crypto.isKeyBackupKeyStored?.(version); if (!stored) throw error; } } }
     const progressCallback = p => setCryptoState(s => ({ ...s, restoreStage: p?.stage || s.restoreStage, restoreProgress: p?.total ? Math.round(((p.successes || 0) / p.total) * 100) : s.restoreProgress })); const result = type === "passphrase" ? await crypto.restoreKeyBackupWithPassphrase(passphrase, { progressCallback }) : await crypto.restoreKeyBackup({ progressCallback }); try { await crypto.bootstrapCrossSigning?.({ authUploadDeviceSigningKeys: async () => ({}) }); } catch {} const retried = await retryLoadedRoomDecryption(connected.client); await refresh(connected.client); setCryptoState(s => ({ ...s, restoring: false, restoreProgress: 100, restoreStage: "done", keyRestored: true })); Toast.success(`密钥恢复完成，导入 ${result?.imported ?? 0} 个会话，已重试解密 ${retried} 条已加载消息。`); } catch (error) { const raw = error?.message || "密钥恢复失败"; const mismatch = /does not match|mismatch|match.*decryption key/i.test(raw); const message = mismatch ? `恢复密钥与服务器备份版本 ${version} 不匹配。请确认这是该账号当前 Secret Storage 的恢复密钥；如果备份曾重置，请从 Element“设置 → 安全与隐私”获取最新密钥。` : raw; setCryptoState(s => ({ ...s, restoring: false, restoreStage: "error", error: message })); Toast.error(message); } };
-  const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); installOrbitStorePersistence(client); const hasCachedRooms = (client.getRooms?.() || []).some(room => ["join", "invite"].includes(room.getMyMembership?.())); setSyncing(!hasCachedRooms); if (!hasCachedRooms) setTimeout(() => setSyncing(false), 5000); if (hasCachedRooms) refresh(client).catch(() => {}); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING", "CATCHUP"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; if (state === "PREPARED") persistOrbitMatrixStore(client, true); queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setPresence("offline"); setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const refreshDead = Boolean(client.__orbitRefreshTokenInvalid || client.__orbitSession?.refreshTokenInvalid || !client.__orbitSession?.refreshToken); const authExpired = isRecoverableAuthError(errorObject) || isFatalAuthError(errorObject); const message = authExpired ? (refreshDead ? "Matrix 同步暂时失败，将自动重试" : "Matrix 访问令牌过期，正在尝试刷新") : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired && client.__orbitSlidingSync) { restartOrbitSyncWithoutSliding(client); return; } if (authExpired && !refreshDead) recoverMatrixAccessToken(client).catch(() => {}); }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room, toStartOfTimeline) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const viewingRoom = room?.roomId === selectedIdRef.current && !document.hidden && (!isOrbitMobile() || document.documentElement.dataset.orbitView === "chat" || document.documentElement.dataset.orbitView === "details"); const scrollNode = viewingRoom ? document.querySelector(".message-scroll") : null; const nearBottom = Boolean(scrollNode && scrollNode.scrollHeight - scrollNode.scrollTop - scrollNode.clientHeight <= 140); if (viewingRoom && nearBottom) { Promise.resolve(markRoomRead(client, room?.roomId, event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && !toStartOfTimeline && eventId && eventShouldNotify(client, event) && (!viewingRoom || !nearBottom); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); if (!hasDecryptedNotificationContent(event)) { const timer = setTimeout(() => { orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body: "收到加密消息", compact: true }); }, 1400); orbitPendingEncryptedNotifications.set(eventId, { room, eventId, title, timer }); } else { markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body }); } } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", (event, state) => { const type = event?.getType?.(); if (type === "m.room.member" && state?.roomId !== selectedIdRef.current) return; queueRefresh(client); }); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user?.presence === "offline" ? "online" : (user?.presence || "online")); }); client.on("Event.decrypted", event => { queueRefresh(client); const eventId = event?.getId?.(); const pending = eventId && orbitPendingEncryptedNotifications.get(eventId); if (!pending) return; clearTimeout(pending.timer); orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId) || !eventShouldNotify(client, event)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room: pending.room, roomId: pending.room?.roomId, eventId, title: pending.title, body: notificationBody(event) }); }); queueRefresh(client); setShowLogin(false); };
-  React.useEffect(() => { const session = readMatrixSession(); if (!session) return; const cachedRooms = loadOrbitCachedRooms(session.userId); if (cachedRooms.length) setRooms(cachedRooms); const cachedMessages = loadOrbitCachedMessages(session.userId); if (Object.keys(cachedMessages).length) setMessages(cachedMessages); (async () => { const start = async current => { loadPersistedRecoveryKey(current.userId); const resolved = await resolveHomeserver(current.homeserver); const client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, current); await prepareOrbitClient(client); window.orbitMatrixClient = client; connectedHandler({ client, userId: current.userId, homeserver: resolved.homeserver }); const cryptoTask = warmOrbitCrypto(client); await Promise.race([cryptoTask, new Promise(resolve => setTimeout(resolve, 700))]); startOrbitSync(client, resolved); }; try { await start(session); } catch (error) { if (session.refreshToken) { try { const resolved = await resolveHomeserver(session.homeserver); await refreshMatrixSession(resolved.clientBaseUrl, session); persistMatrixSession(session); await start(session); return; } catch (refreshError) { if (isFatalAuthError(refreshError)) { dropMatrixRefreshToken(null, session); try { await start(session); return; } catch {} return; } Toast.error(`无法恢复登录：${refreshError?.message || error?.message || "请检查网络"}`); return; } } else if (!isFatalAuthError(error) && !isRecoverableAuthError(error)) { Toast.error(`无法恢复登录：${error?.message || "请检查网络"}`); return; } } })(); }, []);
+  const connectedHandler = ({ client, userId, homeserver }) => { setConnected({ client, userId, homeserver }); installOrbitStorePersistence(client); const hasCachedRooms = (client.getRooms?.() || []).some(room => ["join", "invite"].includes(room.getMyMembership?.())); setSyncing(!hasCachedRooms); if (!hasCachedRooms) setTimeout(() => setSyncing(false), 5000); if (hasCachedRooms) refresh(client).catch(() => {}); refreshCrypto(client); let prepared = false; let lastSyncError = ""; const sync = (state, _prevState, data) => { if (["PREPARED", "SYNCING", "CATCHUP"].includes(state)) { prepared = true; setSyncing(false); lastSyncError = ""; if (state === "PREPARED") persistOrbitMatrixStore(client, true); queueRefresh(client); refreshCrypto(client); return; } if (state !== "ERROR") return; setPresence("offline"); setSyncing(false); const syncData = data || client.getSyncStateData?.() || {}; const errorObject = syncData?.error; const raw = errorObject?.message || errorObject?.errcode || syncData?.errorCode || syncData?.errcode || (typeof errorObject === "string" ? errorObject : "同步请求失败"); const text = String(raw); const refreshDead = Boolean(client.__orbitRefreshTokenInvalid || client.__orbitSession?.refreshTokenInvalid || !client.__orbitSession?.refreshToken); const authExpired = isRecoverableAuthError(errorObject) || isFatalAuthError(errorObject); const message = authExpired ? (refreshDead ? "Matrix 同步暂时失败，将自动重试" : "Matrix 访问令牌过期，正在尝试刷新") : /forbidden|M_FORBIDDEN|403/i.test(text) ? "Matrix 账户没有权限访问该房间" : /5\d{2}|network|timeout|请求失败/i.test(text) ? "Matrix 服务器暂时不可用，正在重试" : `Matrix 同步失败：${text}`; if (message !== lastSyncError) { lastSyncError = message; Toast.error(message); } if (authExpired) { resumeOrbitClient(client, { forceRefresh: !refreshDead }); return; } }; client.on("sync", sync); client.on("Room", room => { if (prepared && room?.getMyMembership?.() === "invite") Toast.info(`收到房间邀请：${room.name || room.roomId}`); queueRefresh(client); }); client.on("Room.timeline", (event, room, toStartOfTimeline) => { if (room) queueRefresh(client); if (!isNotifiableMessage(event) || event?.getSender?.() === userId) return; const eventId = event?.getId?.(); const viewingRoom = room?.roomId === selectedIdRef.current && !document.hidden && (!isOrbitMobile() || document.documentElement.dataset.orbitView === "chat" || document.documentElement.dataset.orbitView === "details"); const scrollNode = viewingRoom ? document.querySelector(".message-scroll") : null; const nearBottom = Boolean(scrollNode && scrollNode.scrollHeight - scrollNode.scrollTop - scrollNode.clientHeight <= 140); if (viewingRoom && nearBottom) { Promise.resolve(markRoomRead(client, room?.roomId, event)).then(() => queueRefresh(client)).catch(() => {}); } const shouldNotify = prepared && !toStartOfTimeline && eventId && eventShouldNotify(client, event) && (!viewingRoom || !nearBottom); if (shouldNotify && !orbitNotifiedEvents.has(eventId)) { const title = room?.name || "Matrix 新消息"; const body = notificationBody(event); if (!hasDecryptedNotificationContent(event)) { const timer = setTimeout(() => { orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body: "收到加密消息", compact: true }); }, 1400); orbitPendingEncryptedNotifications.set(eventId, { room, eventId, title, timer }); } else { markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room, roomId: room?.roomId, eventId, title, body }); } } }); client.on("RoomMember.membership", (_event, member) => { if (prepared && member?.membership === "invite" && member?.userId === userId) Toast.info(`收到房间邀请：${member?.roomId || "新房间"}`); queueRefresh(client); }); client.on("RoomState.events", (event, state) => { const type = event?.getType?.(); if (type === "m.room.member" && state?.roomId !== selectedIdRef.current) return; queueRefresh(client); }); client.on("User.presence", (_event, user) => { if (user?.userId === userId) setPresence(user?.presence === "offline" ? "online" : (user?.presence || "online")); }); client.on("Event.decrypted", event => { queueRefresh(client); const eventId = event?.getId?.(); const pending = eventId && orbitPendingEncryptedNotifications.get(eventId); if (!pending) return; clearTimeout(pending.timer); orbitPendingEncryptedNotifications.delete(eventId); if (orbitNotifiedEvents.has(eventId) || !eventShouldNotify(client, event)) return; markOrbitNotifiedEvent(eventId); enqueueMessageNotification({ room: pending.room, roomId: pending.room?.roomId, eventId, title: pending.title, body: notificationBody(event) }); }); queueRefresh(client); setShowLogin(false); };
+  React.useEffect(() => { const session = readMatrixSession(); if (!session) return; const cachedRooms = loadOrbitCachedRooms(session.userId); if (cachedRooms.length) setRooms(cachedRooms); const cachedMessages = loadOrbitCachedMessages(session.userId); if (Object.keys(cachedMessages).length) setMessages(cachedMessages); (async () => { const start = async current => { loadPersistedRecoveryKey(current.userId); const resolved = await resolveHomeserver(current.homeserver); try { await ensureFreshStoredMatrixSession(resolved.clientBaseUrl, current); } catch (refreshError) { if (!isFatalAuthError(refreshError)) throw refreshError; dropMatrixRefreshToken(null, current); } const client = createAuthenticatedMatrixClient(resolved.clientBaseUrl, current); await prepareOrbitClient(client); window.orbitMatrixClient = client; connectedHandler({ client, userId: current.userId, homeserver: resolved.homeserver }); const cryptoTask = warmOrbitCrypto(client); await Promise.race([cryptoTask, new Promise(resolve => setTimeout(resolve, 700))]); startOrbitSync(client, resolved); }; try { await start(session); } catch (error) { if (session.refreshToken) { try { const resolved = await resolveHomeserver(session.homeserver); await refreshMatrixSession(resolved.clientBaseUrl, session); persistMatrixSession(session); await start(session); return; } catch (refreshError) { if (isFatalAuthError(refreshError)) { dropMatrixRefreshToken(null, session); try { await start(session); return; } catch {} return; } Toast.error(`无法恢复登录：${refreshError?.message || error?.message || "请检查网络"}`); return; } } else if (!isFatalAuthError(error) && !isRecoverableAuthError(error)) { Toast.error(`无法恢复登录：${error?.message || "请检查网络"}`); return; } } })(); }, []);
   React.useEffect(() => {
     const url = new URL(window.location.href);
     const loginToken = url.searchParams.get("loginToken");
@@ -6590,13 +6690,10 @@ function App() {
       const error = data?.error || data;
       if (isFatalAuthError(error)) {
         dropMatrixRefreshToken(client, client.__orbitSession);
-        if (restartOrbitSyncWithoutSliding(client)) return;
+        resumeOrbitClient(client, { forceRefresh: false });
         return;
       }
-      if (isRecoverableAuthError(error)) {
-        if (client.__orbitSlidingSync && restartOrbitSyncWithoutSliding(client)) return;
-        if (latestMatrixRefreshToken(client, client.__orbitSession)) recoverMatrixAccessToken(client).catch(() => {});
-      }
+      if (isRecoverableAuthError(error)) resumeOrbitClient(client, { forceRefresh: true });
     };
     client.on("sync", onAuthSyncError);
     return () => client.off?.("sync", onAuthSyncError);
@@ -6624,7 +6721,7 @@ function App() {
         }
         const next = { ...(window.orbitPendingMentions || {}) }; delete next[roomId]; window.orbitPendingMentions = next;
       }
-      return original(roomId, content, ...rest);
+      return withOrbitAuthRetry(client, () => original(roomId, content, ...rest));
     };
     return () => { client.sendMessage = original; };
   }, [connected?.client]);
@@ -6635,6 +6732,7 @@ function App() {
   const send = async (text, _html, mentions = [], resolvedEmoji = []) => {
     if (!connected || !room) return;
     try {
+      await ensureMatrixAccessToken(connected.client);
       if (editing) {
         const validMentions = (mentions || []).filter(entry => entry?.userId && String(text).includes(`@${String(entry.name || "").replace(/^@/, "")}`));
         resolvedEmoji = await hydrateOutgoingEmoji(connected.client, text, _html, resolvedEmoji);
@@ -6762,7 +6860,7 @@ function App() {
     refresh(connected.client);
   } catch (error) { Toast.error(`回应操作失败：${error?.message || "未知错误"}`); } };
   const redact = async item => { if (!confirm("确定撤回这条消息吗？")) return; try { await connected.client.redactEvent(room.id, item.id); refresh(connected.client); } catch (error) { Toast.error(`撤回失败：${error?.message || "未知错误"}`); } };
-  const upload = async (file, onProgress) => { try { const encryptedRoom = Boolean(room.matrixRoom.hasEncryptionStateEvent?.()); const { uploaded, fileInfo } = await uploadMatrixMedia(connected.client, file, encryptedRoom, onProgress); const isVoice = Number(file.orbitVoiceDuration) > 0 && (String(file.type || "").startsWith("audio/") || /\.(?:ogg|opus|wav|webm|m4a|mp3)$/i.test(file.name || "")); const content = isVoice ? buildVoiceMessageContent(file, uploaded, fileInfo) : applyUploadedMedia({ msgtype: file.type.startsWith("image/") || /\.(?:gif|png|jpe?g|webp|avif|svg)$/i.test(file.name || "") ? "m.image" : file.type.startsWith("video/") ? "m.video" : file.type.startsWith("audio/") ? "m.audio" : "m.file", body: file.name, info: { mimetype: file.type, size: file.size } }, uploaded, fileInfo); await connected.client.sendMessage(room.id, content); Toast.success(encryptedRoom ? "加密文件已发送" : "文件已发送"); refresh(connected.client); } catch (error) { Toast.error(`文件发送失败：${error?.message || "未知错误"}`); throw error; } };
+  const upload = async (file, onProgress) => { try { await ensureMatrixAccessToken(connected.client); const encryptedRoom = Boolean(room.matrixRoom.hasEncryptionStateEvent?.()); const { uploaded, fileInfo } = await uploadMatrixMedia(connected.client, file, encryptedRoom, onProgress); const isVoice = Number(file.orbitVoiceDuration) > 0 && (String(file.type || "").startsWith("audio/") || /\.(?:ogg|opus|wav|webm|m4a|mp3)$/i.test(file.name || "")); const content = isVoice ? buildVoiceMessageContent(file, uploaded, fileInfo) : applyUploadedMedia({ msgtype: file.type.startsWith("image/") || /\.(?:gif|png|jpe?g|webp|avif|svg)$/i.test(file.name || "") ? "m.image" : file.type.startsWith("video/") ? "m.video" : file.type.startsWith("audio/") ? "m.audio" : "m.file", body: file.name, info: { mimetype: file.type, size: file.size } }, uploaded, fileInfo); await connected.client.sendMessage(room.id, content); Toast.success(encryptedRoom ? "加密文件已发送" : "文件已发送"); refresh(connected.client); } catch (error) { Toast.error(`文件发送失败：${error?.message || "未知错误"}`); throw error; } };
   const sendCustomEmoji = async item => {
     if (!connected?.client || !room || !item) return;
     if (stickerSendingRef.current) return Toast.info("上一个表情正在发送，请稍候");
